@@ -108,10 +108,18 @@ pub enum Input {
     /// A daemon call made for a device's request finished.
     Done {
         device: String,
+        op: String,
         /// The request id, when the device's store recorded it.
         key: Option<String>,
         from: requests::Waiter,
         answer: Value,
+    },
+    /// A UI command from the overlord for a device (`n`: the daemon keeps
+    /// it until told it went out live).
+    Ui {
+        device: String,
+        n: Option<u64>,
+        cmd: Value,
     },
     Tick,
 }
@@ -137,6 +145,10 @@ impl Handle {
 
     pub fn changed(&self, rev: String, relay: bool) {
         let _ = self.tx.send(Input::Changed { rev, relay });
+    }
+
+    pub fn ui(&self, device: String, n: Option<u64>, cmd: Value) {
+        let _ = self.tx.send(Input::Ui { device, n, cmd });
     }
 }
 
@@ -186,8 +198,14 @@ pub(crate) struct Actor {
     pub(crate) mailboxes: mailbox::Mailboxes,
     /// Running requests' waiters (`requests.rs`).
     pub(crate) waiting: requests::Waiting,
+    /// Devices that asked to leave (`device.leave`), since when: removed
+    /// once their link closes or the answer has had time to arrive.
+    pub(crate) leaving: HashMap<String, Instant>,
     /// Remote ops the daemon says are safe to run twice (`web.hello`).
     pub(crate) idempotent: Vec<String>,
+    /// The remote API level (`web.hello`), told to each device in its
+    /// hello.
+    pub(crate) api: u64,
     /// The last tick, by both clocks (sleep detection).
     last_tick: Option<(Instant, SystemTime)>,
     last_mailbox_retry: Instant,
@@ -198,8 +216,15 @@ pub(crate) struct Actor {
 }
 
 /// Start the remote-access task. `rev` is the daemon's state now;
-/// `idempotent` the remote ops the daemon says may run twice.
-pub fn start(d: Daemon, cfg: RemoteConfig, rev: String, idempotent: Vec<String>) -> Handle {
+/// `idempotent` the remote ops the daemon says may run twice; `api` its
+/// remote API level.
+pub fn start(
+    d: Daemon,
+    cfg: RemoteConfig,
+    rev: String,
+    idempotent: Vec<String>,
+    api: u64,
+) -> Handle {
     let dir = plugin::remote_dir();
     let (tx, rx) = mpsc::unbounded_channel();
     let (state_tx, state_rx) = watch::channel(Value::Null);
@@ -232,7 +257,9 @@ pub fn start(d: Daemon, cfg: RemoteConfig, rev: String, idempotent: Vec<String>)
         links: HashMap::new(),
         pairing: None,
         waiting: HashMap::new(),
+        leaving: HashMap::new(),
         idempotent,
+        api,
         last_tick: None,
         last_mailbox_retry: Instant::now(),
         signals: Signals::default(),
@@ -322,10 +349,12 @@ impl Actor {
             }
             Input::Done {
                 device,
+                op,
                 key,
                 from,
                 answer,
-            } => self.done(&device, key, from, answer),
+            } => self.done(&device, &op, key, from, answer),
+            Input::Ui { device, n, cmd } => self.ui(&device, n, cmd),
             Input::Tick => self.tick(),
         }
     }
@@ -378,6 +407,7 @@ impl Actor {
             self.expire_devices();
         }
         self.pairing_tick();
+        self.leave_due(None);
         self.signal_owed();
         let wanted = self.wanted();
         match &self.conn {
@@ -724,6 +754,8 @@ impl Actor {
                 if l.is_live() {
                     self.audit.log(&dev, "link closed");
                 }
+                // One that asked to leave has gone: now.
+                self.leave_due(Some(&dev));
             }
             if l.is_pair() {
                 self.pair_unlinked(id, l);
@@ -776,6 +808,47 @@ impl Actor {
             }
         }
         for fp in to_signal {
+            self.send_relay(|n| ToRelay::Signal { n, device: fp });
+        }
+    }
+
+    /// A UI command for device `id`: on its live session as `{"event":
+    /// "ui", "cmd"}`, and the daemon told so; without one, the daemon
+    /// keeps it for the device's `page.pending` at its next hello, and the
+    /// relay is asked to signal the device (within its signal window).
+    fn ui(&mut self, id: &str, n: Option<u64>, cmd: Value) {
+        let live = self
+            .links
+            .iter()
+            .find(|(_, l)| l.live_device().as_deref() == Some(id))
+            .map(|(k, _)| *k);
+        if let Some(link) = live {
+            self.send_control(link, &json!({"event": "ui", "cmd": cmd}));
+            // (Still live: it went into the session's ordered stream.)
+            let sent = self.links.get(&link).is_some_and(|l| l.is_live());
+            if let (Some(n), true) = (n, sent) {
+                let (d, id) = (self.d.clone(), id.to_string());
+                tokio::spawn(async move {
+                    if let Err(e) = d.ui_delivered(&id, n).await {
+                        eprintln!("rlord-web: web.ui_delivered: {e}");
+                    }
+                });
+            }
+            return;
+        }
+        if n.is_none() || !self.connected_now() {
+            return;
+        }
+        let Some(fp) = self
+            .devices
+            .list
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.relay_fp.clone())
+        else {
+            return;
+        };
+        if self.signals.change(id, Instant::now()) {
             self.send_relay(|n| ToRelay::Signal { n, device: fp });
         }
     }

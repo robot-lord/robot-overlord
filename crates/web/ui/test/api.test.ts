@@ -21,7 +21,7 @@ function harness() {
     "a".repeat(64),
     {
       state: (s) => states.push(s),
-      hello: (h) => hellos.push(h.build),
+      hello: (h) => hellos.push(h.build ?? ""),
       changed: (r) => changed.push(r),
     },
     (url) => {

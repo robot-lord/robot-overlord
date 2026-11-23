@@ -24,6 +24,12 @@
 //!   that asked (`page`), never set by the browser. The daemon keeps what
 //!   each page shows (`WebUi`), so the overlord's UI commands can land on
 //!   a page (`ui::target`).
+//! - Paired devices are surfaces too (the phone): the daemon keeps the same
+//!   record per device, by the id the plugin stamps on its `web.call`s, and
+//!   parks the last UI command for each (`page.pending` from that device
+//!   hands it over). `web.ui_delivered {device, n}`: the plugin sent
+//!   command `n` on that device's live session, so it isn't handed over
+//!   again.
 //!
 //! The daemon also runs the plugin, as a child process (`Web`): started by
 //! `web.start` (`rlord web`) or at daemon start with `[web] enabled`,
@@ -83,6 +89,28 @@ impl fmt::Display for NotAllowed {
 
 impl std::error::Error for NotAllowed {}
 
+/// An allowed op asked by the wrong caller (`device.leave` from a local
+/// page). Answered with RPC code `plugin::RPC_ERR_BAD_REQUEST`; the page
+/// or device sees `bad_request`.
+#[derive(Debug)]
+pub struct BadRequest(pub String);
+
+impl fmt::Display for BadRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BadRequest {}
+
+/// The remote API level: the ops, the snapshot and the `ui` commands as a
+/// paired device sees them. A device's `hello` carries it (the plugin
+/// takes it from `web.hello`'s answer); the phone app supports a range
+/// and asks for an update outside it. Within a level, changes are
+/// additive only: `tests/web_api.rs` pins the remote ops and the remote
+/// snapshot's keys against `tests/fixtures/remote_api.json`.
+pub const API: u32 = 1;
+
 /// One browser op: the daemon method it calls ("" when it is answered
 /// here), the only arguments passed on (any others are dropped, so a
 /// browser can't set what a method takes from its trusted callers, such
@@ -114,7 +142,7 @@ const fn op(op: &'static str, method: &'static str, args: &'static [&'static str
 }
 
 /// An op for local pages only: what writes `config.toml`, manages
-/// devices, or is about a page (its reports, its parked commands).
+/// devices, or shows the key screen.
 const fn local(op: &'static str, method: &'static str, args: &'static [&'static str]) -> Op {
     Op {
         op,
@@ -164,14 +192,17 @@ pub const OPS: &[Op] = &[
     op("session.pin", "session.pin", &["ref", "pinned"]),
     // Make another agent's overlord the active one.
     op("overlord.switch", "overlord.switch", &["agent"]),
-    // What the page shows (answered here; see `WebUi`).
-    local(
+    // What the page (or the device) shows (answered here; see `WebUi`).
+    // Setting it twice is the same as once.
+    op(
         "page.report",
         "",
         &["route", "view", "visible", "form", "input"],
-    ),
-    // A UI command that never reached its page (asked on connecting).
-    local("page.pending", "", &[]),
+    )
+    .idempotent(),
+    // A UI command that never reached its page or device (asked on
+    // connecting).
+    op("page.pending", "", &[]),
     // The list view a page with none of its own starts from.
     op("view.default", "", &[]).idempotent(),
     // The key screen, read-only (keys change only in a terminal).
@@ -255,6 +286,12 @@ pub const OPS: &[Op] = &[
     local("device.confirm", "", &[]),
     local("device.reject", "", &[]),
     local("device.revoke", "", &["device"]),
+    // A session's recent conversation as text (its view without a pane),
+    // as `overlord.messages` reads the overlord's.
+    op("session.messages", "", &["ref", "before", "limit"]).idempotent(),
+    // A paired device unpairs itself (the plugin removes it once the
+    // answer is on its way). From a local page: `bad_request`.
+    op("device.leave", "", &[]),
 ];
 
 /// Ops that don't count as the user doing something on the page (look-ups
@@ -271,7 +308,9 @@ const PASSIVE: &[&str] = &[
     "form.repos",
     "form.setup",
     "overlord.messages",
+    "session.messages",
     "device.list",
+    "device.leave",
 ];
 
 /// Method families no op may name, whatever `OPS` says: a second check.
@@ -302,6 +341,8 @@ pub fn hello(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(json!({
         "protocol": plugin::WEB_PROTOCOL,
         "version": env!("CARGO_PKG_VERSION"),
+        // The remote API level, for each device's hello.
+        "api": API,
         // The remote ops a device may repeat freely; the plugin runs any
         // other at most once per request id.
         "idempotent": OPS
@@ -341,9 +382,9 @@ impl<'a> Via<'a> {
 
 /// `web.call {op, args, via, page | device}`: one request, from a local
 /// page with that id or from a paired device (the plugin's word, never
-/// the browser's or the device's). A device's request carries no page,
-/// never counts as use of a screen, and is refused for an op that isn't
-/// `remote`.
+/// the browser's or the device's). A device is a surface of its own,
+/// known by its id (never by a page id passed along), and is refused an
+/// op that isn't `remote`.
 pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
     let op = params["op"].as_str().unwrap_or("");
     let Some(found) = OPS.iter().find(|o| o.op == op) else {
@@ -367,12 +408,32 @@ pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
         Via::Remote(_) if !found.remote => {
             return Err(NotAllowed(format!("{op}: not available to a remote device")).into());
         }
-        Via::Remote(_) => "",
+        Via::Remote(device) => {
+            if !PASSIVE.contains(&op) {
+                d.web_ui().device_used(device);
+            }
+            ""
+        }
     };
     let args = filtered(found, &params["args"]);
-    match op {
+    match (op, via) {
+        ("page.report", Via::Remote(device)) => d.web_ui().report_device(device, &args),
+        ("page.pending", Via::Remote(device)) => Ok(d.web_ui().take_parked(device)),
+        ("device.leave", Via::Remote(device)) => Ok(json!({"left": device})),
+        ("device.leave", Via::Local(_)) => Err(BadRequest(
+            "device.leave is a paired device's own: a page unpairs one with device.revoke".into(),
+        )
+        .into()),
+        _ => call_op(d, found, args, via, page),
+    }
+}
+
+/// `call`, for the ops answered the same way whoever asked.
+fn call_op(d: &Daemon, found: &Op, args: Value, via: Via, page: &str) -> Result<Value> {
+    match found.op {
         "snapshot" => snapshot(d, &args, via),
         "overlord.messages" => overlord_messages(d, &args),
+        "session.messages" => session_messages(d, &args),
         "device.list" => crate::relay::status(d),
         "device.pair" => crate::relay::pair(d),
         "device.pair_cancel" => crate::relay::pair_cancel(d),
@@ -586,21 +647,57 @@ pub fn overlord_messages(d: &Daemon, args: &Value) -> Result<Value> {
         (o, path)
     };
     let head = json!({"id": o.id, "agent": o.agent, "conversation": o.agent_session});
+    let (messages, more) = messages_of(path, before, limit, "the overlord's")?;
+    Ok(json!({"overlord": head, "messages": messages, "more": more}))
+}
+
+/// Op `session.messages {ref, before, limit}`: any session's current
+/// conversation as text, oldest first, read as `overlord.messages` reads
+/// the overlord's (at most 50 messages, each at most 4 KiB; `before`: a
+/// message's `line`). What a device shows of a session it has no pane
+/// for. No conversation yet: no messages.
+pub fn session_messages(d: &Daemon, args: &Value) -> Result<Value> {
+    let r = methods::p_str(args, "ref")?;
+    let limit = args["limit"]
+        .as_u64()
+        .map_or(MESSAGES_MAX, |l| (l as usize).clamp(1, MESSAGES_MAX));
+    let before = args["before"].as_u64().filter(|b| *b > 0);
+    let (s, path) = {
+        let db = d.db();
+        let s = db.resolve_ref(r)?;
+        let path = db.transcript_source(&s.id)?;
+        (s, path)
+    };
+    let head = json!({"id": s.id, "name": s.name, "agent": s.agent,
+                      "conversation": s.agent_session});
+    let (messages, more) = messages_of(path, before, limit, "the session's")?;
+    Ok(json!({"session": head, "messages": messages, "more": more}))
+}
+
+/// The last `limit` messages of the transcript at `path` (those before
+/// line `before`, if given), each clipped, and whether earlier ones are
+/// left. No transcript: none.
+fn messages_of(
+    path: Option<String>,
+    before: Option<u64>,
+    limit: usize,
+    whose: &str,
+) -> Result<(Vec<Value>, bool)> {
     let path = path
         .map(PathBuf::from)
         .filter(|p| rlord_core::agents::transcript::exists(p));
     let Some(path) = path else {
-        return Ok(json!({"overlord": head, "messages": [], "more": false}));
+        return Ok((vec![], false));
     };
     // One more than asked: whether there are earlier ones.
     let mut msgs =
         rlord_core::history::read(&path, before, limit + 1, 0, (limit + 1) * 4 * MESSAGE_BYTES)
-            .with_context(|| format!("reading the overlord's transcript ({})", path.display()))?;
+            .with_context(|| format!("reading {whose} transcript ({})", path.display()))?;
     let more = msgs.len() > limit;
     if more {
         msgs.drain(..msgs.len() - limit);
     }
-    let messages: Vec<Value> = msgs
+    let messages = msgs
         .into_iter()
         .map(|m| {
             json!({
@@ -611,7 +708,7 @@ pub fn overlord_messages(d: &Daemon, args: &Value) -> Result<Value> {
             })
         })
         .collect();
-    Ok(json!({"overlord": head, "messages": messages, "more": more}))
+    Ok((messages, more))
 }
 
 /// `s` cut to at most `n` bytes, on a character boundary.
@@ -692,22 +789,37 @@ pub fn pane_target(d: &Daemon, params: &Value) -> Result<Value> {
     }))
 }
 
-// ---- the pages (what each open web page shows) ----
+// ---- the surfaces besides the terminal: web pages and paired devices ----
 
-/// At most this many pages are kept (the plugin's control-socket limit).
+/// At most this many pages are kept (the plugin's control-socket limit),
+/// and at most this many devices.
 const MAX_PAGES: usize = 16;
+const MAX_DEVICES: usize = 16;
 
-/// The open web pages, as the plugin and the pages report them: the web's
-/// side of "which screen is the user on" (`ui::target`, `ui.state`).
+/// How long a UI command waits for a device that had no live session
+/// (`page.pending` from it, at its next hello).
+const DEVICE_PENDING_FOR: Duration = Duration::from_secs(600);
+
+/// The open web pages and the paired devices that used rlord, as the
+/// plugin and they report them: the side of "which screen is the user on"
+/// (`ui::target`, `ui.state`) that isn't the terminal.
 #[derive(Default)]
 pub struct WebUi {
     pages: Vec<Page>,
+    /// Paired devices (the phone), by device id: added by their first op
+    /// or report, dropped when they are no longer paired (`keep_devices`)
+    /// or the plugin goes.
+    devices: Vec<Page>,
+    /// Order of arrival, shared by pages and devices.
+    seq: u64,
+    /// Numbers the commands parked for devices (`Parked::n`).
+    parked_seq: u64,
 }
 
-/// One open page (a browser tab's control socket).
+/// One open page (a browser tab's control socket), or one paired device.
 #[derive(Clone, Debug, Default)]
 pub struct Page {
-    /// The plugin's id for it (`p<n>-<8 hex>`).
+    /// The plugin's id for it (`p<n>-<8 hex>`), or the device's id.
     pub id: String,
     /// `{kind: "list" | "overlord" | "session", id?}`.
     pub route: Value,
@@ -719,8 +831,20 @@ pub struct Page {
     pub form: Option<String>,
     /// When the user last did something on it (the daemon's clock, ms).
     pub last_input: Option<i64>,
-    /// Order of arrival: among pages never used, the newest wins.
+    /// Order of arrival: among surfaces never used, the newest wins.
     pub seq: u64,
+    /// A device's last UI command, until its live session had it
+    /// (`web.ui_delivered`) or the device takes it (`page.pending`).
+    pub parked: Option<Parked>,
+}
+
+/// A UI command kept for a device.
+#[derive(Clone, Debug)]
+pub struct Parked {
+    pub at: Instant,
+    /// Its number, on the `ui` line and in `web.ui_delivered`.
+    pub n: u64,
+    pub cmd: Value,
 }
 
 /// The forms a page may say it has open.
@@ -733,26 +857,26 @@ impl WebUi {
     /// dropped; the others keep what they reported.
     pub fn set_pages(&mut self, ids: &[String]) {
         self.pages.retain(|p| ids.contains(&p.id));
-        let mut seq = self.pages.iter().map(|p| p.seq).max().unwrap_or(0);
         for id in ids {
             if self.pages.len() >= MAX_PAGES {
                 break;
             }
             if !id.is_empty() && !self.pages.iter().any(|p| &p.id == id) {
-                seq += 1;
+                self.seq += 1;
                 self.pages.push(Page {
                     id: clip(id, 40),
                     route: json!({"kind": "list"}),
-                    seq,
+                    seq: self.seq,
                     ..Default::default()
                 });
             }
         }
     }
 
-    /// The plugin is gone: so are its pages.
+    /// The plugin is gone: so are its pages and its devices' records.
     pub fn clear(&mut self) {
         self.pages.clear();
+        self.devices.clear();
     }
 
     /// Page `id` was used now. (An unknown id changes nothing.)
@@ -774,14 +898,113 @@ impl WebUi {
         self.pages.iter_mut().find(|p| p.id == id)
     }
 
+    pub fn devices(&self) -> &[Page] {
+        &self.devices
+    }
+
+    pub fn device(&self, id: &str) -> Option<&Page> {
+        self.devices.iter().find(|p| p.id == id)
+    }
+
+    /// Device `id`'s record, made on its first op or report. Past the
+    /// limit, the one used longest ago makes room.
+    pub fn device_mut(&mut self, id: &str) -> &mut Page {
+        let id = clip(id, 40);
+        let i = match self.devices.iter().position(|p| p.id == id) {
+            Some(i) => i,
+            None => {
+                if self.devices.len() >= MAX_DEVICES {
+                    let oldest = self
+                        .devices
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, p)| (p.last_input, p.seq))
+                        .map(|(i, _)| i);
+                    if let Some(i) = oldest {
+                        self.devices.remove(i);
+                    }
+                }
+                self.seq += 1;
+                self.devices.push(Page {
+                    id,
+                    route: json!({"kind": "list"}),
+                    seq: self.seq,
+                    ..Default::default()
+                });
+                self.devices.len() - 1
+            }
+        };
+        &mut self.devices[i]
+    }
+
+    /// Device `id` was used now (the daemon's clock, as for a page).
+    pub fn device_used(&mut self, id: &str) {
+        self.device_mut(id).last_input = Some(rlord_core::types::now_ms());
+    }
+
+    /// Only the devices still paired keep their records.
+    pub fn keep_devices(&mut self, paired: &[String]) {
+        self.devices.retain(|p| paired.contains(&p.id));
+    }
+
+    /// Park `cmd` in device `id`'s one slot (replacing what was there):
+    /// its number.
+    pub fn park(&mut self, id: &str, cmd: Value) -> u64 {
+        self.parked_seq += 1;
+        let n = self.parked_seq;
+        self.device_mut(id).parked = Some(Parked {
+            at: Instant::now(),
+            n,
+            cmd,
+        });
+        n
+    }
+
+    /// Command `n` reached device `id`'s live session.
+    fn delivered(&mut self, id: &str, n: u64) {
+        if let Some(p) = self.devices.iter_mut().find(|p| p.id == id) {
+            if p.parked.as_ref().is_some_and(|k| k.n == n) {
+                p.parked = None;
+            }
+        }
+    }
+
+    /// Op `page.pending` from device `id`: its parked command, once, if
+    /// under 10 minutes old. Null otherwise.
+    pub(crate) fn take_parked(&mut self, id: &str) -> Value {
+        let Some(p) = self.devices.iter_mut().find(|p| p.id == id) else {
+            return Value::Null;
+        };
+        match p.parked.take() {
+            Some(k) if k.at.elapsed() < DEVICE_PENDING_FOR => k.cmd,
+            _ => Value::Null,
+        }
+    }
+
     /// Op `page.report {route, view, visible, form, input}` from page
     /// `id`: what it shows now. Only the fields given change; `input:
     /// true` stamps its last use with the daemon's clock.
-    fn report_fields(&mut self, id: &str, args: &Value) -> Result<()> {
+    fn report(&mut self, id: &str, args: &Value) -> Result<Value> {
         let Some(p) = self.pages.iter_mut().find(|p| p.id == id) else {
             bail!("this page isn't open (reload it)");
         };
-        if let Some(r) = args.get("route").filter(|r| !r.is_null()) {
+        report_fields(p, args)?;
+        Ok(json!({"ok": true}))
+    }
+
+    /// `page.report` from device `id`, as from a page (the id is the
+    /// plugin's word, never the device's).
+    pub(crate) fn report_device(&mut self, id: &str, args: &Value) -> Result<Value> {
+        report_fields(self.device_mut(id), args)?;
+        Ok(json!({"ok": true}))
+    }
+}
+
+/// A `page.report`'s fields into `p`: all checked, then set.
+fn report_fields(p: &mut Page, args: &Value) -> Result<()> {
+    let route = match args.get("route").filter(|r| !r.is_null()) {
+        None => None,
+        Some(r) => {
             let kind = r["kind"].as_str().unwrap_or("");
             if !matches!(kind, "list" | "overlord" | "session") {
                 bail!("route kind must be list, overlord or session");
@@ -790,35 +1013,46 @@ impl WebUi {
             if let Some(i) = r["id"].as_str().filter(|_| kind == "session") {
                 route["id"] = json!(clip(i, 80));
             }
-            p.route = route;
+            Some(route)
         }
-        if let Some(v) = args.get("view").filter(|v| v.is_object()) {
-            p.view = crate::ui::normalize_view(v);
-        }
-        if let Some(v) = args.get("visible").and_then(Value::as_bool) {
-            p.visible = v;
-        }
-        match args.get("form") {
-            None => {}
-            Some(Value::Null) => p.form = None,
-            Some(f) => {
-                let f = f.as_str().unwrap_or("");
-                if !FORMS.contains(&f) {
-                    bail!("form must be one of {} or null", FORMS.join(", "));
-                }
-                p.form = Some(f.to_string());
+    };
+    let form = match args.get("form") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(f) => {
+            let f = f.as_str().unwrap_or("");
+            if !FORMS.contains(&f) {
+                bail!("form must be one of {} or null", FORMS.join(", "));
             }
+            Some(Some(f.to_string()))
         }
-        if args["input"] == true {
-            p.last_input = Some(rlord_core::types::now_ms());
-        }
-        Ok(())
+    };
+    if let Some(r) = route {
+        p.route = r;
     }
+    if let Some(f) = form {
+        p.form = f;
+    }
+    if let Some(v) = args.get("view").filter(|v| v.is_object()) {
+        p.view = crate::ui::normalize_view(v);
+    }
+    if let Some(v) = args.get("visible").and_then(Value::as_bool) {
+        p.visible = v;
+    }
+    if args["input"] == true {
+        p.last_input = Some(rlord_core::types::now_ms());
+    }
+    Ok(())
+}
 
-    fn report(&mut self, id: &str, args: &Value) -> Result<Value> {
-        self.report_fields(id, args)?;
-        Ok(json!({"ok": true}))
-    }
+/// `web.ui_delivered {device, n}`: the plugin sent device `device` its
+/// command `n` on a live session, so `page.pending` doesn't hand it over
+/// again.
+pub fn ui_delivered(d: &Daemon, params: &Value) -> Result<Value> {
+    let device = methods::p_str(params, "device")?;
+    let n = params["n"].as_u64().context("ui_delivered needs n")?;
+    d.web_ui().delivered(device, n);
+    Ok(json!({"ok": true}))
 }
 
 /// How long a UI command waits for a page (`page.pending`).
@@ -1275,9 +1509,11 @@ mod tests {
         OPS.iter().find(|o| o.op == name).unwrap()
     }
 
-    /// Only look-ups are idempotent: anything that changes something runs
-    /// at most once per request id from a device, so a resend after a lost
-    /// link can't repeat it. `web.hello` tells the plugin which are.
+    /// Only look-ups (and a page's report of what it shows, which sets the
+    /// same thing again) are idempotent: anything that changes something
+    /// runs at most once per request id from a device, so a resend after a
+    /// lost link can't repeat it. `page.pending` hands its command over
+    /// once, so it isn't. `web.hello` tells the plugin which are.
     #[test]
     fn only_look_ups_are_idempotent() {
         let idem: Vec<&str> = OPS.iter().filter(|o| o.idempotent).map(|o| o.op).collect();
@@ -1287,6 +1523,7 @@ mod tests {
                 "snapshot",
                 "session.get",
                 "overlord.ensure",
+                "page.report",
                 "view.default",
                 "keys.list",
                 "form.defaults",
@@ -1294,6 +1531,7 @@ mod tests {
                 "form.setup",
                 "overlord.messages",
                 "device.list",
+                "session.messages",
             ]
         );
         for o in [
@@ -1301,6 +1539,8 @@ mod tests {
             "overlord.new_session",
             "session.new",
             "session.stop",
+            "page.pending",
+            "device.leave",
         ] {
             assert!(!op_named(o).idempotent, "{o}");
         }

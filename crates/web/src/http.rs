@@ -389,6 +389,7 @@ fn browser_code(code: i64) -> &'static str {
     match code {
         0 => "daemon_unavailable",
         c if c == i64::from(rlord_core::plugin::RPC_ERR_NOT_ALLOWED) => "not_allowed",
+        c if c == i64::from(rlord_core::plugin::RPC_ERR_BAD_REQUEST) => "bad_request",
         _ => "failed",
     }
 }
@@ -461,6 +462,10 @@ mod tests {
         assert_eq!(
             browser_code(rlord_core::plugin::RPC_ERR_NOT_ALLOWED.into()),
             "not_allowed"
+        );
+        assert_eq!(
+            browser_code(rlord_core::plugin::RPC_ERR_BAD_REQUEST.into()),
+            "bad_request"
         );
         assert_eq!(browser_code(-32603), "failed");
     }

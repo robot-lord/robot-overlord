@@ -314,6 +314,8 @@ fn hello_refuses_another_protocol() {
     let got = hello(plugin::WEB_PROTOCOL);
     assert_eq!(got["result"]["protocol"], plugin::WEB_PROTOCOL, "{got}");
     assert_eq!(got["result"]["version"], env!("CARGO_PKG_VERSION"));
+    // The remote API level, which the plugin puts in each device's hello.
+    assert_eq!(got["result"]["api"], rlord_daemon::web::API, "{got}");
     let got = hello(plugin::WEB_PROTOCOL + 1);
     assert_eq!(got["error"]["code"], plugin::RPC_ERR_INCOMPATIBLE, "{got}");
     assert!(got["error"]["message"]
@@ -1146,8 +1148,6 @@ fn a_device_reaches_only_the_remote_ops() {
     assert_eq!(
         local,
         [
-            "page.report",
-            "page.pending",
             "keys.list",
             "form.setup",
             "form.setup_save",
@@ -1207,7 +1207,8 @@ fn a_device_reaches_only_the_remote_ops() {
     assert_eq!(snap["relay"]["devices"], 0, "{snap}");
 
     // A device is never a page: a page id passed along is ignored, and
-    // its ops don't count as use of a screen.
+    // its ops don't count as use of that page (a device not paired, as
+    // here, isn't a surface at all).
     ok(
         &r.sock,
         "web.pages",
@@ -1642,4 +1643,382 @@ fn overlord_messages_are_bounded() {
     let none = start();
     let got = op(&none.sock, "overlord.messages", json!({}))["result"].clone();
     assert_eq!(got["messages"], json!([]), "{got}");
+}
+
+// ---- slice 4: the phone ----
+
+/// The phone in these tests, and the plugin's report that it is paired
+/// (`linked`: it has a live session now).
+const PHONE: &str = "ab12cd34";
+
+fn paired(sock: &Path, devices: Value) {
+    ok(sock, "web.remote_state", json!({"devices": devices}));
+}
+
+/// Any session's conversation as text, as the overlord's is read: at most
+/// 50 messages of 4 KiB, paged back by `before`, from a page or a device.
+#[test]
+fn session_messages_are_bounded() {
+    let dir = env().join("session-messages");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("0b1d7a52-0000-4000-8000-000000000002.jsonl");
+    let mut lines = Vec::new();
+    for i in 0..60 {
+        lines.push(claude_line("user", &format!("ask {i}")));
+        let reply = if i % 10 == 0 {
+            "€".repeat(3000)
+        } else {
+            format!("answer {i}")
+        };
+        lines.push(claude_line("assistant", &reply));
+    }
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let p = path.to_str().unwrap().to_string();
+    let r = start_with(|db| db.upsert_transcript_source("beta", &p).unwrap());
+
+    let got =
+        op_remote(&r.sock, PHONE, "session.messages", json!({"ref": "beta"}))["result"].clone();
+    assert_eq!(got["session"]["id"], "beta", "{got}");
+    assert_eq!(got["session"]["name"], "beta", "{got}");
+    let msgs = got["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 50);
+    assert_eq!(got["more"], true);
+    assert_eq!(msgs.last().unwrap()["text"], "answer 59");
+    assert!(msgs
+        .iter()
+        .all(|m| m["text"].as_str().unwrap().len() <= 4096));
+    let first = msgs[0]["line"].as_u64().unwrap();
+    let back = op(
+        &r.sock,
+        "session.messages",
+        json!({"ref": "beta", "before": first, "limit": 500}),
+    )["result"]
+        .clone();
+    let back = back["messages"].as_array().unwrap().clone();
+    assert_eq!(back.len(), 50);
+    assert!(back.iter().all(|m| m["line"].as_u64().unwrap() < first));
+    // A session with no transcript: none. An unknown one: an error.
+    let none = op(&r.sock, "session.messages", json!({"ref": "gamma"}))["result"].clone();
+    assert_eq!(
+        (&none["messages"], &none["more"]),
+        (&json!([]), &json!(false))
+    );
+    assert!(op(&r.sock, "session.messages", json!({"ref": "nope"}))["error"].is_object());
+    // A look-up: no change, and no use of a screen.
+    let rev = r.daemon.rev();
+    op_remote(&r.sock, PHONE, "session.messages", json!({"ref": "beta"}));
+    assert_eq!(r.daemon.rev(), rev);
+}
+
+/// A paired device reports what it shows and is picked as a page is: the
+/// surface the user did something on last. UI commands for it carry its
+/// id and a number, and are kept for its next `page.pending` until the
+/// plugin says one went out live.
+#[test]
+fn a_paired_phone_is_a_surface() {
+    let r = start();
+    let mut stream = WebStream::open(&r.sock);
+    // Not listed as paired by the plugin: no surface.
+    op_remote(
+        &r.sock,
+        PHONE,
+        "session.pin",
+        json!({"ref": "gamma", "pinned": true}),
+    );
+    assert_eq!(ui_state(&r.sock)["target"], "none");
+    paired(
+        &r.sock,
+        json!([{"id": PHONE, "name": "pocket", "linked": true}]),
+    );
+    let s = ui_state(&r.sock);
+    assert_eq!(s["target"], "phone", "{s}");
+    assert_eq!(s["phone"]["open"], true);
+    assert_eq!(s["phone"]["name"], "pocket");
+    assert_eq!(s["phone"]["showing"]["kind"], "session_list");
+    assert!(s["web"].is_null());
+
+    // Its reports: as a page's, under its id (the plugin's word).
+    let rep = op_remote(
+        &r.sock,
+        PHONE,
+        "page.report",
+        json!({"route": {"kind": "session", "id": "alpha"},
+               "view": {"sort": "name"}, "visible": true, "form": "describe",
+               "page": "p9-zzzz"}),
+    );
+    assert!(rep["error"].is_null(), "{rep}");
+    let s = ui_state(&r.sock);
+    assert_eq!(
+        s["phone"]["showing"],
+        json!({"kind": "session", "id": "alpha", "name": "alpha"})
+    );
+    assert_eq!(s["phone"]["form"], "describe");
+    assert_eq!(s["current_view"]["sort"], "name");
+    let bad = op_remote(
+        &r.sock,
+        PHONE,
+        "page.report",
+        json!({"route": {"kind": "admin"}}),
+    );
+    assert!(bad["error"].is_object(), "{bad}");
+
+    // The overlord's tools land on it: `on: "phone"`, lines for it.
+    let on_phone = |got: &Value, name: &str| {
+        assert!(got["error"].is_null(), "{name}: {got}");
+        assert_eq!(got["result"]["on"], "phone", "{name}: {got}");
+        got["result"].clone()
+    };
+    on_phone(&tool(&r.sock, "show_list", json!({})), "show_list");
+    let c = stream.next_ui();
+    assert_eq!(c["device"], PHONE, "{c}");
+    assert_eq!(c["cmd"], json!({"cmd": "show_list"}));
+    assert!(c["n"].is_u64() && c.get("page").is_none(), "{c}");
+    let t = on_phone(
+        &tool(&r.sock, "set_list_view", json!({"query": "tag:web"})),
+        "set_list_view",
+    );
+    // From the phone's own view.
+    assert_eq!(t["view"]["sort"], "name");
+    assert_eq!(stream.next_ui()["cmd"]["cmd"], "set_view");
+    assert_eq!(stream.next_ui()["cmd"]["cmd"], "show_list");
+    assert_eq!(ui_state(&r.sock)["current_view"]["query"], "tag:web");
+    on_phone(
+        &tool(
+            &r.sock,
+            "propose_session",
+            json!({"name": "x", "prompt": "p"}),
+        ),
+        "propose_session",
+    );
+    assert_eq!(stream.next_ui()["cmd"]["cmd"], "new_session");
+    on_phone(
+        &tool(
+            &r.sock,
+            "confirm_new_session",
+            json!({"description": "from the phone", "changed": [], "note": "n"}),
+        ),
+        "confirm_new_session",
+    );
+    let c = stream.next_ui();
+    assert_eq!(c["cmd"]["cmd"], "confirm_new_session");
+    let t = tool(&r.sock, "get_ui_state", json!({}))["result"].clone();
+    assert_eq!(t["target"], "phone");
+    assert_eq!(t["phone"]["open"], true);
+
+    // Parked: the last command, handed to the phone's next `page.pending`
+    // once (its live session never had it).
+    let got = op_remote(&r.sock, PHONE, "page.pending", json!({}));
+    assert_eq!(got["result"]["cmd"], "confirm_new_session", "{got}");
+    assert_eq!(
+        op_remote(&r.sock, PHONE, "page.pending", json!({}))["result"],
+        Value::Null
+    );
+    // One that went out live isn't handed over again; a newer one than
+    // the one delivered still is.
+    tool(&r.sock, "show_list", json!({}));
+    let n1 = stream.next_ui()["n"].as_u64().unwrap();
+    ok(
+        &r.sock,
+        "web.ui_delivered",
+        json!({"device": PHONE, "n": n1}),
+    );
+    assert_eq!(
+        op_remote(&r.sock, PHONE, "page.pending", json!({}))["result"],
+        Value::Null
+    );
+    tool(&r.sock, "show_list", json!({}));
+    let n2 = stream.next_ui()["n"].as_u64().unwrap();
+    tool(&r.sock, "show_list", json!({}));
+    let n3 = stream.next_ui()["n"].as_u64().unwrap();
+    assert!(n1 < n2 && n2 < n3);
+    ok(
+        &r.sock,
+        "web.ui_delivered",
+        json!({"device": PHONE, "n": n2}),
+    );
+    assert_eq!(
+        op_remote(&r.sock, PHONE, "page.pending", json!({}))["result"],
+        json!({"cmd": "show_list"})
+    );
+    // A local page's slot is its own.
+    assert_eq!(
+        op(&r.sock, "page.pending", json!({}))["result"],
+        Value::Null
+    );
+
+    // A page used later wins; then the user does something on the phone,
+    // and it is the target again (a look-up from it doesn't count).
+    ok(&r.sock, "web.pages", json!({"pages": ["p1-aaaa"]}));
+    std::thread::sleep(Duration::from_millis(1100));
+    op_from(
+        &r.sock,
+        "p1-aaaa",
+        "session.pin",
+        json!({"ref": "gamma", "pinned": false}),
+    );
+    assert_eq!(ui_state(&r.sock)["target"], "web");
+    assert_eq!(tool(&r.sock, "show_list", json!({}))["result"]["on"], "web");
+    std::thread::sleep(Duration::from_millis(1100));
+    op_remote(&r.sock, PHONE, "snapshot", json!({}));
+    op_remote(&r.sock, PHONE, "session.messages", json!({"ref": "alpha"}));
+    assert_eq!(ui_state(&r.sock)["target"], "web");
+    op_remote(
+        &r.sock,
+        PHONE,
+        "session.describe",
+        json!({"ref": "alpha", "description": "from the phone"}),
+    );
+    let s = ui_state(&r.sock);
+    assert_eq!(s["target"], "phone", "{s}");
+    // The page is still described (the most recent page).
+    assert_eq!(s["web"]["open"], true);
+
+    // Unpaired (revoked, or it left): no surface any more.
+    paired(&r.sock, json!([]));
+    let s = ui_state(&r.sock);
+    assert_eq!((&s["target"], &s["phone"]), (&json!("web"), &Value::Null));
+}
+
+/// What needs a screen on this computer (the code-folder form, the key
+/// screen) never goes to a phone: it takes a terminal or a page, and with
+/// only a phone it fails naming the ways in.
+#[test]
+fn screens_on_this_computer_never_go_to_a_phone() {
+    let r = start();
+    let mut stream = WebStream::open(&r.sock);
+    paired(&r.sock, json!([{"id": PHONE, "name": "p", "linked": true}]));
+    op_remote(&r.sock, PHONE, "page.report", json!({"input": true}));
+    assert_eq!(ui_state(&r.sock)["target"], "phone");
+    for (name, args) in [
+        ("confirm_setup", json!({"code_dir": "/tmp"})),
+        ("open_keys", json!({})),
+    ] {
+        let e = method_error(&tool(&r.sock, name, args));
+        assert!(
+            e.contains("phone") && e.contains("rlord web") && e.contains("terminal"),
+            "{name}: {e}"
+        );
+    }
+    // With a page open (used before the phone): the page.
+    ok(&r.sock, "web.pages", json!({"pages": ["p1-aaaa"]}));
+    std::thread::sleep(Duration::from_millis(1100));
+    op_remote(&r.sock, PHONE, "page.report", json!({"input": true}));
+    assert_eq!(ui_state(&r.sock)["target"], "phone");
+    let t = tool(&r.sock, "confirm_setup", json!({"code_dir": "/tmp"}));
+    assert_eq!(t["result"]["on"], "web", "{t}");
+    let c = stream.next_ui();
+    assert_eq!(
+        (&c["page"], &c["cmd"]["cmd"]),
+        (&json!("p1-aaaa"), &json!("setup"))
+    );
+    let t = tool(&r.sock, "open_keys", json!({}));
+    assert_eq!(t["result"]["on"], "web", "{t}");
+    assert_eq!(stream.next_ui()["cmd"]["cmd"], "keys");
+    // Nothing was parked for the phone.
+    assert_eq!(
+        op_remote(&r.sock, PHONE, "page.pending", json!({}))["result"],
+        Value::Null
+    );
+}
+
+/// `device.leave` is a device's own: from a device it names only the
+/// caller (the plugin then removes that one); from a local page it is a
+/// bad request.
+#[test]
+fn device_leave_is_the_callers_own() {
+    let r = start();
+    let got = op_remote(
+        &r.sock,
+        PHONE,
+        "device.leave",
+        // Not the device's to choose: dropped.
+        json!({"device": "ffffffff"}),
+    );
+    assert_eq!(got["result"], json!({"left": PHONE}), "{got}");
+    let got = op(&r.sock, "device.leave", json!({}));
+    assert_eq!(got["error"]["code"], plugin::RPC_ERR_BAD_REQUEST, "{got}");
+    assert!(got["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("device.revoke"));
+}
+
+/// The remote API, level by level: within a level, the ops a device may
+/// call and the keys of its snapshot only grow (`web::API`; the phone app
+/// is built against one). The fixture is written with
+/// `RLORD_UPDATE_FIXTURES=1`, which refuses to drop anything: dropping or
+/// renaming is a new level.
+#[test]
+fn the_remote_api_only_grows_within_a_level() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/remote_api.json");
+    let r = start();
+    let snap = op_remote(&r.sock, PHONE, "snapshot", json!({}))["result"].clone();
+    assert!(snap.get("relay").is_none(), "{snap}");
+    let mut keys = std::collections::BTreeSet::new();
+    key_paths(&snap, "", &mut keys);
+    let ops: std::collections::BTreeSet<String> = rlord_daemon::web::OPS
+        .iter()
+        .filter(|o| o.remote)
+        .map(|o| o.op.to_string())
+        .collect();
+    let now = json!({"api": rlord_daemon::web::API, "ops": ops, "snapshot": keys});
+    let old: Option<Value> = std::fs::read_to_string(&path)
+        .ok()
+        .map(|t| serde_json::from_str(&t).unwrap());
+    let missing = |old: &Value, k: &str, now: &std::collections::BTreeSet<String>| -> Vec<String> {
+        old[k]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|x| !now.contains(*x))
+            .map(str::to_string)
+            .collect()
+    };
+    if let Some(old) = &old {
+        assert_eq!(
+            old["api"],
+            rlord_daemon::web::API,
+            "web::API moved: rewrite {} for the new level",
+            path.display()
+        );
+        let gone: Vec<String> = missing(old, "ops", &ops)
+            .into_iter()
+            .chain(missing(old, "snapshot", &keys))
+            .collect();
+        assert!(
+            gone.is_empty(),
+            "the remote API lost {gone:?} within level {}: put them back, or bump web::API",
+            rlord_daemon::web::API
+        );
+    }
+    if std::env::var("RLORD_UPDATE_FIXTURES").as_deref() == Ok("1") || old.is_none() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&now).unwrap() + "\n").unwrap();
+    }
+    assert!(old.is_some(), "wrote {}: commit it", path.display());
+}
+
+/// Every key path in `v` (`rows[].id`, `overlord.overlords[].agent`, …),
+/// arrays by their first item.
+fn key_paths(v: &Value, at: &str, out: &mut std::collections::BTreeSet<String>) {
+    match v {
+        Value::Object(o) => {
+            for (k, v) in o {
+                let p = if at.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{at}.{k}")
+                };
+                out.insert(p.clone());
+                key_paths(v, &p, out);
+            }
+        }
+        Value::Array(a) => {
+            if let Some(first) = a.first() {
+                key_paths(first, &format!("{at}[]"), out);
+            }
+        }
+        _ => {}
+    }
 }

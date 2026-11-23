@@ -6,11 +6,18 @@
 export interface Hello {
   event: "hello";
   version: string;
-  /** The plugin's version plus a hash of its embedded page: a page from another build reloads. */
-  build: string;
+  /**
+   * The plugin's version plus a hash of its embedded page: a page from
+   * another build reloads. A device's hello has none (its page is the app's).
+   */
+  build?: string;
   rev: string;
-  /** This page's id: the daemon addresses UI commands to it. */
+  /** This page's id (a device's id, for a device): the daemon addresses UI commands to it. */
   page: string;
+  /** The remote API level (a device's hello only). */
+  api?: number;
+  /** The device's id (a device's hello only). */
+  device?: string;
 }
 
 /** Something in the daemon changed: ask for a new snapshot. */
@@ -98,6 +105,8 @@ export const OPS = [
   "device.confirm",
   "device.reject",
   "device.revoke",
+  "session.messages",
+  "device.leave",
 ] as const;
 
 export type Op = (typeof OPS)[number];
@@ -504,18 +513,16 @@ export interface OverlordMessages {
 }
 
 // ---------------------------------------------------------------------
-// The phone app (slice 4): ops beyond `OPS`, and the messages between the
-// page and the app's native side (docs/working/web-ui-remote.md, "The
-// bridge and RemoteTransport"). Kept in this block, apart from the rest.
+// The phone app (slice 4): the messages between the page and the app's
+// native side (docs/working/web-ui-remote.md, "The bridge and
+// RemoteTransport"). Kept in this block, apart from the rest.
 
-/**
- * Every op the page may send: `OPS`, plus ops the daemon is gaining in
- * this slice (in `OPS` once its list has them; the union stays valid).
- */
-export type PageOp = Op | "session.messages";
+/** Every op the page may send (`session.messages` is in `OPS` now). */
+export type PageOp = Op;
 
-/** A session's recent conversation (op `session.messages {ref, before, limit}`). */
+/** A session's recent conversation (op `session.messages {ref, before, limit}`), read as `overlord.messages`. */
 export interface SessionMessages {
+  session: { id: string; name: string; agent: string; conversation: string | null };
   messages: OverlordMessage[];
   /** Earlier ones are left. */
   more: boolean;

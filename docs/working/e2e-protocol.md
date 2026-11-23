@@ -281,8 +281,12 @@ The device id is `device_id(static)`: 16 hex characters of a labelled hash.
    whose fingerprint is not one of its devices (`drop`) and answers with
    the device's stored static key, so a revoked or swapped device fails.
 2. The device's first frame: `{"event":"hello"}`. The host answers
-   `{"event":"hello","version","rev","device":"<id>"}`, and after that
-   `{"event":"changed","rev"}` on every change of the daemon's state.
+   `{"event":"hello","version","api","rev","page":"<id>","device":"<id>"}`
+   (`api`: the remote API level; `page`: the device's id, the one its
+   `page.report`s are kept under), and after that
+   `{"event":"changed","rev"}` on every change of the daemon's state, and
+   `{"event":"ui","cmd"}` for each overlord UI command that lands on this
+   device (§5).
 3. Requests are the local control socket's: `{"id","op","args"}`,
    answered `{"id","ok"}` or `{"id","error":{"code","message"}}`. The host
    passes each to the daemon as `web.call {op, args, via: "remote",
@@ -391,12 +395,17 @@ The daemon holds no keys and does no crypto.
 - **Remote requests.** `web.call {op, args, via, device?}`: `via` is
   `"local"` (a page; with `page`) or `"remote"` (a device; with `device`,
   its id); anything else is refused. `web::Op` has `remote: bool`; an op
-  with `remote: false` is refused (`NotAllowed`) from a device. A remote
-  call carries no `page`, never counts as use of a screen and gets no `ui`
-  commands. `plugin::WEB_PROTOCOL` is 3. `web::Op.idempotent` marks the
-  look-ups; `web.hello`'s answer lists the remote ones (`"idempotent":
-  [op]`), and the plugin runs any op not listed at most once per request
-  id (§4).
+  with `remote: false` is refused (`NotAllowed`) from a device. A device
+  is a surface of its own (docs/architecture.md, "The phone as a
+  surface"): its id stands for its page in `page.report` and
+  `page.pending`, its user-driven ops count as its use, and UI commands
+  for it come on the `web.subscribe` stream as `{"notify":"ui","device",
+  "n","cmd"}`; the plugin sends them on its live session and says
+  `web.ui_delivered {device, n}`, or signals it. `device.leave` removes
+  the calling device. `plugin::WEB_PROTOCOL` is 4. `web::Op.idempotent`
+  marks the look-ups (and `page.report`); `web.hello`'s answer lists the
+  remote ones (`"idempotent": [op]`) and gives `"api"`, and the plugin
+  runs any op not listed at most once per request id (§4).
 - **User commands** (`relay.*`, `crates/daemon/src/relay.rs`; never on
   `OPS`, never in `mcp.rs`): `relay.status`, `relay.setup {address,
   token?, reset?}`, `relay.pair`, `relay.pair_cancel`, `relay.confirm`,

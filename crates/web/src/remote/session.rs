@@ -156,6 +156,7 @@ pub(crate) fn code_of(code: i64) -> &'static str {
     match code {
         0 => "daemon_unavailable",
         c if c == i64::from(rlord_core::plugin::RPC_ERR_NOT_ALLOWED) => "not_allowed",
+        c if c == i64::from(rlord_core::plugin::RPC_ERR_BAD_REQUEST) => "bad_request",
         _ => "failed",
     }
 }
@@ -204,10 +205,14 @@ impl Actor {
                 // The session exists now: the device proved its key.
                 let _ = self.devices.seen(&device, super::now());
                 self.audit.log(&device, "link");
+                // As a local page's, with the remote API level; `page` is
+                // the device's id, the one its reports are kept under.
                 let ev = json!({
                     "event": "hello",
                     "version": env!("CARGO_PKG_VERSION"),
+                    "api": self.api,
                     "rev": self.rev,
+                    "page": device,
                     "device": device,
                 });
                 if let Some(l) = self.links.get_mut(&id) {

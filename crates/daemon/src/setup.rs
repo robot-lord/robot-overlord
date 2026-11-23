@@ -295,11 +295,12 @@ fn suggestion_value_with(s: &Suggestion, cfg: &Config, needed: bool, look: &Look
 /// `ui.confirm_setup` (the overlord's `confirm_setup`): open the
 /// code-folder form on the user's screen with what the overlord would
 /// save. The user's confirm there saves it (`setup.apply`). Cheap: the
-/// form loads rlord's own suggestion (for ←/→) in the background.
+/// form loads rlord's own suggestion (for ←/→) in the background. It
+/// needs this computer's screen (it names folders here): never a phone.
 pub(crate) fn confirm(d: &Daemon, params: &Value) -> Result<Value> {
-    let to = crate::ui::target(d);
+    let to = crate::ui::target_local(d);
     if to == crate::ui::Target::None {
-        crate::ui::show_form(d, &to, "")?;
+        return Err(crate::ui::no_local_screen("the code-folder form"));
     }
     let st = status(d)?;
     let r = queue_confirm(d, params, st, &to)?;

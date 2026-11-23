@@ -58,7 +58,7 @@ const control = token
       hello: (h) => {
         // A page from another build reloads (the plugin was updated).
         if (build !== null && build !== h.build) location.reload();
-        build = h.build;
+        build = h.build ?? null;
         version = h.version;
         if (!control) return;
         store.connected(control);

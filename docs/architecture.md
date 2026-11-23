@@ -1066,8 +1066,9 @@ ops list. The release workflow builds the page once in its own job
 **The web as a UI target.** The overlord's UI tools (`goto_session`,
 `show_list`, `set_list_view`, `propose_session`, `confirm_new_session`,
 `confirm_setup`, `open_keys`, `go` on a launch) land on one *surface*:
-the user's terminal (a tmux client) or one web page (a browser tab's
-control socket).
+the user's terminal (a tmux client), one web page (a browser tab's
+control socket), or one paired device (the phone, through the relay:
+"The phone as a surface" below).
 
 - *Which one* (`ui::target`, on the pure `ui::pick`): the surface the user
   last did something on. A terminal's last use is tmux's
@@ -1094,8 +1095,9 @@ control socket).
   `ui.state` has `target`, `web` (the most recent page) and `current_view`
   from the target. Pages go when the last `web.subscribe` stream ends.
 - *Addressed commands.* `Daemon::ui_cmd_to` sends `{"notify":"ui",
-  "to":"terminal"|"web", "page"?, "cmd"}` on the broadcast. The TUI
-  ignores `to: "web"`; `web.subscribe` passes the web's on as
+  "to":"terminal"|"web"|"device", "page"?, "device"?, "n"?, "cmd"}` on
+  the broadcast. The TUI ignores `to: "web"` and `"device"`;
+  `web.subscribe` passes the web's on as
   `{"notify":"ui","page","cmd"}`, never folded into or dropped by the
   coalescing of `changed`; the plugin sends each to its page only as
   `{"event":"ui","cmd"}`. Each surface has one parked slot (30 s): the
@@ -1208,16 +1210,42 @@ tool, never reachable from a device.
 **How a device's request reaches the daemon.** The plugin passes the
 control stream's `{id, op, args}` on as `web.call {op, args, via:
 "remote", device}`. `web::OPS` has a `remote` column: a device may call
-what a local page may except what writes `config.toml`, the surface
-reports, the key screen and device management. A remote call has no
-`page`, never counts as use of a screen and gets no `ui` commands. To
+what a local page may except what writes `config.toml`, the key screen
+and device management (it may remove itself: `device.leave`, which a
+local page is refused as `bad_request`; the plugin removes the device as
+`revoke` does once the answer has had time to reach it). To
 make an op remote, set `remote: true` on its `Op` and test it from a
 device in `web_api.rs`; an op is local-only unless a device needs it.
 Mark it `.idempotent()` only if running it twice is the same as once (a
 look-up); anything else is deduplicated by request id.
-`overlord.messages` (both) gives the active overlord's recent
-conversation as text, read from its transcript (at most 50 messages of 4
-KiB), for a chat view.
+`overlord.messages` and `session.messages {ref}` (both) give the active
+overlord's or a session's recent conversation as text, read from its
+transcript (at most 50 messages of 4 KiB), for a chat view and a
+session's view without a pane. A device's `hello` carries `api`, the
+remote API level (`web::API`, from `web.hello`'s answer): the ops, the
+snapshot and the `ui` commands as a device sees them. Within a level
+they only grow; `web_api.rs` pins the remote ops and snapshot keys
+against `crates/daemon/tests/fixtures/remote_api.json`.
+
+**The phone as a surface.** A paired device is a third kind of surface
+beside the terminal and the pages. The daemon keeps a page's record per
+device, by the id the plugin stamps (`page.report` and `page.pending`
+are remote; the device's `hello` gives its id as `page`), at most 16,
+dropped when the plugin's `web.remote_state` no longer lists it as
+paired. Its last use is the daemon's clock at a user-driven op from it or
+a `page.report` with `input`; one never used counts only while it has a
+live session. `ui::pick` takes devices beside pages by the same rule
+(`ui_target = "web"` covers both); `target_local` leaves them out for
+what needs this computer (`confirm_setup`, `open_keys`; the overlay is
+the terminal's anyway), which then takes a terminal or page, or fails
+naming them. Answers say `"on": "phone"`; `ui.state` has `phone`, shaped
+like `web`. A device's command is the line `{"notify":"ui","to":
+"device","device","n","cmd"}`, parked in that device's one slot (10
+minutes): the plugin sends `{"event":"ui","cmd"}` on its live session
+and says `web.ui_delivered {device, n}`, which clears the slot; with no
+live session it asks the relay to `signal` the device, and the
+device's `page.pending` at its next `hello` hands the command over,
+once. A phone gets no notices of what opened elsewhere.
 
 The user's commands (`relay.*`, `daemon/src/relay.rs`) go the other
 way. They are dispatched from the socket only, never through
