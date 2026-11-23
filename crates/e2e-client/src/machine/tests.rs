@@ -1703,3 +1703,36 @@ fn a_relay_changing_boot_every_time_gets_one_resend_per_link() {
     assert_eq!(w.host.mb_got.len(), 6);
     assert_eq!(w.dials.len(), 6);
 }
+
+// ---- the page as a surface ----
+
+#[test]
+fn ui_commands_reach_the_page_and_its_reports_are_lookups() {
+    let mut w = World::live();
+    // An overlord's command on the live session: to the page as it came.
+    w.host_says(json!({"event": "ui", "cmd": {"cmd": "show_list"}}));
+    assert_eq!(
+        w.page_events("ui"),
+        [json!({"event": "ui", "cmd": {"cmd": "show_list"}})]
+    );
+    // The page's report: no outbox entry, nothing saved, no outbox event.
+    let disk = w.disk.clone();
+    let outboxes = w.page_events("outbox").len();
+    w.page_says(json!({"id": 1, "op": "page.report", "args": {"route": {"kind": "list"}}}));
+    let r = w.requests().pop().unwrap();
+    assert_eq!(r["op"], "page.report");
+    assert_eq!(r["args"]["route"]["kind"], "list");
+    assert_eq!(w.disk, disk);
+    assert_eq!(w.page_events("outbox").len(), outboxes);
+    w.host_says(json!({"id": r["id"], "ok": {}}));
+    assert_eq!(w.reply(1).unwrap()["ok"], json!({}));
+    // In flight when the link dies: `disconnected`, never resent.
+    w.page_says(json!({"id": 2, "op": "page.report", "args": {}}));
+    w.closed(1006);
+    assert_eq!(w.reply(2).unwrap()["error"]["code"], "disconnected");
+    // Taking a parked command is kept and resent by id: its answer is
+    // stored at the host, so a lost one isn't a lost command.
+    let mut w = World::live();
+    w.page_says(json!({"id": 3, "op": "page.pending", "args": {}}));
+    assert_eq!(w.saved().outbox.len(), 1);
+}
