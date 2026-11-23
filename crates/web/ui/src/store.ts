@@ -4,13 +4,13 @@
 // only asks for snapshots at the right times.
 
 import { batch, computed, type Signal, signal } from "@preact/signals";
-import type { ConnState } from "./api";
-import type { ListView, Op, Query, Row, Snapshot, Sort, UiCmd, Unchanged } from "./proto";
+import type { ListView, PageOp, Query, Row, Snapshot, Sort, UiCmd, Unchanged } from "./proto";
+import type { ConnState } from "./transport";
 import type { OpenForm } from "./ui";
 
-/** What the store needs of the control socket. */
+/** What the store needs of its transport (a fake in tests). */
 export interface Requester {
-  request<T = unknown>(op: Op, args?: object): Promise<T>;
+  request<T = unknown>(op: PageOp, args?: object): Promise<T>;
 }
 
 export type Tab = "sessions" | "groups";
@@ -284,7 +284,7 @@ export class Store {
   }
 
   /** Ask the daemon (an op on its allow-list); fails when not connected. */
-  request<T = unknown>(op: Op, args: object = {}): Promise<T> {
+  request<T = unknown>(op: PageOp, args: object = {}): Promise<T> {
     if (!this.api) return Promise.reject(new Error("not connected"));
     return this.api.request<T>(op, args);
   }

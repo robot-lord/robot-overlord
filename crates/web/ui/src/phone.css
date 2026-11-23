@@ -1,0 +1,320 @@
+/* The phone app's page, over app.css: light and dark from the system,
+   the screen's safe areas, the part of it the keyboard leaves, 16 px
+   inputs (iOS zooms into smaller ones), 44 px touch targets, and nothing
+   that needs hover. Only app.tsx imports this. */
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fafafa;
+    --panel: #ffffff;
+    --fg: #1d1d22;
+    --dim: #6b6b75;
+    --line: #dcdce2;
+    --accent: #7a3fb8;
+    --bad: #c62828;
+    --ok: #2e7d32;
+    --warn: #a15c00;
+    --info: #1565c0;
+    color-scheme: light;
+  }
+  .phone .banner {
+    background: #efe6f7;
+  }
+}
+
+.phone {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  overscroll-behavior: none;
+}
+/* Laid over the visual viewport (app.tsx sets --vvh and --vvtop), so the
+   composer sits above the keyboard. */
+.phone .app {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: var(--vvtop, 0);
+  height: var(--vvh, 100dvh);
+  padding: 0 env(safe-area-inset-right) 0 env(safe-area-inset-left);
+  box-sizing: border-box;
+}
+.phone .bar {
+  padding-top: max(8px, env(safe-area-inset-top));
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+.phone .bar .conn {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.phone .menu-link {
+  font-size: 22px;
+  line-height: 1;
+  color: var(--accent);
+}
+
+/* One column at any width under a tablet's. */
+@media (max-width: 899px) {
+  .phone .at-status .side,
+  .phone .at-list .main {
+    display: none;
+  }
+  .phone .back {
+    display: inline-flex;
+  }
+}
+
+/* Inputs at 16 px; touch targets at least 44 px. */
+.phone input,
+.phone textarea,
+.phone select {
+  font-size: 16px;
+}
+.phone button,
+.phone select,
+.phone .back,
+.phone .menu-link,
+.phone .row,
+.phone .toggle {
+  min-height: 44px;
+}
+.phone button,
+.phone .back,
+.phone .menu-link {
+  min-width: 44px;
+  align-items: center;
+  justify-content: center;
+}
+.phone .back {
+  padding: 0 8px 0 0;
+}
+.phone .row {
+  align-items: center;
+}
+/* The usage figure: no room at phone width. */
+.phone .row .usage {
+  display: none;
+}
+.phone .modal-back {
+  padding: env(safe-area-inset-top) 0 0;
+}
+.phone .modal {
+  border-radius: 0;
+  min-height: 100%;
+  box-sizing: border-box;
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
+}
+.phone .toast {
+  bottom: max(16px, env(safe-area-inset-bottom));
+}
+
+/* Chat and a session's text. */
+.chat,
+.session-text {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.msgs {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+.msgs .older {
+  align-self: center;
+}
+.msg {
+  max-width: 85%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.msg-text {
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.msg-you {
+  align-self: flex-end;
+}
+.msg-you .msg-text {
+  border-color: var(--accent);
+}
+.msg-agent {
+  align-self: flex-start;
+}
+.msg-tool {
+  align-self: flex-start;
+  font-size: 12px;
+  color: var(--dim);
+}
+.msg-tool .msg-text {
+  background: none;
+  border-style: dashed;
+}
+.msg-at,
+.msg-note {
+  font-size: 11px;
+  color: var(--dim);
+  padding: 0 4px;
+}
+.msg-you .msg-at,
+.msg-you .msg-note {
+  align-self: flex-end;
+}
+.bubble-pending .msg-text {
+  opacity: 0.7;
+  border-style: dashed;
+}
+.bubble-failed .msg-text,
+.bubble-interrupted .msg-text {
+  border-color: var(--bad);
+}
+.bubble-failed .msg-note,
+.bubble-interrupted .msg-note {
+  color: var(--bad);
+}
+.bubble-buttons {
+  display: flex;
+  gap: 6px;
+  align-self: flex-end;
+}
+.composer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px max(8px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+  background: var(--bg);
+}
+.composer textarea {
+  flex: 1;
+  min-width: 0;
+  max-height: 30vh;
+}
+.composer-err {
+  flex-basis: 100%;
+  margin: 0;
+  white-space: normal;
+}
+.not-running.inline {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.not-running.inline p {
+  margin: 0;
+}
+.notes {
+  margin: 0;
+  padding: 8px 12px;
+  white-space: pre-wrap;
+  color: var(--dim);
+  border-bottom: 1px solid var(--line);
+}
+.no-pane {
+  margin: 0;
+  padding: 8px 12px max(8px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+}
+
+/* Pairing and the status screen. */
+.pair {
+  padding: max(24px, env(safe-area-inset-top)) 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 480px;
+  margin: 0 auto;
+}
+.pair h1 {
+  font-size: 20px;
+  margin: 0;
+}
+.pair p {
+  margin: 0;
+}
+.pair .big {
+  font-size: 18px;
+  padding: 10px 24px;
+  align-self: flex-start;
+}
+.pair .code {
+  font-size: 36px;
+  letter-spacing: 4px;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+.pair-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.pair-form .field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.err-line {
+  color: var(--bad);
+}
+.status-screen {
+  overflow-y: auto;
+}
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px 16px;
+  margin: 0;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.facts dt {
+  color: var(--dim);
+}
+.facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.toggles {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--line);
+}
+.toggle {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+}
+.toggle > span {
+  display: flex;
+  flex-direction: column;
+}
+.toggle input {
+  width: 24px;
+  height: 24px;
+}
+.unpair {
+  border-bottom: none;
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+}

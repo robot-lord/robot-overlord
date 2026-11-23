@@ -1,4 +1,28 @@
 import type { Sock } from "../src/api";
+import type { Bridge } from "../src/remote";
+
+/** The app shell's message bridge, driven by hand: `push` is the native side. */
+export class FakeBridge implements Bridge {
+  sent: string[] = [];
+  private recv: ((text: string) => void) | null = null;
+  send(text: string): void {
+    this.sent.push(text);
+  }
+  listen(recv: (text: string) => void): void {
+    this.recv = recv;
+  }
+  push(m: unknown): void {
+    this.recv?.(typeof m === "string" ? m : JSON.stringify(m));
+  }
+  json(i: number): unknown {
+    const s = this.sent.at(i);
+    return s === undefined ? undefined : JSON.parse(s);
+  }
+  /** Every message sent, parsed. */
+  all(): Record<string, unknown>[] {
+    return this.sent.map((s) => JSON.parse(s) as Record<string, unknown>);
+  }
+}
 
 /** A websocket the test drives by hand. */
 export class FakeSock implements Sock {

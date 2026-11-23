@@ -59,10 +59,13 @@ export function NewSession({
   store,
   kind,
   cmd,
+  manualInside = false,
 }: {
   store: Store;
   kind: NewForm["kind"];
   cmd: UiCmd | null;
+  /** The describe form offers the manual one (a page with one New button). */
+  manualInside?: boolean;
 }) {
   const [defaults, setDefaults] = useState<FormDefaults | null>(null);
   const [repos, setRepos] = useState<FormRepos | null>(null);
@@ -308,6 +311,17 @@ export function NewSession({
               Optional hints: leave them as they are and the overlord works them out from your
               description. Your description wins where they disagree.
             </p>
+            {manualInside && !cmd && (
+              <button
+                type="button"
+                class="dim link"
+                onClick={() => {
+                  store.form.value = { kind: "manual", cmd: null, touched: false };
+                }}
+              >
+                Fill in every field yourself instead (no overlord)
+              </button>
+            )}
             <div class="hints">
               {repoField}
               {agentField}

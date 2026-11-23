@@ -26,6 +26,7 @@ mod tap;
 mod tools;
 mod version;
 mod web;
+mod web_app;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -46,8 +47,9 @@ usage: cargo xtask <task>
       the relay's container image (amd64, arm64) from a release's relay tarballs
   check-deps
       fail if the rlord binary depends on network code (the web plugin's)
-  web install|check|build|watch
-      the web plugin's page (crates/web/ui): install its pinned tools, check, build
+  web install|check|build [--app]|check-app|watch
+      the web plugin's page (crates/web/ui) and the phone app's (--app): install its
+      pinned tools, check, build
   e2e vectors [--check] | wasm | test-wasm
       the end-to-end crypto core's test vectors and WASM build (crates/e2e)
   app bindings | core-ios | ios [--sim [NAME] | --device ID] | test-ios [--unit]

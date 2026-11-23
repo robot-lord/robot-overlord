@@ -1616,6 +1616,8 @@ fn overlord_messages_are_bounded() {
         json!({"before": first, "limit": 5}),
     )["result"]
         .clone();
+    // (Five short messages: the phone page's chat test reads them.)
+    fixture("overlord_messages", &back);
     let back = back["messages"].as_array().unwrap().clone();
     assert_eq!(back.len(), 5);
     assert!(back.iter().all(|m| m["line"].as_u64().unwrap() < first));
