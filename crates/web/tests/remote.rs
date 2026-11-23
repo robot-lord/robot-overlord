@@ -910,3 +910,29 @@ async fn an_answer_refused_by_a_full_queue_is_sent_again() {
     assert_eq!(a["id"], "f2", "{a}");
     assert!(!audit().contains("not delivered"));
 }
+
+/// The plugin stopped and started again at once, a few times: a relay
+/// command right after each start reaches the new plugin (the old one's
+/// stream doesn't count as a plugin that will answer), and right after a
+/// stop nothing reports the old plugin's state as current.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_command_right_after_a_restart_reaches_the_new_plugin() {
+    let _g = LOCK.lock().await;
+    let w = world(1).await;
+    for i in 0..5 {
+        let d = w.rig.daemon.clone();
+        tokio::task::spawn_blocking(move || d.web().stop())
+            .await
+            .unwrap();
+        let s = rpc("relay.status", json!({})).await.unwrap();
+        assert_eq!(s["reported"], false, "stop {i}: {s}");
+        let d = w.rig.daemon.clone();
+        tokio::task::spawn_blocking(move || d.web().start(false).map(|_| ()))
+            .await
+            .unwrap()
+            .unwrap();
+        let t = Instant::now();
+        let r = rpc("relay.pair_cancel", json!({})).await;
+        assert!(r.is_ok(), "restart {i} ({:?}): {r:?}", t.elapsed());
+    }
+}

@@ -67,11 +67,41 @@ fn standin() {
     .unwrap();
     let mut lines = BufReader::new(s).lines();
     let _reply = lines.next();
+    if mode == "relay" {
+        relay_standin();
+    }
     // Stay until the daemon goes (or a signal ends it).
     for l in lines {
         if l.is_err() {
             break;
         }
+    }
+    std::process::exit(0)
+}
+
+/// The stand-in's `relay` mode, after its hello: subscribe as the plugin
+/// does, and answer every relay command with its pid; until the daemon
+/// goes (or a signal ends it).
+fn relay_standin() {
+    let sock = std::env::var("RLORD_STANDIN_SOCK").unwrap();
+    let s = UnixStream::connect(&sock).unwrap();
+    let mut w = s.try_clone().unwrap();
+    writeln!(w, "{}", json!({"id": 1, "method": "web.subscribe"})).unwrap();
+    for l in BufReader::new(s).lines() {
+        let Ok(l) = l else { break };
+        let v: Value = serde_json::from_str(&l).unwrap_or_default();
+        if v["notify"] != "remote" {
+            continue;
+        }
+        let mut c = UnixStream::connect(&sock).unwrap();
+        writeln!(
+            c,
+            "{}",
+            json!({"id": 2, "method": "web.remote_reply", "params": {
+                "id": v["id"], "ok": {"pid": std::process::id()}}})
+        )
+        .unwrap();
+        let _ = BufReader::new(c).lines().next();
     }
     std::process::exit(0)
 }
@@ -249,6 +279,30 @@ fn start_waits_for_hello_and_stop_ends_it() {
     // Stopped is stopped: not restarted.
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(r.starts(), 1);
+}
+
+/// Stopped, then a relay command at once; stopped and started again at
+/// once, then a relay command: each reaches the plugin running now, never
+/// the stopped one's stream (which the daemon has let go of by the time
+/// `web.stop` returns).
+#[test]
+fn a_relay_command_right_after_a_stop_or_restart_reaches_the_new_plugin() {
+    let r = Rig::new();
+    r.standin("relay");
+    let mut pid = r.ok("web.start")["pid"].clone();
+    for i in 0..5 {
+        r.ok("web.stop");
+        // (It starts the plugin, and waits for its stream.)
+        let a = r.ok("relay.pair_cancel");
+        let now = r.ok("web.status")["pid"].clone();
+        assert_ne!(now, pid, "stop {i}");
+        assert_eq!(a["pid"], now, "stop {i}: {a}");
+        r.ok("web.stop");
+        pid = r.ok("web.start")["pid"].clone();
+        assert_ne!(pid, now, "restart {i}");
+        let a = r.ok("relay.pair_cancel");
+        assert_eq!(a["pid"], pid, "restart {i}: {a}");
+    }
 }
 
 #[test]

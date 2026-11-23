@@ -142,8 +142,6 @@ async fn the_plugin_restarted_mid_request() {
     let ask = phone.send("overlord.ask", json!({"text": "two"}));
     audit_until(&format!("{id} op overlord.ask"), 2).await;
     w.rig.daemon.web().stop();
-    // (The supervisor settles after a stop before the next start.)
-    tokio::time::sleep(Duration::from_millis(500)).await;
     start_plugin(&w, &[]);
     let a = phone.reply(ask, LONG).await.unwrap();
     assert_eq!(a["error"]["code"], "interrupted", "{a}");
