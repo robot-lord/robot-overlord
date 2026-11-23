@@ -385,6 +385,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// A Claude session's draft that rlord stashed and couldn't put back
+    /// (`⎘` on its row) is dealt with: forget it, so rlord may stash
+    /// drafts in that session again. (Seeing the draft back in its box
+    /// does the same.)
+    StashDismiss {
+        /// Session (id, prefix or name)
+        session: String,
+    },
     /// Install the newest release from GitHub (no compiling), then reset a
     /// running rlord onto it. Same as scripts/update.sh.
     Update {
@@ -804,6 +812,16 @@ fn main() -> Result<()> {
                         format!("the overlord is now on {agent} (its conversation as you left it)"),
                 }
             );
+            Ok(())
+        }
+        Command::StashDismiss { session } => {
+            let r = call("session.stash_dismiss", json!({"ref": session}))?;
+            let name = r["session"].as_str().unwrap_or("?");
+            if r["dismissed"] == true {
+                println!("{name}: stashed draft dismissed");
+            } else {
+                println!("{name}: no stashed draft of rlord's");
+            }
             Ok(())
         }
         Command::ResumeAfterLimit {

@@ -436,26 +436,69 @@ pub(crate) fn usage_limit(v: &Value) -> Option<(i64, String)> {
 /// allowed for.
 pub fn dialog_shown(screen: &str) -> bool {
     let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    let Some((i, rest)) = lowest_mark(&lines) else {
+        return false;
+    };
+    !ruled_above(&lines, i) && super::numbered_choice(rest.trim_start())
+}
+
+/// The lowest `❯` line among the bottom 25 non-blank ones (`│` borders
+/// allowed for), and what follows its `❯`.
+fn lowest_mark(lines: &[&str]) -> Option<(usize, String)> {
     let mark = |l: &str| {
         l.trim_start_matches(|c: char| c.is_whitespace() || c == '│')
             .strip_prefix('❯')
             .map(str::to_string)
     };
-    // The lowest `❯` line among the bottom 25 non-blank ones.
-    let Some((i, rest)) = lines
+    lines
         .iter()
         .enumerate()
         .rev()
         .filter(|(_, l)| !l.trim().is_empty())
         .take(25)
         .find_map(|(i, l)| mark(l).map(|r| (i, r)))
-    else {
-        return false;
-    };
-    let input_box = i
-        .checked_sub(1)
-        .is_some_and(|j| lines[j].trim_start().starts_with('─'));
-    !input_box && super::numbered_choice(rest.trim_start())
+}
+
+/// A `─` rule directly above line `i`.
+fn ruled_above(lines: &[&str], i: usize) -> bool {
+    i.checked_sub(1)
+        .is_some_and(|j| lines[j].trim_start().starts_with('─'))
+}
+
+/// Claude Code's input box on a plain screen, as line indexes: the top
+/// `─` rule, the `❯` line, and the bottom rule. Found as `dialog_shown`
+/// finds it (the lowest `❯` line with a rule right above it), so every
+/// reader agrees on where it is. None: no input box (a dialog, or a
+/// screen not recognised).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputBox {
+    pub top: usize,
+    pub input: usize,
+    pub bottom: usize,
+}
+
+impl InputBox {
+    /// The box's text lines (from the `❯` line to above the bottom rule).
+    pub fn lines<'a>(&self, lines: &[&'a str]) -> Vec<&'a str> {
+        lines[self.input..self.bottom].to_vec()
+    }
+}
+
+pub fn input_box(screen: &str) -> Option<InputBox> {
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    let (input, _) = lowest_mark(&lines)?;
+    if !ruled_above(&lines, input) {
+        return None;
+    }
+    let bottom = input
+        + lines[input..]
+            .iter()
+            .position(|l| l.trim_start().starts_with('─'))?;
+    Some(InputBox {
+        top: input - 1,
+        input,
+        bottom,
+    })
 }
 
 // ---- archive summaries ----

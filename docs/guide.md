@@ -150,8 +150,29 @@ runs a command.
   10s of the last thing typed into it, or while you are typing in a
   terminal showing that session (used in the last 5s; typing to the
   overlord in its overlay doesn't count). A waiting message that is held
-  back says why once in the session's log. A restart, stop or archive
+  back says why once in the session's log, and its row shows `✉`
+  (`✉ draft` when unsent text holds it, `✉ stash` while waiting for
+  Claude to restore a stashed draft; hover for why). A restart, stop or archive
   of the session waits for a paste in progress, and the other way round.
+- In a **Claude** session, a draft doesn't hold a message for long. Once
+  your unsent text has sat unchanged for 30s, rlord sets it aside with
+  Claude Code's own prompt stash (Ctrl+S; "draft stashed" shows under
+  the box) and sends the message. Claude Code puts your draft back by
+  itself once that turn is over; rlord never presses Ctrl+S to restore
+  it. Until rlord sees the draft back in the box, or you send a prompt
+  of your own, further messages to that session wait (`✉ stash`). Claude Code's
+  stash holds one draft, so rlord never stashes while one is already
+  stashed, and stops trying in a session for 10 minutes when Ctrl+S
+  didn't take the draft. If the message couldn't go in after the stash,
+  or a minute after the turn your draft still isn't seen back, the row
+  shows `⎘` ("draft may still be stashed"): with the box empty, press
+  Ctrl+S to restore (Ctrl+S with text in the box overwrites the stash),
+  or run `rlord stash-dismiss <session>` to tell rlord it's dealt with.
+  A restart of the session loses the stash with the process (logged). If `~/.claude/keybindings.json` (rlord
+  only reads it) binds Ctrl+S, or a chord starting with it, to anything
+  else, or binds `chat:stash` to any other key, rlord leaves the stash
+  alone and a draft holds messages as before. Codex and OpenCode have no
+  stash: a draft holds.
 - `rlord overlord ask` (and the list's `n` form) won't type into the
   overlord while it waits on you, or while its screen shows a dialog: its
   Enter would answer it. Answer it first.

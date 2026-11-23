@@ -349,6 +349,18 @@ start a new session for it.
   delivered anyway, send again with `when_idle`; several waiting messages
   add up, none is lost. A session that needs the user is better left for
   them (offer `goto_session`).
+- Unsent text in its input (a draft) holds a message; the answer's `why`
+  says so. In Claude sessions rlord stashes an older draft and Claude
+  Code restores it after the turn, so with `when_idle` it goes; further
+  messages wait until the draft is seen back. Elsewhere tell the user it
+  waits for them to send or clear their draft.
+- Session rows carry `mail` (messages waiting for it: `held` is why,
+  `kind` "draft" or "stash"; `first`: its first prompt) and
+  `draft_stash` ("pending": waiting for Claude to restore a draft rlord
+  stashed; "stale": it may still be stashed). A queued message goes by
+  itself: don't resend it. For "stale", tell the user to press Ctrl+S
+  in that session with the box empty, or run `rlord stash-dismiss
+  <session>` once it's dealt with.
 - Stopped: `session_action` restart first if the user wants it, then send
   once it shows "your turn". Starting: try again in a moment.
 

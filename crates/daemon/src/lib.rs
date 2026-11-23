@@ -29,6 +29,7 @@ pub mod search;
 pub mod send;
 pub mod session_tools;
 pub mod setup;
+pub mod stash;
 pub mod summary;
 pub mod triage;
 pub mod ui;
@@ -954,6 +955,7 @@ impl Daemon {
             }
             "overlord.ask" => ask::ask(self, params),
             "session.send" => send::send(self, params),
+            "session.stash_dismiss" => stash::dismiss(self, params),
             "limits.resume" => limits::resume(self, params),
             "limits.auto_resume" => limits::set_auto_resume(self, params),
             "overlord.triage" => triage::triage(self, params),
@@ -1433,6 +1435,8 @@ pub(crate) fn annotate_status(d: &Daemon, rows: &mut [Value], remote: bool) {
     }
     background::annotate(d, rows);
     limits::annotate(d, rows);
+    send::annotate(d, rows);
+    stash::annotate(d, rows);
     set_shown_status(rows);
 }
 
