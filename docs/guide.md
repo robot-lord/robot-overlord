@@ -150,8 +150,20 @@ runs a command.
   10s of the last thing typed into it, or while you are typing in a
   terminal showing that session (used in the last 5s; typing to the
   overlord in its overlay doesn't count). A waiting message that is held
-  back says why once in the session's log. A restart, stop or archive
+  back says why once in the session's log, and its row shows `✉`
+  (`✉ draft` when unsent text holds it; hover for why). A restart, stop or archive
   of the session waits for a paste in progress, and the other way round.
+- In a **Claude** session, a draft doesn't hold a message for long. Once
+  your unsent text has sat unchanged for 30s, rlord sets it aside with
+  Claude Code's own prompt stash (Ctrl+S; "draft stashed" shows under
+  the box), sends the message, and presses Ctrl+S again once that turn
+  is over, which puts your draft back as it was. Claude Code's stash
+  holds one draft, so rlord never stashes while one is already stashed,
+  and never presses Ctrl+S while the box has text in it. If it can't put
+  the draft back, the row shows `⎘`: press Ctrl+S in the session
+  yourself. If you moved `chat:stash` off Ctrl+S in
+  `~/.claude/keybindings.json` (rlord only reads it), a draft holds
+  messages as before. Codex and OpenCode have no stash: a draft holds.
 - `rlord overlord ask` (and the list's `n` form) won't type into the
   overlord while it waits on you, or while its screen shows a dialog: its
   Enter would answer it. Answer it first.

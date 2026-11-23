@@ -55,6 +55,14 @@ pub fn legend() -> Vec<(String, &'static str)> {
         "Remote Control: green on, dim connecting, red failing",
     ));
     v.push(("⚙N".into(), "N sub-agents running"));
+    v.push((
+        "✉".into(),
+        "a message from the overlord waits (✉ draft: held by unsent text)",
+    ));
+    v.push((
+        "⎘".into(),
+        "a draft rlord stashed wasn't restored: Ctrl+S in the session",
+    ));
     v.push(("⋯".into(), "still loading its sub-agent counts"));
     v
 }
@@ -270,11 +278,42 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
             shown: true,
         });
     }
+    v.extend(mail_marks(s));
     // The status always shows (clipped if it must); the rest only whole.
     let mut used = v[0].mark.width();
     for m in &mut v[1..] {
         used += 1 + m.mark.width();
         m.shown = used <= width;
+    }
+    v
+}
+
+/// The overlord's messages waiting for the session (`mail`: `✉`, or `✉
+/// draft` when a draft in its input holds them) and a draft rlord
+/// stashed and couldn't put back (`draft_stash`: "failed").
+fn mail_marks(s: &Value) -> Vec<Item> {
+    let mut v = Vec::new();
+    let m = &s["mail"];
+    if m.is_object() {
+        let (mark, text) = match m["held"].as_str() {
+            Some(why) if m["draft"] == true => ("✉ draft", format!("a message is held: {why}.")),
+            Some(why) => ("✉", format!("a message is held: {why}.")),
+            None => ("✉", "a message waits for its turn to end.".to_string()),
+        };
+        v.push(Item {
+            label: "mail",
+            mark: Span::styled(mark, theme::faint()),
+            text,
+            shown: true,
+        });
+    }
+    if s["draft_stash"] == "failed" {
+        v.push(Item {
+            label: "stash",
+            mark: Span::styled("⎘", Style::default().fg(theme::red())),
+            text: "draft stashed: Ctrl+S in the session to restore it (rlord couldn't).".into(),
+            shown: true,
+        });
     }
     v
 }
@@ -547,5 +586,30 @@ mod tests {
                 "2 background shells: Dev server, Watch tests (1m ago).",
             ]
         );
+    }
+
+    /// Waiting messages show `✉` (`✉ draft` when a draft holds them) and
+    /// a stash rlord couldn't put back shows `⎘`.
+    #[test]
+    fn mail_and_stash_marks() {
+        let marks = |s: &Value| -> Vec<String> {
+            status_marks(s, false, 80, 0)
+                .iter()
+                .skip(1)
+                .map(Item::plain)
+                .collect()
+        };
+        assert!(marks(&json!({"status": "idle"})).is_empty());
+        let waiting = json!({"status": "working", "mail": {"held": null, "draft": false}});
+        assert_eq!(
+            marks(&waiting),
+            ["✉ — a message waits for its turn to end."]
+        );
+        let draft = json!({"status": "idle",
+            "mail": {"held": "its input holds unsent text (a draft)", "draft": true}});
+        assert!(marks(&draft)[0].starts_with("✉ draft — a message is held: its input"));
+        let failed = json!({"status": "idle", "draft_stash": "failed"});
+        assert!(marks(&failed)[0].starts_with("⎘ — draft stashed: Ctrl+S"));
+        assert!(marks(&json!({"status": "idle", "draft_stash": "pending"})).is_empty());
     }
 }
