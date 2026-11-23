@@ -23,8 +23,6 @@ and `crates/daemon/src/overlord.md`. The full working doc is in git history
   - The OpenCode retry hold covers only `Source::Resume`; extend it to
     `Source::Send`.
 - **`auto_schedule` and `limit_auto`**
-  - `auto_schedule`'s final `retain` prunes `limit_auto` with the
-    `limits` snapshot taken at its start, which may be stale by then.
   - The `limit_auto` marker is pruned when a session is archived or
     unarchived across a restart, so its limit can be scheduled again.
   - Return early from `auto_schedule` when no session is limited.
@@ -43,9 +41,3 @@ and `crates/daemon/src/overlord.md`. The full working doc is in git history
   - `offer_auto_resume` makes a blocking daemon call inside refresh.
   - Ctrl+D ("don't ask again") in the setup form drops the auto-resume
     pick made on that form.
-
-## Open decision (the user's)
-
-- There is no `confirm_*` form or overlord tool for this option. The
-  overlord can only point the user at `[limits] auto_resume`. Whether it
-  should be able to set the option is the user's call.

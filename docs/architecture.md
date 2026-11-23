@@ -549,7 +549,11 @@ hooks and `discover` keep the stored status to themselves.
   form offers it as an optional hint ("ask me later" by default;
   `setup.apply {auto_resume}`, one config write with the folder), and a
   dialog asks when a listed session is limited and `limits.auto_resume {on}` writes the
-  answer to rlord's `config.toml` and takes it without a restart.
+  answer to rlord's `config.toml` and takes it without a restart. The
+  overlord's `set_auto_resume` tool calls the same method, only on the
+  user's explicit request (the user's decision). Turning it off also
+  clears the dropped jobs' `limit_auto` markers, so turning it back on
+  during the same limit makes them again.
   `limits::native_auto_resume` is the per-agent stand-down slot: true
   for an agent that resumes by itself, and then rlord neither schedules
   nor sends. It is false for all three today. Each session gets a job in kv `limit_resume`, so a daemon

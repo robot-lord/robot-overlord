@@ -551,16 +551,21 @@ fn auto_schedule(d: &Daemon) -> Result<()> {
         }
         tracing::info!(session = %s.name, "resume scheduled by itself (auto_resume)");
     }
-    {
-        // (Over what `schedule` recorded meanwhile.)
-        let db = d.db();
-        let mut now_done = db.kv_map(AUTO_KEY)?;
-        merge_newer(&mut now_done, done);
-        now_done.retain(|id, _| limits.contains_key(id));
-        db.kv_set_map(AUTO_KEY, &now_done)?;
-    }
+    save_markers(d, done)?;
     d.changed();
     Ok(())
+}
+
+/// Save `auto_schedule`'s markers `done` (kv `limit_auto`) over what was
+/// recorded meanwhile, forgetting sessions no longer limited per a fresh
+/// read of the limits: one limited since the tick began keeps its marker.
+fn save_markers(d: &Daemon, done: Map<String, Value>) -> Result<()> {
+    let limits = limits(d);
+    let db = d.db();
+    let mut now_done = db.kv_map(AUTO_KEY)?;
+    merge_newer(&mut now_done, done);
+    now_done.retain(|id, _| limits.contains_key(id));
+    db.kv_set_map(AUTO_KEY, &now_done)
 }
 
 /// Markers in `from` over `into` (kv `limit_auto`), keeping the later
@@ -577,7 +582,8 @@ fn merge_newer(into: &mut Map<String, Value>, from: Map<String, Value>) {
 }
 
 /// Auto-resume is off: drop the jobs it made (`auto`), keep the ones
-/// asked for, each logged.
+/// asked for, each logged. A dropped job's marker (kv `limit_auto`) goes
+/// too: turned back on during the same limit, the job is made again.
 fn drop_auto_jobs(d: &Daemon) -> Result<()> {
     let ids: Vec<String> = d
         .db()
@@ -597,6 +603,10 @@ fn drop_auto_jobs(d: &Daemon) -> Result<()> {
         if jobs.get(&id).is_some_and(|j| j["auto"] == true) {
             jobs.remove(&id);
             db.kv_set_map(JOBS_KEY, &jobs)?;
+            let mut done = db.kv_map(AUTO_KEY)?;
+            if done.remove(&id).is_some() {
+                db.kv_set_map(AUTO_KEY, &done)?;
+            }
             db.insert_event(
                 &id,
                 now,
@@ -1424,6 +1434,42 @@ mod tests {
         d.update_config(|c| c.limits.auto_resume = Some(false));
         auto_schedule(&d).unwrap();
         assert!(d.db().kv_map(JOBS_KEY).unwrap().contains_key("s1"));
+    }
+
+    /// Off, then on again during the same limit: the job it dropped is
+    /// made again (its marker went with it).
+    #[test]
+    fn auto_resume_off_then_on_makes_the_job_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        auto_schedule(&d).unwrap();
+        let cfg = dir.path().join("config.toml");
+        set_auto_resume_at(&d, &json!({"on": false}), &cfg).unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
+        set_auto_resume_at(&d, &json!({"on": true}), &cfg).unwrap();
+        auto_schedule(&d).unwrap();
+        assert_eq!(d.db().kv_map(JOBS_KEY).unwrap()["s1"]["auto"], true);
+    }
+
+    /// A session limited after `auto_schedule` read the limits keeps the
+    /// marker recorded for it meanwhile: markers are pruned by a fresh read.
+    #[test]
+    fn markers_are_pruned_by_the_limits_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        let at = limits(&d)["s1"]["at"].clone();
+        // s2 is limited and handled (by `resume`, say) mid-tick.
+        d.limits
+            .now
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .insert("s2".into(), json!({"at": 7, "resets_at": 99999999999i64}));
+        mark_handled(&d.db(), "s2", &json!(7)).unwrap();
+        save_markers(&d, Map::from_iter([("s1".to_string(), at)])).unwrap();
+        let done = d.db().kv_map(AUTO_KEY).unwrap();
+        assert!(done.contains_key("s1") && done.contains_key("s2"));
     }
 
     /// A job that gives up because the limit kept hitting: auto-resume

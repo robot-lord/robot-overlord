@@ -327,6 +327,11 @@ pub fn tools() -> Value {
                 "message": s("What to send (default: the user's configured resume message, \"continue\")"),
                 "cancel": b("Cancel the scheduled resume instead of scheduling one (default false)"),
             }), &[]),
+        tool("set_auto_resume",
+            "Read or set the user's auto-resume setting (`[limits] auto_resume` in rlord's config): on, rlord schedules a resume (as resume_after_limit does) for every session that stops on a usage limit, by itself. Set it only when the user explicitly asks to turn it on or off. Turning it off drops the resumes it scheduled; ones the user asked for stay. Without `on`: says what is set (null: not chosen yet, rlord asks the user once).",
+            json!({
+                "on": b("true: turn it on; false: off. Omit to read the current setting"),
+            }), &[]),
         tool("session_action",
             "Lifecycle: restart (resumes the conversation), stop (resumable), archive (stop + hide), unarchive.",
             json!({
@@ -1072,6 +1077,14 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             d.rpc("limits.resume", Value::Object(p))
         }
+        "set_auto_resume" => {
+            let on = match args.get("on") {
+                None | Some(Value::Null) => Value::Null,
+                Some(Value::Bool(on)) => json!(on),
+                Some(other) => bail!("on: true or false, not {other}"),
+            };
+            d.rpc("limits.auto_resume", json!({"on": on}))
+        }
         "session_action" => {
             let r = session_ref(args)?;
             let method = match arg_str(args, "action") {
@@ -1141,6 +1154,7 @@ mod tests {
         "import_sessions",
         "send_to_session",
         "resume_after_limit",
+        "set_auto_resume",
         "session_action",
         // (Fetches, and moves rlord's tree in the repo.)
         "repo_latest",
