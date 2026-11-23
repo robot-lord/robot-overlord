@@ -430,6 +430,12 @@ impl SetupForm {
         self.auto_resume_row && self.auto_resume.is_none()
     }
 
+    /// Saving or sending stops on the unpicked Auto-resume row (an empty
+    /// folder with no description says so first).
+    fn auto_resume_unpicked(&self) -> bool {
+        self.auto_resume_missing() && (self.describing() || !self.code_dir.trim().is_empty())
+    }
+
     /// ←/→/space on the Auto-resume row: on, then off, then on.
     fn toggle_auto_resume(&mut self) {
         self.auto_resume = Some(self.auto_resume != Some(true));
@@ -442,6 +448,9 @@ impl SetupForm {
         exists: &dyn Fn(&str) -> Option<bool>,
     ) -> std::result::Result<SaveCall, String> {
         let dir = self.code_dir.trim();
+        if self.auto_resume_unpicked() {
+            return Err("pick auto-resume on or off (←/→ on its row)".into());
+        }
         if self.describing() && !self.confirmed {
             let source = if dir.is_empty() {
                 "not set"
@@ -467,9 +476,6 @@ impl SetupForm {
                 "roots": roots,
                 "roots_source": roots_source,
             })));
-        }
-        if self.auto_resume_missing() && !dir.is_empty() {
-            return Err("pick auto-resume on or off (←/→ on its row)".into());
         }
         if dir.is_empty() {
             return Err(if self.loading {
@@ -885,7 +891,7 @@ impl App {
             }
             Err(e) => {
                 f.error = Some(e);
-                let at = if f.auto_resume_missing() && !f.code_dir.trim().is_empty() {
+                let at = if f.auto_resume_unpicked() {
                     Row::AutoResume
                 } else {
                     Row::Folder
@@ -1321,6 +1327,10 @@ mod tests {
         assert_eq!(f.rows(), [Row::Folder, Row::AutoResume, Row::Save]);
         let err = f.save_call(&|_| Some(true)).unwrap_err();
         assert!(err.contains("auto-resume"), "{err}");
+        // Going to the overlord too.
+        f.describe = Some("work in ~/ko".into());
+        assert!(f.save_call(&|_| Some(true)).is_err());
+        f.describe = None;
         f.toggle_auto_resume();
         assert_eq!(f.auto_resume, Some(true));
         let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {

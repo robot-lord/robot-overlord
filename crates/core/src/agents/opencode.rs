@@ -469,13 +469,21 @@ fn parse_jsonc(text: &str) -> Option<Value> {
 }
 
 /// OpenCode is counting down its own retry of a failed request ("retrying
-/// in 2m 30s", next to the prompt while its turn is still going): text
-/// typed now would stack on that turn. Only the bottom lines are read,
-/// where it draws the countdown, so a reply quoting the words higher up
-/// doesn't count.
+/// in 2m 30s") while its turn is still going: text typed now would stack
+/// on that turn. Only OpenCode's own chrome under its prompt box is read
+/// (the status lines from the box's closing `╹` line down, as `draft`
+/// finds the box), never the transcript above it or the input inside it,
+/// so a reply or a draft with these words doesn't count. No prompt box on
+/// screen: no.
 pub fn retrying(screen: &str) -> bool {
-    crate::agents::bottom_lines(screen, 12).any(|l| {
-        let l = l.to_lowercase();
+    let lines: Vec<String> = screen
+        .lines()
+        .map(|l| super::strip_ansi(l).to_lowercase())
+        .collect();
+    let Some(close) = lines.iter().rposition(|l| l.trim().starts_with('╹')) else {
+        return false;
+    };
+    lines[close..].iter().any(|l| {
         l.match_indices("retrying in ").any(|(i, m)| {
             l[i + m.len()..]
                 .trim_start()
@@ -1731,15 +1739,24 @@ pub(crate) mod tests {
     /// a resume; the words quoted in a reply higher up don't.
     #[test]
     fn its_retry_countdown_is_seen() {
-        let counting = "┃ fix the build\n\n  Rate limited [retrying in 2m 30s attempt #3]\n┃ >\n  esc interrupt";
-        assert!(retrying(counting));
-        assert!(retrying("  Retrying in 45s"));
-        assert!(!retrying("┃ >\n  ctrl+p commands"));
-        assert!(!retrying("we stop retrying in production\n┃ >"));
-        let mut quoted = String::from("it said retrying in 5s\n");
-        quoted.push_str(&"reply line\n".repeat(20));
-        quoted.push_str("┃ >");
+        let box_ = "  ┃\n  ┃  Build · Big Pickle OpenCode\n  ╹▀▀▀▀▀▀▀▀▀▀\n";
+        let counting = format!(
+            "  reply\n\n{box_}  ⠋ Rate limited [retrying in 2m 30s attempt #3]  esc interrupt\n"
+        );
+        assert!(retrying(&counting));
+        let idle = format!("  reply\n\n{box_}  /tmp/proj  5.5K (3%)  ctrl+p commands\n");
+        assert!(!retrying(&idle));
+        // The agent's own reply, right above the box, quoting the words.
+        let quoted = format!(
+            "  The server said retrying in 30s, so I backed off.\n{box_}  /tmp/proj  ctrl+p commands\n"
+        );
         assert!(!retrying(&quoted));
+        // A draft in the prompt box with them.
+        let draft =
+            "  ┃  retrying in 30s?\n  ┃  Build · Big Pickle OpenCode\n  ╹▀▀▀▀\n  ctrl+p commands\n";
+        assert!(!retrying(draft));
+        // No prompt box: not read.
+        assert!(!retrying("  Retrying in 45s"));
     }
 
     #[test]

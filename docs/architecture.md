@@ -536,9 +536,11 @@ hooks and `discover` keep the stored status to themselves.
   `resume_after_limit` tool, `rlord resume-after-limit`, the list's
   menu), **or automatic** with `[limits] auto_resume = true`
   (`limits::auto_schedule`, on the same tick): each limit of a session
-  other than an overlord gets the same job (`auto: true`), once per
-  limit (kv `limit_auto`: `{id: limit at}`), so a cancelled or finished
-  job isn't remade. Unset is off; the TUI asks once (the first-run
+  other than an overlord gets the same job, once per limit (kv
+  `limit_auto`: `{id: limit at}`; a limit that has any job, asked for or
+  rescheduled onto, is marked too), so a cancelled or given-up job isn't
+  remade, and an automatic job never replaces one made meanwhile
+  (checked under the session's lock). Unset is off; the TUI asks once (the first-run
   setup form's row, `setup.apply {auto_resume}`, or a dialog when a
   listed session is limited) and `limits.auto_resume {on}` writes the
   answer to rlord's `config.toml` and takes it without a restart.
@@ -552,10 +554,10 @@ hooks and `discover` keep the stored status to themselves.
   on `idle`, and on `working` too: the untouched limit record is where
   the turn ended, so a session whose `StopFailure` hook is missing
   (older install) still resumes. Not on `waiting_input`, which is
-  blocked on a prompt. OpenCode only on `idle`: it reads `working` while
-  it counts down its own retry, and `type_into` holds a resume while its
-  screen shows "retrying in <n>" near the bottom (`opencode::retrying`,
-  `send::resume_held`), so the message doesn't stack on that turn. Scheduling takes the session's lock, and a job
+  blocked on a prompt. For OpenCode, `type_into` holds a resume while the
+  status lines under its prompt box show "retrying in <n>"
+  (`opencode::retrying`, `send::resume_held`), so the message doesn't
+  stack on OpenCode's own retry. Scheduling takes the session's lock, and a job
   only writes back over itself (same `limit_at` and `asked_at`), so
   asking again while a job runs replaces it cleanly. After
   sending, a newer untouched limit record within 15 minutes reschedules

@@ -547,8 +547,8 @@ a session hits a limit (`y` on, `n` off, Esc asks again next start). The
 answer goes in your `config.toml`; change it there any time. None of the
 agents picks itself up when a limit resets (Claude Code's
 "auto-continue" is in its Desktop app only), so rlord does it. An
-OpenCode session is resumed only once its turn is over, never while
-OpenCode is counting down its own retry ("retrying in …").
+OpenCode session is never resumed while OpenCode is counting down its
+own retry ("retrying in …").
 
 To call a scheduled resume off: right-click the session, "Cancel
 scheduled resume" (or `:cancel resume`), `rlord resume-after-limit

@@ -193,12 +193,13 @@ pub fn type_into(
     }
     // With attributes: a dim placeholder isn't a draft.
     let ansi = tmux::capture_pane_id_ansi(pane)?;
-    if !checks.agent.at_prompt(&strip_ansi(&ansi)) {
+    let plain = strip_ansi(&ansi);
+    if !checks.agent.at_prompt(&plain) {
         return Ok(Typed::NotNow(
             "its screen isn't at its input prompt (a dialog or question is up)".into(),
         ));
     }
-    if let Some(why) = resume_held(checks, &strip_ansi(&ansi)) {
+    if let Some(why) = resume_held(checks, &plain) {
         return Ok(Typed::NotNow(why.into()));
     }
     if checks.draft && draft(checks.agent, &ansi).is_some() {
@@ -1059,8 +1060,8 @@ mod tests {
             draft: true,
             source,
         };
-        let retrying = "  Rate limited [retrying in 30s attempt #2]\n┃ >";
-        let idle = "┃ >\n  ctrl+p commands";
+        let retrying = "  ┃\n  ╹▀▀▀▀\n  ⠋ Rate limited [retrying in 30s attempt #2]";
+        let idle = "  ┃\n  ╹▀▀▀▀\n  ctrl+p commands";
         let resume = checks(Agent::OpenCode, Some(Source::Resume));
         assert!(resume_held(&resume, retrying).is_some());
         assert!(resume_held(&resume, idle).is_none());

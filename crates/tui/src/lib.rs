@@ -2494,10 +2494,10 @@ impl App {
             | Mode::OverlordUpgrade(_)
             | Mode::RemoteOffer(_)
             | Mode::LimitSwitch(_)
-            | Mode::AutoResume(_)
             | Mode::ImportOffer(_) => {
                 Some("overlord — see dialog".to_string())
             }
+            Mode::AutoResume(_) => Some("auto-resume — see dialog".to_string()),
             Mode::Setup(_) => Some("code folder — see form".to_string()),
             Mode::Fork(_) => Some("fork — see form".to_string()),
             Mode::Help => Some("help: any key closes".to_string()),
