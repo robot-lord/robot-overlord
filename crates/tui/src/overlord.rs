@@ -44,6 +44,11 @@ struct AgentChoice {
     /// Effort choices ("" = the agent's default); empty: it has none.
     efforts: Vec<String>,
     effort: usize,
+    /// Each model's own efforts (Codex's catalog), shown when the Model
+    /// row moves to it; a model not listed keeps `efforts`.
+    efforts_by: std::collections::HashMap<String, Vec<String>>,
+    /// The default effort, kept across model changes when offered.
+    effort_default: String,
     /// It has Remote Control.
     remote: bool,
     /// family → latest id, for the "→ resolves to" hint.
@@ -63,6 +68,83 @@ enum SetupRow {
 pub(crate) struct RemoteOffer {
     note: Option<String>,
     error: Option<String>,
+}
+
+/// Keys pressed this soon after the limit offer opens are dropped: typed
+/// before the user saw it.
+const LIMIT_GRACE: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// The active overlord ran out of usage: switch it to another agent's?
+/// Asked once per limit (`overlord.get`'s `limit.offer`); only the user
+/// switches.
+pub(crate) struct LimitSwitch {
+    /// The limited overlord's agent, as shown ("Claude Code").
+    from: String,
+    /// When its limit resets, as shown ("3:00pm").
+    until: String,
+    /// Its reset time (ms): what "not now" declines.
+    resets_at: i64,
+    /// The agents to switch to: (name, label, has an overlord already).
+    to: Vec<(String, String, bool)>,
+    /// Which of `to` enter picks.
+    pick: usize,
+    /// When it opened (`LIMIT_GRACE`).
+    opened: std::time::Instant,
+    error: Option<String>,
+}
+
+impl LimitSwitch {
+    /// The offer in an `overlord.get` answer, if it asks now.
+    pub(crate) fn from_overlord(o: &Value) -> Option<Self> {
+        let l = &o["limit"];
+        if l["offer"] != true {
+            return None;
+        }
+        let to: Vec<_> = l["switch_to"]
+            .as_array()?
+            .iter()
+            .filter_map(|a| {
+                let name = a["agent"].as_str()?.to_string();
+                let label = a["label"].as_str().unwrap_or(&name).to_string();
+                Some((name, label, a["exists"] == true))
+            })
+            .collect();
+        if to.is_empty() {
+            return None;
+        }
+        let agent = o["agent"].as_str().unwrap_or("");
+        let from = rlord_core::agents::Agent::parse(agent)
+            .map(|a| a.label().to_string())
+            .unwrap_or_else(|| agent.to_string());
+        Some(Self {
+            from,
+            until: l["until"].as_str().unwrap_or("later").to_string(),
+            resets_at: l["resets_at"].as_i64().unwrap_or(0),
+            to,
+            pick: 0,
+            opened: std::time::Instant::now(),
+            error: None,
+        })
+    }
+}
+
+impl LimitSwitch {
+    /// Take a newer reading of the offer, keeping the pick on the same
+    /// agent where it is still offered. When it opened is kept only if
+    /// what it says is the same: a changed dialog gets a new grace.
+    fn refresh(&mut self, new: LimitSwitch) {
+        let picked = self.to.get(self.pick).map(|t| t.0.clone());
+        let pick = picked
+            .and_then(|a| new.to.iter().position(|t| t.0 == a))
+            .unwrap_or(0);
+        let same = (&self.from, self.resets_at, &self.to) == (&new.from, new.resets_at, &new.to);
+        *self = LimitSwitch {
+            pick,
+            opened: if same { self.opened } else { new.opened },
+            error: self.error.take(),
+            ..new
+        };
+    }
 }
 
 /// An existing overlord on an old model.
@@ -105,7 +187,28 @@ impl AgentChoice {
             e if e.is_empty() => (e, 0),
             e => with(e, a["effort"].as_str().unwrap_or("")),
         };
+        let efforts_by = a["efforts_by_model"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| {
+                        let e = v
+                            .as_array()
+                            .map(|l| {
+                                l.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (k.clone(), e)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         AgentChoice {
+            efforts_by,
+            effort_default: a["effort"].as_str().unwrap_or("").to_string(),
             name: a["name"].as_str().unwrap_or("claude").to_string(),
             label: a["label"].as_str().unwrap_or("Claude Code").to_string(),
             models,
@@ -115,6 +218,13 @@ impl AgentChoice {
             remote: a["remote_control"] == true,
             catalog: catalog_of(a),
         }
+    }
+}
+
+impl AgentChoice {
+    /// The effort it starts on, by name (its index is into `efforts`).
+    fn start_effort(&self) -> String {
+        self.efforts.get(self.effort).cloned().unwrap_or_default()
     }
 }
 
@@ -158,6 +268,8 @@ impl Setup {
             none_installed,
             error: None,
         };
+        let keep = s.choice().start_effort();
+        s.refit_efforts(&keep);
         // Start on the first row there is something to pick in.
         s.row = usize::from(s.agents.len() < 2);
         s
@@ -171,7 +283,7 @@ impl Setup {
     /// one, Remote Control only where this machine and the agent can.
     fn rows(&self) -> Vec<SetupRow> {
         let mut v = vec![SetupRow::Agent, SetupRow::Model];
-        if !self.choice().efforts.is_empty() {
+        if !self.efforts().is_empty() {
             v.push(SetupRow::Effort);
         }
         if self.remote.is_some() && self.choice().remote {
@@ -185,7 +297,31 @@ impl Setup {
     }
 
     fn effort(&self) -> &str {
-        self.choice().efforts.get(self.effort).map_or("", |e| e)
+        self.efforts().get(self.effort).map_or("", |e| e)
+    }
+
+    /// The effort choices for the current model: its own (Codex's catalog,
+    /// `efforts_by`), else the agent's list. Never changes the choice's
+    /// lists, so switching agents and back finds them as sent.
+    fn efforts(&self) -> &[String] {
+        let c = self.choice();
+        c.efforts_by
+            .get(self.model())
+            .filter(|e| !e.is_empty())
+            .unwrap_or(&c.efforts)
+    }
+
+    /// The model changed: point the effort at the same level in the new
+    /// list if offered, else the default, else the first.
+    fn refit_efforts(&mut self, keep: &str) {
+        let e = self.efforts();
+        let dflt = &self.choice().effort_default;
+        let at = e
+            .iter()
+            .position(|x| x == keep)
+            .or_else(|| e.iter().position(|x| x == dflt))
+            .unwrap_or(0);
+        self.effort = at;
     }
 
     /// ← / →: the focused row's next or previous choice. Another agent
@@ -206,11 +342,16 @@ impl Setup {
                 if to != self.agent {
                     self.agent = to;
                     self.model = self.choice().model;
-                    self.effort = self.choice().effort;
+                    let keep = self.choice().start_effort();
+                    self.refit_efforts(&keep);
                 }
             }
-            Some(SetupRow::Model) => self.model = next(self.model, self.choice().models.len()),
-            Some(SetupRow::Effort) => self.effort = next(self.effort, self.choice().efforts.len()),
+            Some(SetupRow::Model) => {
+                let keep = self.effort().to_string();
+                self.model = next(self.model, self.choice().models.len());
+                self.refit_efforts(&keep);
+            }
+            Some(SetupRow::Effort) => self.effort = next(self.effort, self.efforts().len()),
             Some(SetupRow::Remote) => self.remote = self.remote.map(|on| !on),
             None => {}
         }
@@ -819,6 +960,152 @@ impl App {
         }
     }
 
+    /// Open the limit-switch offer if the overlord row (`overlord.get`)
+    /// asks for it and nothing else is open.
+    /// Already open: brought up to date, or closed once the offer no
+    /// longer applies (switched elsewhere, the limit reset, no target left).
+    pub(crate) fn offer_limit_switch(&mut self, o: &Value) {
+        let fresh = LimitSwitch::from_overlord(o);
+        match (&mut self.mode, fresh) {
+            (Mode::Normal, Some(l)) => self.mode = Mode::LimitSwitch(Box::new(l)),
+            (Mode::LimitSwitch(_), None) => self.mode = Mode::Normal,
+            (Mode::LimitSwitch(l), Some(new)) => l.refresh(new),
+            _ => {}
+        }
+    }
+
+    /// Tell the daemon this limit's offer was answered (`resets_at`).
+    fn answer_limit_offer(l: &LimitSwitch) -> anyhow::Result<()> {
+        client_call(
+            &paths::socket_path(),
+            "overlord.answer_limit_offer",
+            json!({"resets_at": l.resets_at}),
+        )
+        .map(drop)
+    }
+
+    pub(crate) fn handle_limit_switch(&mut self, k: KeyEvent, mut l: Box<LimitSwitch>) {
+        // It opens on a background refresh, maybe mid-typing: keys pressed
+        // before the user could have seen it are dropped, and only the
+        // deliberate `y` switches (not enter).
+        if l.opened.elapsed() < LIMIT_GRACE {
+            self.mode = Mode::LimitSwitch(l);
+            return;
+        }
+        // The quit key is never trapped here.
+        if self.keys.action(&k) == Some(Action::Quit) {
+            self.mode = Mode::ConfirmQuit;
+            return;
+        }
+        match k.code {
+            // Always closes; an answer that didn't reach the daemon is
+            // said in the status line (it may ask again).
+            KeyCode::Esc => {
+                self.status_line = match Self::answer_limit_offer(&l) {
+                    Ok(()) => format!(
+                        "overlord stays on {} (out of usage until {})",
+                        l.from, l.until
+                    ),
+                    Err(e) => format!("error: {e:#}"),
+                };
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Down | KeyCode::Char('j') => {
+                l.pick = (l.pick + 1) % l.to.len();
+                self.mode = Mode::LimitSwitch(l);
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Up | KeyCode::Char('k') => {
+                l.pick = (l.pick + l.to.len() - 1) % l.to.len();
+                self.mode = Mode::LimitSwitch(l);
+            }
+            KeyCode::Char('y') => {
+                let agent = l.to[l.pick].0.clone();
+                match self.try_switch_overlord(&agent) {
+                    // Answered: this limit isn't offered again. (Only once
+                    // switched: a failed switch keeps the offer.)
+                    Ok(()) => {
+                        let _ = Self::answer_limit_offer(&l);
+                    }
+                    Err(e) => {
+                        l.error = Some(format!("{e:#}"));
+                        self.mode = Mode::LimitSwitch(l);
+                    }
+                }
+            }
+            _ => self.mode = Mode::LimitSwitch(l),
+        }
+    }
+
+    pub(crate) fn draw_limit_switch(&self, f: &mut Frame, l: &LimitSwitch) {
+        // The error wraps inside the 72-wide box (70 columns in its border).
+        let err_rows = l.error.as_ref().map_or(0, |e| {
+            use unicode_width::UnicodeWidthStr;
+            (e.width() + 2).div_ceil(70)
+        });
+        let h = 10 + l.to.len() as u16 + u16::try_from(err_rows).unwrap_or(u16::MAX);
+        let area = newform::centered(f.area(), 72, h);
+        f.render_widget(Clear, area);
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!(
+                    "  Your {} overlord is out of usage until {}.",
+                    l.from, l.until
+                ),
+                Style::default().bold(),
+            )),
+            Line::from(Span::styled(
+                "  Switch the active overlord to another agent? The old one keeps its",
+                theme::muted(),
+            )),
+            Line::from(Span::styled(
+                "  conversation: switch back any time (:overlord <agent>).",
+                theme::muted(),
+            )),
+            Line::from(""),
+        ];
+        for (i, (_, label, exists)) in l.to.iter().enumerate() {
+            let mark = if i == l.pick { "▸" } else { " " };
+            let note = if *exists {
+                ""
+            } else {
+                "  (set up on first switch)"
+            };
+            let style = if i == l.pick {
+                Style::default().bold()
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {mark} {label}"), style),
+                Span::styled(note.to_string(), theme::faint()),
+            ]));
+        }
+        lines.push(Line::from(""));
+        let mut keys = vec![("y", "switch", Cap::Context)];
+        if l.to.len() > 1 {
+            keys.push(("tab", "next agent", Cap::Context));
+        }
+        lines.push(keys_line(&keys));
+        lines.push(keys_line(&[(
+            "esc",
+            "not now (won't ask again for this limit)",
+            Cap::Global,
+        )]));
+        if let Some(e) = &l.error {
+            lines.push(Line::from(Span::styled(
+                format!("  {e}"),
+                Style::default().fg(theme::red()),
+            )));
+        }
+        self.modal_hits(f.area(), area, &lines);
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(theme::modal("Overlord out of usage")),
+            area,
+        );
+    }
+
     pub(crate) fn draw_remote_offer(&self, f: &mut Frame, o: &RemoteOffer) {
         let area = newform::centered(f.area(), 72, 12);
         f.render_widget(Clear, area);
@@ -874,6 +1161,24 @@ impl App {
 mod tests {
     use super::*;
 
+    /// The limit offer opens only when the daemon says to ask, and lists
+    /// where to go.
+    #[test]
+    fn the_limit_offer_reads_the_overlord_row() {
+        let mut o = json!({
+            "agent": "claude",
+            "limit": {"until": "3:00pm", "resets_at": 42, "offer": true,
+                "switch_to": [{"agent": "codex", "label": "Codex", "exists": true}]},
+        });
+        let l = LimitSwitch::from_overlord(&o).unwrap();
+        assert_eq!(l.from, "Claude Code");
+        assert_eq!((l.until.as_str(), l.resets_at), ("3:00pm", 42));
+        assert_eq!(l.to, [("codex".into(), "Codex".into(), true)]);
+        o["limit"]["offer"] = json!(false);
+        assert!(LimitSwitch::from_overlord(&o).is_none());
+        assert!(LimitSwitch::from_overlord(&json!({"agent": "claude"})).is_none());
+    }
+
     fn status(agents: Value, remote: bool) -> Value {
         json!({"exists": false, "default_agent": "claude", "default_model": "opus",
                "default_effort": "medium", "agents": agents,
@@ -912,6 +1217,49 @@ mod tests {
             s.rows(),
             [SetupRow::Agent, SetupRow::Model, SetupRow::Effort]
         );
+    }
+
+    fn codex_choice() -> Value {
+        json!({"name": "codex", "label": "Codex", "model": "gpt-a",
+            "effort": "medium", "models": ["gpt-a", "gpt-b", ""],
+            "efforts": ["low", "medium", "xhigh"],
+            "efforts_by_model": {"gpt-a": ["low", "medium", "xhigh"],
+                                 "gpt-b": ["low", "high"], "": ["low", "medium", "high"]}})
+    }
+
+    /// Codex: the effort row follows the model (its catalog's levels),
+    /// keeping the chosen effort where offered.
+    #[test]
+    fn setup_efforts_follow_the_codex_model() {
+        let mut s = Setup::from_status(&status(json!([codex_choice()]), false));
+        assert_eq!((s.model(), s.effort()), ("gpt-a", "medium"));
+        s.row = 1; // Model
+        s.step(true);
+        assert_eq!(s.model(), "gpt-b");
+        assert_eq!(s.efforts(), ["low", "high"]);
+        assert_eq!(s.effort(), "low");
+        s.step(true);
+        // "low" is offered here too: kept.
+        assert_eq!((s.model(), s.effort()), ("", "low"));
+        // Lists are never replaced: back on gpt-a its own list again.
+        s.step(true);
+        assert_eq!(s.model(), "gpt-a");
+        assert_eq!(s.efforts(), ["low", "medium", "xhigh"]);
+        // Agent row: to Claude and back resets Codex to its default.
+        let mut s = Setup::from_status(&status(json!([claude(), codex_choice()]), false));
+        s.row = 0;
+        s.step(true);
+        assert_eq!(
+            (s.choice().name.as_str(), s.model(), s.effort()),
+            ("codex", "gpt-a", "medium")
+        );
+        s.row = 1;
+        s.step(true);
+        s.row = 0;
+        s.step(true);
+        s.step(true);
+        assert_eq!((s.model(), s.effort()), ("gpt-a", "medium"));
+        assert_eq!(s.efforts(), ["low", "medium", "xhigh"]);
     }
 
     #[test]

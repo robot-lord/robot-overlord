@@ -77,9 +77,10 @@ file). PR #68.
   lookup index-only.
 - **Codex and OpenCode adapters.** `Tracker::advance_within` is the hook. Neither
   agent has a known background-task record yet.
-- **Needs-you reason.** The popup and details say "blocked on a permission
-  prompt or a question". rlord doesn't store which; the hook payload
-  (`PermissionRequest` tool, `AskUserQuestion`) could be kept for it.
+- **Needs-you reason.** Stored since the attention queue's first PR
+  (`sessions.attention_reason`: `permission` | `question`). Owed: the popup
+  and details still say "blocked on a permission prompt or a question";
+  they can say which.
 - **Hover.** The popup is placed once when it opens on a row and stays
   there while the pointer moves within that row (round 6 reversed round
   5's follow-the-pointer, because of the motion flood).
@@ -106,4 +107,8 @@ file). PR #68.
 - Shells still show during the 15 s stop grace.
 - The first wheel event over the popup is swallowed (no `drop_popup` on wheel).
 - `live_transcripts`' OR plus `json_extract` subquery may not seek the index; log a startup as its own event kind.
-- Copies of the shown-status fallback (statustext, main.rs, mcp.rs) and the task-phrase wording.
+- Copies of the shown-status fallback (lib.rs `shown`, which statustext now uses; main.rs; mcp.rs) and the task-phrase wording.
+
+### Owed from the status-popup PR (#86, 1.15.0)
+- `column_spans` builds the sentences only to drop them; split marks from meanings.
+- Move `state_chip` and `shown` from lib.rs into statustext.

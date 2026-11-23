@@ -554,10 +554,15 @@ impl App {
         }
         self.startup_chain = false;
         let opened = self.check_setup();
+        // Setup is behind the user (answered, or a code folder set): the
+        // import offer, if anything is found. Otherwise after the form.
+        if !opened && !self.setup_put_off {
+            self.start_import_offer();
+        }
         if std::mem::take(&mut self.overlay_after_startup) {
             match &mut self.mode {
                 Mode::Setup(f) if opened => f.then_overlord = true,
-                _ => self.show_overlord(),
+                _ => self.show_overlord_after_offer(),
             }
         }
     }
@@ -710,8 +715,13 @@ impl App {
 
     /// The form closed (saved, sent or put off).
     fn close_setup(&mut self, f: &SetupForm) {
+        // The import offer comes next (the daemon says whether it
+        // applies). Put off with Esc: both wait for the next start.
+        if !self.setup_put_off {
+            self.start_import_offer();
+        }
         if f.then_overlord {
-            self.show_overlord();
+            self.show_overlord_after_offer();
         }
     }
 

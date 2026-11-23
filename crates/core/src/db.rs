@@ -20,6 +20,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0010_session_context.sql"),
     include_str!("../migrations/0011_forked_from.sql"),
     include_str!("../migrations/0012_events_kind.sql"),
+    include_str!("../migrations/0013_attention.sql"),
+    include_str!("../migrations/0014_events_kind_ts.sql"),
 ];
 
 /// kv: the id of the active overlord (see `Db::overlord`).
@@ -30,7 +32,40 @@ const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_s
      last_user_msg_at, last_agent_msg_at, last_state_change_at, \
      repo_path, workspace_path, branch, description, notes, launch_spec, role, summary, summary_at, \
      last_rlord_msg_at, forked_from, \
-     (SELECT p.name FROM sessions p WHERE p.id = sessions.forked_from)";
+     (SELECT p.name FROM sessions p WHERE p.id = sessions.forked_from), \
+     last_viewed_at, attention_reason";
+
+/// The first string after every one that starts with `prefix` (its last
+/// character bumped). None: no such string (empty, or ends in the last
+/// character there is).
+fn prefix_end(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    let last = chars.pop()?;
+    let bumped = char::from_u32(last as u32 + 1)?;
+    chars.push(bumped);
+    Some(chars.into_iter().collect())
+}
+
+/// kv key: when session `id`'s last overlay (background work, a usage
+/// limit) stopped being shown (ms), recorded where it ends
+/// (`rlord_daemon::background`, `rlord_daemon::limits`): its turn is the
+/// user's from then. Dropped when it starts again (a restart, a fresh
+/// conversation), is archived, deleted, or found dead at a reconcile.
+pub fn overlay_end_key(id: &str) -> String {
+    format!("overlay_end:{id}")
+}
+
+/// An attention entry the log leaves open (`Db::open_attention_entries`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OpenEntry {
+    pub session: String,
+    /// None where its payload can't say (not JSON, no kind, not a string).
+    pub kind: Option<String>,
+    pub since: Option<i64>,
+    /// The `attention_entered` row: an unreadable entry is closed by a
+    /// marker naming it (`closes_seq`).
+    pub seq: i64,
+}
 
 pub struct NewSession<'a> {
     pub id: &'a str,
@@ -357,6 +392,11 @@ impl Db {
         }
     }
 
+    /// The session with id `id`: None only when there is no such row.
+    pub fn session_by_id(&self, id: &str) -> Result<Option<Session>> {
+        self.get_session_where("id = ?1", id)
+    }
+
     fn get_session_where(&self, cond: &str, arg: &str) -> Result<Option<Session>> {
         Ok(self.query_sessions(cond, arg)?.into_iter().next())
     }
@@ -468,10 +508,22 @@ impl Db {
 
     /// Every kv entry whose key starts with `prefix`, by key.
     pub fn kv_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
-        let mut st = self.conn.prepare(
-            "SELECT key, value FROM kv WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
-        )?;
-        let rows = st.query_map([prefix], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        // A range on the key (its primary key index), not a function of
+        // it: `prefix <= key < next`, `next` the prefix with its last
+        // character bumped.
+        let next = prefix_end(prefix);
+        let (sql, upper) = match &next {
+            Some(n) => (
+                "SELECT key, value FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key",
+                n.as_str(),
+            ),
+            None => (
+                "SELECT key, value FROM kv WHERE key >= ?1 AND ?2 = ?2 ORDER BY key",
+                "",
+            ),
+        };
+        let mut st = self.conn.prepare(sql)?;
+        let rows = st.query_map(params![prefix, upper], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -817,11 +869,21 @@ impl Db {
     /// Every tag on live (unarchived) sessions with its session count, most
     /// used first; the overlord is never tagged.
     pub fn tag_counts(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        self.tag_counts_in(false)
+    }
+
+    /// As `tag_counts`, archived sessions counted too when `archived`.
+    pub fn tag_counts_in(&self, archived: bool) -> Result<Vec<(String, i64)>> {
+        let live = if archived {
+            ""
+        } else {
+            "s.archived_at IS NULL AND "
+        };
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT t.tag, COUNT(*) FROM tags t JOIN sessions s ON s.id = t.session_id \
-             WHERE s.archived_at IS NULL AND s.role = '' \
-             GROUP BY t.tag ORDER BY COUNT(*) DESC, t.tag",
-        )?;
+             WHERE {live}s.role = '' \
+             GROUP BY t.tag ORDER BY COUNT(*) DESC, t.tag"
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -1040,12 +1102,21 @@ impl Db {
     }
 
     /// Update status; stamps last_state_change_at and returns true iff changed.
+    /// Stopped or starting (a stop, a restart): why it waited goes with it;
+    /// starting, also when its last overlay ended (the attention queue's).
     pub fn set_status(&self, id: &str, status: Status, ts: i64) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE sessions SET status = ?2, last_state_change_at = ?3 \
+            "UPDATE sessions SET status = ?2, last_state_change_at = ?3, \
+               attention_reason = CASE WHEN ?2 IN ('stopped', 'starting') THEN NULL \
+                                       ELSE attention_reason END \
              WHERE id = ?1 AND status != ?2",
             params![id, status.as_str(), ts],
         )?;
+        // (A start, from a restart or a fresh conversation: a new
+        // process. Not a stop: a `/clear` stops it a moment.)
+        if n > 0 && status == Status::Starting {
+            self.kv_delete(&overlay_end_key(id))?;
+        }
         if n > 0 && status == Status::Stopped {
             // A sub-agent can't outlive its session's agent process.
             self.close_open_subagents(Some(id), ts)?;
@@ -1108,6 +1179,9 @@ impl Db {
             "UPDATE sessions SET archived_at = ?2 WHERE id = ?1",
             params![id, ts],
         )?;
+        if ts.is_some() {
+            self.kv_delete(&overlay_end_key(id))?;
+        }
         Ok(())
     }
 
@@ -1156,6 +1230,149 @@ impl Db {
             "UPDATE sessions SET last_agent_msg_at = ?2 WHERE id = ?1",
             params![id, ts],
         )?;
+        Ok(())
+    }
+
+    /// The attention queue's shadow events since `from` (ms), oldest
+    /// first: (session, ts, kind, payload).
+    pub fn attention_events(
+        &self,
+        from: i64,
+    ) -> Result<Vec<(String, i64, String, serde_json::Value)>> {
+        let mut st = self.conn.prepare(
+            "SELECT session_id, ts, kind, payload FROM events \
+             WHERE kind IN ('attention_entered', 'attention_settled', 'attention_cleared') \
+               AND ts >= ?1 ORDER BY seq",
+        )?;
+        let rows = st.query_map([from], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or(serde_json::Value::Null),
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// When each session's pane was found dead since `from` (ms): a crash
+    /// or a kill, as rlord logs it (`reconciled_dead`, a `session_end`
+    /// from the pane). Not the agent
+    /// ending itself, nor the user stopping or archiving it.
+    pub fn pane_deaths(&self, from: i64) -> Result<std::collections::HashMap<String, Vec<i64>>> {
+        let mut st = self.conn.prepare(
+            "SELECT session_id, ts FROM events WHERE ts >= ?1 AND (kind = 'reconciled_dead' \
+               OR (kind = 'session_end' AND json_extract(payload, '$.from') = 'pane')) \
+             ORDER BY seq",
+        )?;
+        let mut out: std::collections::HashMap<String, Vec<i64>> = Default::default();
+        for row in st.query_map([from], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (id, ts) = row?;
+            out.entry(id).or_default().push(ts);
+        }
+        Ok(out)
+    }
+
+    /// When the attention queue's first shadow event was logged (ms).
+    pub fn first_attention_event(&self) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT MIN(ts) FROM events WHERE kind IN \
+             ('attention_entered', 'attention_settled', 'attention_cleared')",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Session `session_id`'s events of these `kinds` logged after `ts`
+    /// (ms), oldest first, all of them (no cap: other kinds never crowd
+    /// them out). On `idx_events_session_kind`.
+    pub fn events_of_kinds_after(
+        &self,
+        session_id: &str,
+        ts: i64,
+        kinds: &[&str],
+    ) -> Result<Vec<EventRow>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; kinds.len()].join(", ");
+        let sql = format!(
+            "SELECT seq, ts, kind, payload FROM events WHERE session_id = ? AND ts > ? \
+             AND kind IN ({marks}) ORDER BY seq"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&session_id, &ts];
+        for k in kinds {
+            args.push(k);
+        }
+        let rows = stmt.query_map(args.as_slice(), |r| {
+            Ok(EventRow {
+                seq: r.get(0)?,
+                ts: r.get(1)?,
+                kind: r.get(2)?,
+                payload: serde_json::from_str(&r.get::<_, String>(3)?)
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Attention entries the log leaves open: the latest
+    /// `attention_entered` of each session and kind with no
+    /// `attention_cleared` after it. (session, kind, since.)
+    pub fn open_attention_entries(&self) -> Result<Vec<OpenEntry>> {
+        // (A payload that isn't JSON, or has no kind: its row comes back
+        // with None, for the caller to close; never an error for the rest.
+        // A marker naming a row's seq, `closes_seq`, closes that row.)
+        let mut st = self.conn.prepare(
+            "SELECT e.session_id, \
+                    CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.kind') END, \
+                    CASE WHEN json_valid(e.payload) \
+                         THEN COALESCE(json_extract(e.payload, '$.since'), e.ts) END, \
+                    e.seq \
+             FROM events e WHERE e.kind = 'attention_entered' \
+               AND e.seq = (SELECT MAX(x.seq) FROM events x WHERE x.session_id = e.session_id \
+                            AND x.kind = 'attention_entered' \
+                            AND (CASE WHEN json_valid(x.payload) THEN json_extract(x.payload, '$.kind') END) \
+                                IS (CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.kind') END)) \
+               AND NOT EXISTS (SELECT 1 FROM events c WHERE c.session_id = e.session_id \
+                            AND c.kind = 'attention_cleared' AND c.seq > e.seq \
+                            AND json_valid(c.payload) \
+                            AND (json_extract(c.payload, '$.closes_seq') = e.seq \
+                                 OR (json_valid(e.payload) \
+                                     AND json_extract(c.payload, '$.kind') = json_extract(e.payload, '$.kind'))))",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(OpenEntry {
+                session: r.get(0)?,
+                kind: r.get::<_, Option<String>>(1).ok().flatten(),
+                since: r.get::<_, Option<i64>>(2).ok().flatten(),
+                seq: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Why the session waits (`attention_reason`; see migration 0013).
+    pub fn set_attention_reason(&self, id: &str, reason: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET attention_reason = ?2 WHERE id = ?1",
+            params![id, reason],
+        )?;
+        Ok(())
+    }
+
+    /// A person's terminal showed these sessions at `ts`.
+    pub fn set_last_viewed(&self, ids: &[&str], ts: i64) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "UPDATE sessions SET last_viewed_at = ?2 \
+             WHERE id = ?1 AND (last_viewed_at IS NULL OR last_viewed_at < ?2)",
+        )?;
+        for id in ids {
+            stmt.execute(params![id, ts])?;
+        }
         Ok(())
     }
 
@@ -1743,6 +1960,8 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         last_rlord_msg_at: r.get(25)?,
         forked_from: r.get(26)?,
         forked_from_name: r.get(27)?,
+        last_viewed_at: r.get(28)?,
+        attention_reason: r.get(29)?,
         forks: Vec::new(),
         fork_count: 0,
         live_fork_count: 0,
@@ -1816,6 +2035,7 @@ mod tests {
         assert_eq!(db.untagged_count().unwrap(), 0);
         db.rename_tag("web", "frontend").unwrap();
         assert_eq!(db.tag_counts().unwrap(), vec![("frontend".to_string(), 1)]);
+        assert_eq!(db.tag_counts_in(true).unwrap(), db.tag_counts().unwrap());
     }
 
     #[test]
@@ -1999,10 +2219,66 @@ mod tests {
         assert_eq!(tokens(&db), (90, 20));
     }
 
+    /// A stop or a (re)start drops why it waited; a (re)start or an
+    /// archive also its last overlay's end; other changes keep them.
+    #[test]
+    fn a_stop_or_start_clears_the_attention_state() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&NewSession {
+            id: "s",
+            name: "s",
+            agent: "claude",
+            agent_session: None,
+            project_path: "/tmp",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        let set = |st: Status, t: i64| {
+            db.set_status("s", st, t).unwrap();
+            db.set_attention_reason("s", Some("finished")).unwrap();
+            db.kv_set(&overlay_end_key("s"), "5").unwrap();
+        };
+        let state = || {
+            (
+                db.resolve_ref("s").unwrap().attention_reason,
+                db.kv_get(&overlay_end_key("s")).unwrap(),
+            )
+        };
+        set(Status::Idle, 2);
+        db.set_status("s", Status::Working, 3).unwrap();
+        assert_eq!(state(), (Some("finished".into()), Some("5".into())));
+        // A stop (a `/clear` is a brief one) keeps the overlay's end.
+        db.set_status("s", Status::Stopped, 4).unwrap();
+        assert_eq!(state(), (None, Some("5".into())));
+        set(Status::Idle, 5);
+        db.set_status("s", Status::Starting, 6).unwrap();
+        assert_eq!(state(), (None, None));
+        db.kv_set(&overlay_end_key("s"), "7").unwrap();
+        db.set_archived("s", Some(8)).unwrap();
+        assert_eq!(db.kv_get(&overlay_end_key("s")).unwrap(), None);
+        // The key range finds exactly the prefix's keys.
+        db.kv_set("overlay_end:a", "1").unwrap();
+        db.kv_set("overlay_end;", "x").unwrap();
+        db.kv_set("overlay_enc", "x").unwrap();
+        let found: Vec<String> = db
+            .kv_prefix("overlay_end:")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(found, ["overlay_end:a"]);
+    }
+
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 12);
+        assert_eq!(db.schema_version().unwrap(), 14);
         for table in [
             "sessions",
             "tags",
@@ -2243,7 +2519,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 12);
+        assert_eq!(db.schema_version().unwrap(), 14);
     }
 
     #[test]

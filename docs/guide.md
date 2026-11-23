@@ -29,7 +29,9 @@ runs the overlord" below for what differs. You can have one on each agent
 and switch between them: see "An overlord per agent" below.
 
 - **A strong model at medium effort** (`opus` / `medium` by default on
-  Claude Code; Codex's own default model at `medium`; OpenCode's default model, which
+  Claude Code; on Codex, the best-priority "astra" model in its own
+  catalog at `medium`, or Codex's own default when none matches or your
+  Codex config sets `model`; OpenCode's default model, which
   has no effort setting). It does
   light work itself, in seconds: find and jump to sessions (`goto_session`,
   `show_list`), shape the list (`set_list_view`, groups), edit names, tags,
@@ -130,13 +132,17 @@ runs a command.
   like any OpenCode session.
 - **Passing work to a session** ("tell the web app to also fix the
   footer"): the overlord sends it with `send_to_session`, whichever agent
-  runs the overlord and whichever the session runs. rlord types it into
-  that session's prompt, as if you had, once its turn is over. A session
-  that is working, or waiting on you, isn't typed into: the overlord says
-  so, or (when you want it delivered anyway) it waits for that turn to end
-  and goes in then (one waiting message per session; a newer one replaces
-  it, and one sent directly drops it). Stopped and archived sessions are
-  refused. Each send is in the session's log.
+  runs the overlord and whichever the session runs. Your words go as you
+  said them, with the overlord's notes after them, labelled as its own.
+  An OpenCode session gets it through OpenCode's own queue: it runs once
+  the current turn is over. A Claude or Codex session gets it typed into
+  its prompt, as if you had, once its turn is over. One that is working,
+  or waiting on you, isn't typed into: the overlord says so, or (when you
+  want it delivered anyway) it waits; a Claude session that is
+  working then picks it up as its turn ends and carries on with it (at
+  most three in a row, then it is typed in). Messages that wait add up;
+  none replaces another. Stopped and archived sessions are refused. Each
+  send is in the session's log.
 - Right before typing, rlord looks at the session's screen. It holds off
   (the message waits, or is refused) while a dialog is up there (a
   permission prompt, a question: Enter would pick an answer), while its
@@ -450,10 +456,9 @@ rlord can't always tell, and may type a message (or a usage-limit
 "continue") into that turn. Daemon mode has been checked on macOS only
 so far.
 
-Not yet: importing Codex conversations started outside rlord, sub-agent
-tracking. Remote Control is Claude Code only: Codex's waits until Codex
-makes it official. A session blocked on a permission prompt shows "needs
-you" only with trusted hooks.
+Not yet: sub-agent tracking. Remote Control is Claude Code only: Codex's
+waits until Codex makes it official. A session blocked on a permission
+prompt shows "needs you" only with trusted hooks.
 
 ## OpenCode sessions
 
@@ -554,14 +559,22 @@ working dir, the four timestamps, tags and group (all of them, wrapped
 over as many lines as they need) — plus two fields you write:
 a one-line **description** (`D`, or `rlord describe <ref> <text>`) and
 free-form **notes** (`E` opens `$EDITOR`; `rlord notes <ref> [--set|--file]`).
-Its **status** line spells out every symbol on the row in words: the
-status, background tasks with what they are and how long ago they
-started, a usage limit, and Remote Control (`⇄`: green connected,
-reachable from the Claude app; dim connecting or waiting for a restart;
-red failing, with why). Hovering the pointer over a row in the list shows
-the same in a small popup. `?` lists every status symbol.
-`rlord show <ref>` prints the same card. The list always wins on space: it
-keeps its width and the preview drops out first when the terminal is narrow.
+Its **status** line spells out the status in words, with background
+tasks (what they are and how long ago they started) or a usage limit;
+its `shells`, `remote` and `agents` rows cover background shells,
+Remote Control and sub-agents. Hovering the pointer over a row in the
+list shows a small popup that explains every mark in the row's Status
+column, one line each, in the column's order and colour: the mark as the
+list draws it, then what it means (`◔ bg 2 — waiting on 2 background
+tasks: …`, `⇄ — Remote Control connected: reachable from the Claude
+app.`, `⚙1 — 1 sub-agent running.`, `⋯ — still loading its sub-agent
+counts.`). In a narrow list, where the status is its glyph alone, the
+line spells out the label (`○ — your turn: …`). Marks the column has
+no room for come after the rest, marked "(not shown in this width)".
+`?` lists every status symbol. `rlord show <ref>` prints the same card,
+with the popup's lines (every mark but `⋯`, which only the list knows)
+under their own labels. The list always wins on space: it keeps its
+width and the preview drops out first when the terminal is narrow.
 Where its `list_width_pct` share is too narrow for a readable name, Status,
 the time column and Usage, the list borrows that much from the preview,
 leaving the preview at least 40 columns or 30% of the width. It never takes
@@ -582,8 +595,14 @@ from disk on first view.
 
 rlord can adopt agent conversations you started elsewhere: in a terminal,
 another session manager, or the desktop app. It finds them in the agents' own
-files (`~/.claude/projects/`), so it doesn't matter what started them.
+files (Claude Code's `~/.claude/projects/`, Codex's `~/.codex/sessions/`
+and thread index), so it doesn't matter what started them.
 
+- **Offered on first run**: while rlord has no sessions besides the
+  overlord and Claude Code or Codex conversations exist, it offers this
+  once the code-folder form closes. `y` opens the
+  overlord and asks it to import your sessions, `d` stops asking, Esc asks
+  again next start.
 - **Ask the overlord**: "import my sessions from the last month". It proposes
   which to import, archive or skip, with names and groups. Nothing is
   imported until you approve the list.
@@ -599,7 +618,9 @@ files (`~/.claude/projects/`), so it doesn't matter what started them.
   copies running at once fork the transcript. The listing flags
   conversations that look open elsewhere.
 
-Only Claude Code conversations for now.
+Claude Code and Codex conversations can be imported; OpenCode's can't yet.
+Headless runs (`claude -p`, `codex exec`) and Codex sub-agent threads
+aren't listed.
 
 ## Archived sessions and past work
 
@@ -882,7 +903,15 @@ in the config).
   - A session with two tags appears in both groups.
 - **Filter bar:** above both tabs, a line always shows the current filter,
   sort and live/archived, with the keys that change them.
-- **Editing tags:** `#` edits the selected session's tags (space-separated).
+- **Editing tags:** `#` opens the tags editor for the selected session:
+  its tags as a list, and an input that suggests tags already in use
+  (archived sessions' too). `enter` (or space) adds the highlighted row;
+  a tag nobody uses asks first (only `y` creates it; `n` or `esc` goes
+  back), so a half-typed tag isn't saved by accident. `tab` completes,
+  `↑↓` choose. With the input empty, `↑↓` pick a tag and `ctrl-d` or
+  Delete removes it; `enter` saves. `ctrl-s` adds what's typed, then
+  saves. `esc` clears typed text, then cancels (if you changed
+  anything it asks first: `y` discards, `ctrl-s` saves).
 - **The list's Groups column** shows a session's tags when they fit, else
   how many groups it is in, dimmed (`#3`); the details pane and the groups
   tab always show them all. It's at most 15 cells wide, and only gets

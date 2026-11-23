@@ -111,6 +111,21 @@ impl Service {
         read_timeout: Duration,
     ) -> Result<(u16, Body<BufReader<TcpStream>>)> {
         let mut stream = self.connect(read_timeout)?;
+        self.write_request(&mut stream, method, path, body, accept)?;
+        let mut r = BufReader::new(stream);
+        let (status, mode) = read_head(&mut r)?;
+        Ok((status, Body::new(r, mode)))
+    }
+
+    /// Write one request on a connection already made.
+    fn write_request(
+        &self,
+        stream: &mut TcpStream,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        accept: &str,
+    ) -> Result<()> {
         let auth = base64(format!("opencode:{}", self.password).as_bytes());
         let mut req = format!(
             "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Basic {auth}\r\n\
@@ -129,9 +144,7 @@ impl Service {
         if let Some(p) = &payload {
             stream.write_all(p.as_bytes())?;
         }
-        let mut r = BufReader::new(stream);
-        let (status, mode) = read_head(&mut r)?;
-        Ok((status, Body::new(r, mode)))
+        Ok(())
     }
 
     /// One request and its whole answer: (status, body). `limit`: how long
@@ -312,6 +325,59 @@ impl Service {
         super::opencode::fork_response(&text, Some((200..300).contains(&status)))
     }
 
+    /// Send session `id` a message as the user's (`POST
+    /// /api/session/{id}/prompt`, body `{text}`): OpenCode admits it and
+    /// runs a turn on it. A new session's first prompt goes this way, off
+    /// the TUI's command line. Says whether it surely went, surely didn't
+    /// (no connection, or an error status), or can't be told (the request
+    /// went out, the answer didn't come back): a message that may have
+    /// been admitted must not be sent again another way.
+    pub fn prompt(&self, id: &str, text: &str) -> Posted {
+        self.post_prompt(id, text, None)
+    }
+
+    /// `prompt` for a later message: `delivery: "queue"` (OpenCode's
+    /// inbox), so a session mid-turn takes it once that turn is over
+    /// rather than having it steered into the turn; an idle one runs it
+    /// at once.
+    pub fn queue_prompt(&self, id: &str, text: &str) -> Posted {
+        self.post_prompt(id, text, Some("queue"))
+    }
+
+    fn post_prompt(&self, id: &str, text: &str, delivery: Option<&str>) -> Posted {
+        if !is_session_id(id) {
+            return Posted::Refused("not an OpenCode session id".into());
+        }
+        let limit = Duration::from_secs(10);
+        let mut stream = match self.connect(limit) {
+            Ok(s) => s,
+            Err(e) => return Posted::Refused(format!("{e:#}")),
+        };
+        let mut body = serde_json::json!({ "text": text });
+        if let Some(how) = delivery {
+            body["delivery"] = serde_json::json!(how);
+        }
+        let path = format!("/api/session/{id}/prompt");
+        // (Not all written: the server can't have taken an incomplete
+        // request.)
+        if let Err(e) =
+            self.write_request(&mut stream, "POST", &path, Some(&body), "application/json")
+        {
+            return Posted::Refused(format!("{e:#}"));
+        }
+        let mut r = BufReader::new(stream);
+        match read_head(&mut r) {
+            Ok((status, _)) if (200..300).contains(&status) => Posted::Sent,
+            // A 4xx: the server turned it down. Anything else (a 5xx, a
+            // proxy's answer) may come after it was admitted.
+            Ok((status, _)) if (400..500).contains(&status) => {
+                Posted::Refused(format!("POST {path}: {status}"))
+            }
+            Ok((status, _)) => Posted::Unknown(format!("POST {path}: {status}")),
+            Err(e) => Posted::Unknown(format!("{e:#}")),
+        }
+    }
+
     /// Text generated from session `id`'s context without adding to its
     /// history (`POST /api/session/{id}/generate`): the session's own
     /// model answers, and only its token totals change.
@@ -330,6 +396,16 @@ impl Service {
             .map(str::to_string)
             .context("no text in OpenCode's answer")
     }
+}
+
+/// How a `Service::prompt` went.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Posted {
+    Sent,
+    /// Surely not admitted (why).
+    Refused(String),
+    /// Sent, but no answer: it may have been admitted (why).
+    Unknown(String),
 }
 
 /// `GET /api/model`'s answer as `provider/model` names, in its order.
@@ -1040,6 +1116,41 @@ mod tests {
         // An id that isn't one never reaches a URL.
         assert!(svc.generate("ses_1a/../x", "hi", limit).is_err());
         assert_eq!(svc.has_session("../x"), Some(false));
+    }
+
+    #[test]
+    fn a_first_prompt_is_posted_to_the_server() {
+        let (svc, asked) = serve(vec![
+            ok(r#"{"data":{"id":"msg_1"}}"#),
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".into(),
+            // Read, then closed with no answer: it may have been admitted.
+            String::new(),
+        ]);
+        assert_eq!(svc.prompt("ses_1a", "fix \"it\""), Posted::Sent);
+        let req = asked.recv().unwrap();
+        assert!(
+            req.starts_with("POST /api/session/ses_1a/prompt HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(req.ends_with(r#"{"text":"fix \"it\""}"#), "{req}");
+        assert!(matches!(svc.prompt("ses_1a", "x"), Posted::Refused(_)));
+        assert!(matches!(svc.prompt("ses_1a", "y"), Posted::Unknown(_)));
+        assert!(matches!(svc.prompt("ses_1a/../x", "x"), Posted::Refused(_)));
+    }
+
+    #[test]
+    fn a_later_message_is_queued_on_the_server() {
+        let (svc, asked) = serve(vec![ok(r#"{"data":{"id":"msg_2"}}"#)]);
+        assert_eq!(svc.queue_prompt("ses_1a", "and the footer"), Posted::Sent);
+        let req = asked.recv().unwrap();
+        assert!(
+            req.starts_with("POST /api/session/ses_1a/prompt HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(
+            req.ends_with(r#"{"delivery":"queue","text":"and the footer"}"#),
+            "{req}"
+        );
     }
 
     #[test]

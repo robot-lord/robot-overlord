@@ -45,6 +45,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "search_history",
     "read_history",
     "recall",
+    "attention",
     "list_groups",
     "find_repos",
     "keys_list",
@@ -275,6 +276,10 @@ pub fn tools() -> Value {
             "Set the user's favourite groups, in order: they head the groups list (★); the rest follow, biggest first. Replaces the whole list, so pass every favourite you want to keep (get_ui_state / list_groups shows the current order).",
             json!({"order": {"type": "array", "items": {"type": "string"}, "description": "Tags, most important first; [] clears"}}),
             &["order"]),
+        tool("attention",
+            "What waits on the user, in order (plain code, no screen or transcript reads): needs_you (blocked on a permission prompt or a question; reason permission|question) oldest first, then your_turn (a finished turn they haven't looked at since; reason finished|failed; prompted_by rlord when rlord sent the prompt) oldest first. Each entry: session, name, kind, reason, since, waited, seen, settled. Also the counts, and cant_tell: live sessions whose needs-you can't be seen (Codex before its hooks are trusted, OpenCode with its server out of reach). The overlord's own sessions are never listed.",
+            json!({"limit": {"type": "integer", "description": "Max entries (default 20)"}}),
+            &[]),
         tool("triage",
             "Cheap first pass for upkeep (no AI, no screen reads): live sessions changed since you last reviewed them, newest first, with what their meta-context is missing (flags: default_name, no_description, untagged, waiting_on_user) and excerpts from their transcripts (first_prompt, last_prompt, last_reply, title). Editing a session with update_session/organize marks it reviewed.",
             json!({
@@ -288,7 +293,7 @@ pub fn tools() -> Value {
                 "all": b("Mark every live session reviewed"),
             }), &[]),
         tool("scan_agent_sessions",
-            "Find agent conversations on this machine that rlord doesn't track yet (Claude Code's so far; read from its own transcript files; no AI), most recently active first, for importing existing work. Each has its folder (and whether it still exists or can be recreated), repo/branch, title, first/latest prompt, latest reply, PR link, when it started and was last active, and whether it may be open elsewhere right now.",
+            "Find agent conversations on this machine that rlord doesn't track yet (Claude Code's and Codex's, each with its agent; OpenCode's aren't importable; read from the agents' own transcript files; no AI), most recently active first, for importing existing work. Each has its folder (and whether it still exists or can be recreated), repo/branch, title, first/latest prompt, latest reply, PR link, when it started and was last active, and whether it may be open elsewhere right now.",
             json!({
                 "since_days": {"type": "integer", "description": "Only conversations with an exchange in the last N days (default 30)"},
                 "limit": {"type": "integer", "description": "Max conversations (default 30)"},
@@ -307,10 +312,11 @@ pub fn tools() -> Value {
                 "recreate_worktree": b("Its folder is gone but recreatable: recreate the worktree there"),
             }, "required": ["id"]}}}), &["sessions"]),
         tool("send_to_session",
-            "Pass a message to an existing session: typed into its agent's prompt and submitted, as if the user had typed it. Use it to hand a session work or a follow-up. Only a session whose turn is over (your turn) takes it now; a working one or one that needs the user is refused unless `when_idle` (then it is delivered when that turn ends; one pending message per session, a newer one replaces it). Stopped, starting and archived sessions are refused; so is one stopped on a usage limit (with `when_idle`, held until the limit resets). Right before typing rlord also checks the session's screen: while a dialog is up there, its input holds the user's unsent text, it was typed into in the last few seconds, or the user is typing in it, it is not typed into (queued with `when_idle`, else refused with the reason).",
+            "Pass the user's message to an existing session. rlord frames it (a line saying the overlord passes it on for the user, the text, then `context` labelled as yours) and delivers it the agent's own way: Claude and Codex take it typed in at their idle prompt, or with `when_idle` mid-turn, at the end of the turn (Claude's Stop hook, and in-pane Codex's, carries it on in the same turn; Codex on its background server gets it at its next idle prompt); OpenCode's server queues it behind the current turn (mid-turn also only with `when_idle`). Answers `sent` (with `via`) or `queued`. A working session or one that needs the user is refused unless `when_idle`. Messages waiting for one session add up: a later one joins them (`with_pending` counts them), and a message sent directly takes them with it. Stopped, starting and archived sessions are refused; so is one stopped on a usage limit (with `when_idle`, held until the limit resets). Right before typing rlord also checks the session's screen: while a dialog is up there, its input holds the user's unsent text, it was typed into in the last few seconds, or the user is typing in it, it is not typed into (queued with `when_idle`, else refused with the reason).",
             json!({
                 "session": s(SESSION_REF),
-                "text": s("The message, complete: the session sees only this"),
+                "text": s("The user's words, verbatim (no framing: rlord adds it)"),
+                "context": s("Optional: what the session needs from your conversation to act on this message, in your words. Sent with it, labelled as yours, not the user's. Facts for its work as a whole go in its background instead (update_session add_context)"),
                 "when_idle": b("Session mid-turn: deliver when its turn is over instead of refusing (default false)"),
             }), &["session", "text"]),
         tool("resume_after_limit",
@@ -491,6 +497,9 @@ fn summarize_candidate(c: &Value) -> Value {
     if c["open_elsewhere"] == true || c["recently_written"] == true {
         row["maybe_open_elsewhere"] = json!(true);
     }
+    if c["maybe_held_by_codex_server"] == true {
+        row["maybe_held_by_codex_app"] = json!(true);
+    }
     row
 }
 
@@ -670,6 +679,21 @@ fn new_session_params(args: &Value) -> Value {
     Value::Object(p)
 }
 
+/// How session `id`'s agent can look things up itself
+/// (`session_tools::lookup_kind`: `mcp`, `cli` or `none`).
+fn lookup_of(d: &Daemon, id: &str) -> Value {
+    // (One lock: the DB mutex isn't re-entrant.)
+    let db = d.db();
+    match db.resolve_ref(id) {
+        Ok(s) => json!(crate::session_tools::lookup_kind(
+            &db,
+            &rlord_core::paths::data_dir(),
+            &s
+        )),
+        Err(_) => Value::Null,
+    }
+}
+
 pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
     match name {
         "list_sessions" => {
@@ -702,6 +726,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             s["recent_events"] = d.rpc("session.log", json!({"ref": id, "limit": 15}))?;
             s["subagents"] = d.rpc("session.subagents", json!({"ref": id}))?;
             s["background"] = d.rpc("session.context", json!({"ref": id}))?;
+            s["lookup"] = lookup_of(d, id.as_str().unwrap_or(""));
             // The status as list_sessions shows it.
             overlord_status(&mut s);
             // Right after rlord starts, sub-agent data may still be loading.
@@ -796,6 +821,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             let s = d.rpc("session.new", params)?;
             let mut out = summarize(&s);
+            out["lookup"] = lookup_of(d, s["id"].as_str().unwrap_or(""));
             if !s["base"].is_null() {
                 out["base"] = shape_base(&s["base"]);
             }
@@ -837,6 +863,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             let s = d.rpc("session.fork", params)?;
             let mut out = summarize(&s);
+            out["lookup"] = lookup_of(d, s["id"].as_str().unwrap_or(""));
             out["warnings"] = s["warnings"].clone();
             if args.get("go").and_then(Value::as_bool) == Some(true) {
                 // The fork exists either way; a failed switch is a note.
@@ -959,6 +986,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             Ok(json!({"results": done}))
         }
+        "attention" => d.rpc(
+            "attention.list",
+            json!({"limit": args.get("limit").and_then(Value::as_u64)}),
+        ),
         "triage" => {
             let mut p = Map::new();
             if let Some(v) = args.get("all").and_then(Value::as_bool) {
@@ -1035,6 +1066,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             "session.send",
             json!({"ref": session_ref(args)?,
                    "text": args.get("text").and_then(Value::as_str).context("missing 'text'")?,
+                   "context": arg_str(args, "context"),
                    "when_idle": args.get("when_idle").and_then(Value::as_bool).unwrap_or(false)}),
         ),
         "resume_after_limit" => {

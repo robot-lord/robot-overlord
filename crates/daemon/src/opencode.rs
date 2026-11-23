@@ -32,8 +32,13 @@
 //! line (`agents::Deferred`: the model). The launch creates the session
 //! with its model before opening the TUI; if that didn't take, the model
 //! is set here once the session exists, and when it can't be in time
-//! (`DEFERRED_WAIT_MS`) the session's log says it wasn't applied. The first
-//! prompt always rides on the command line: nothing here can lose it.
+//! (`DEFERRED_WAIT_MS`) the session's log says it wasn't applied.
+//!
+//! It also sends a launch's first prompt (`first_prompt`: kept off the
+//! TUI's command line), POSTed once the session exists and its model is
+//! settled (`apply_first_prompt`). When that can't be done within
+//! `FIRST_PROMPT_WAIT_MS`, or the POST fails, the prompt is queued to be
+//! typed in at the session's first idle turn (`send::queue_first`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -43,7 +48,9 @@ use anyhow::Result;
 use serde_json::json;
 
 use rlord_core::agents::opencode::{self, Turn};
-use rlord_core::agents::opencode_service::{map_event, Events, Service, Signal, EVENT_TYPES};
+use rlord_core::agents::opencode_service::{
+    map_event, Events, Posted, Service, Signal, EVENT_TYPES,
+};
 use rlord_core::agents::Agent;
 use rlord_core::db::Db;
 use rlord_core::types::{now_ms, PromptMark, Session, Status};
@@ -81,6 +88,8 @@ struct Follower {
     /// `service.json`, or nothing accepting connections at its address),
     /// in a row. An error answer means it is there: that resets it.
     failed: u8,
+    /// Passes in a row with no event stream after trying to connect.
+    unlinked: u8,
 }
 
 /// Start the follower.
@@ -95,6 +104,7 @@ pub fn start(d: &Arc<Daemon>) {
             gone: HashMap::new(),
             parents: HashMap::new(),
             failed: 0,
+            unlinked: 0,
         };
         loop {
             let began = Instant::now();
@@ -127,9 +137,13 @@ fn live(d: &Daemon) -> Result<Vec<Session>> {
 /// One tick: about `TICK` long, most of it waiting (for events, or asleep).
 fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
     let live = live(d)?;
+    settle_stopped_first_prompts(d)?;
     f.gone.retain(|id, _| live.iter().any(|s| &s.id == id));
     f.blocked.retain(|id, _| live.iter().any(|s| &s.id == id));
     if live.is_empty() {
+        f.unlinked = 0;
+        d.opencode_blind
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         f.link = None;
         f.parents.clear();
         f.failed = 0;
@@ -141,7 +155,10 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
         .iter()
         .filter(|s| f.gone.get(&s.id).is_none_or(|n| *n == 0))
         .collect();
-    if f.link.is_none() && Instant::now() >= f.retry_at {
+    // (Whether a connect was tried this pass: only such a pass counts as
+    // one unlinked.)
+    let tried = f.link.is_none() && Instant::now() >= f.retry_at;
+    if tried {
         match connect() {
             Ok((svc, events)) => {
                 tracing::debug!(server = ?svc, "following OpenCode's events");
@@ -158,9 +175,20 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
             }
         }
     }
+    // (Needs-you is seen only through a live event stream: `attention`.
+    // Blind only once it stayed unlinked for a whole pass after a try: a
+    // reconnect blip suspends nothing.)
+    f.unlinked = match (&f.link, tried) {
+        (Some(_), _) => 0,
+        (None, true) => f.unlinked.saturating_add(1),
+        (None, false) => f.unlinked,
+    };
+    d.opencode_blind
+        .store(f.unlinked >= 2, std::sync::atomic::Ordering::Relaxed);
     match f.link.take() {
         Some((svc, mut events)) => {
             changed |= apply_deferred(d, Some(&svc), &up)?;
+            changed |= apply_first_prompt(d, Some(&svc), &up)?;
             // A session still starting: its creation may have been missed
             // (the event is sent once). Its row says when it is there.
             let starting: Vec<&Session> = up
@@ -199,6 +227,7 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
         }
         None => {
             changed |= apply_deferred(d, None, &up)?;
+            changed |= apply_first_prompt(d, None, &up)?;
             // Gone, not merely out of reach for a moment (a stream that
             // just broke, an error answer): nothing was there twice running.
             let rows = With::Rows {
@@ -332,6 +361,8 @@ fn write(db: &Db, s: &Session, step: &Step, from: &str, text: Option<&PromptMark
     if let Some(status) = step.status {
         db.set_status(&s.id, status, now)?;
     }
+    // (A form, `question`, reads as a question by its kind.)
+    crate::reason::record(db, s, kind, step.status.unwrap_or(s.status), false, false)?;
     // A prompt: the user's, or one rlord typed (`own.rs`: by its text
     // when the event carried it, else by time).
     let (kind, source) = if step.user_msg {
@@ -448,6 +479,7 @@ fn on_signal(
     let mut changed = apply(&d.db(), &mut f.blocked, &s, signal)?;
     if *signal == Signal::Created {
         changed |= apply_deferred(d, Some(svc), &[&s])?;
+        changed |= apply_first_prompt(d, Some(svc), &[&s])?;
     }
     Ok(changed)
 }
@@ -590,6 +622,9 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
         let ended = turn.is_some_and(|t| !t.working());
         // (The times OpenCode recorded, not when rlord noticed.)
         let mut source = None;
+        // A turn's end: OpenCode's own time for it, the one its last
+        // message is dated from (the event is logged now, in order).
+        let mut idle_at = None;
         let (kind, from) = match want {
             // What it waited on was answered while rlord wasn't listening:
             // not a message (as from the event stream).
@@ -608,6 +643,7 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
             _ if ended => {
                 let idle = turn.and_then(|t| t.idle).unwrap_or(now);
                 db.touch_last_agent_msg(&s.id, idle)?;
+                idle_at = Some(idle);
                 ("agent_stopped", "opencode session")
             }
             // Its turn never ended: the server it ran in is gone, or the
@@ -616,7 +652,18 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
             _ if seen == Seen::NotRunning => ("agent_stopped", "opencode turn not running"),
             _ => ("agent_stopped", "opencode server gone"),
         };
-        let detail = crate::own::with_source(json!({ "from": from }), source);
+        // (A form among what it waits on: a question.)
+        let question = pending
+            .as_ref()
+            .is_some_and(|p| p.iter().any(|w| w.starts_with("form:")));
+        // (A turn's end only when OpenCode recorded one.)
+        let lost = kind == "agent_stopped" && idle_at.is_none() && from != "opencode session";
+        let kind_for = if lost { crate::reason::TURN_LOST } else { kind };
+        crate::reason::record(&db, s, kind_for, want, question, false)?;
+        let mut detail = crate::own::with_source(json!({ "from": from }), source);
+        if let Some(t) = idle_at {
+            detail["idle_at"] = json!(t);
+        }
         db.insert_event(&s.id, now, kind, &detail.to_string())?;
         changed = true;
     }
@@ -687,6 +734,217 @@ fn apply_deferred(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> Resu
         }
     }
     Ok(changed)
+}
+
+/// How long a launch's first prompt may wait for its session before it is
+/// queued to be typed in instead.
+const FIRST_PROMPT_WAIT_MS: i64 = 30_000;
+
+/// Send each launch's first prompt (`first_prompt::Way::Server`), once:
+/// POSTed when OpenCode has the session and its model is settled (no
+/// `Deferred` left, or that has run out of time). A POST that fails, or a
+/// session not there within `FIRST_PROMPT_WAIT_MS`: the prompt is queued
+/// for the session's first idle turn (`send::queue_first`). A POST whose
+/// answer never came may have been admitted: logged, never typed again.
+/// Either way the file goes and the log says how it went.
+fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> Result<bool> {
+    let waiting: Vec<(&Session, String)> = {
+        let db = d.db();
+        up.iter()
+            .filter_map(|s| {
+                let k = crate::first_prompt::pending_key(&s.id);
+                Some((*s, db.kv_get(&k).ok()??))
+            })
+            .collect()
+    };
+    if waiting.is_empty() {
+        return Ok(false);
+    }
+    let read = match linked {
+        Some(_) => None,
+        None => Service::read(&opencode::service_file()),
+    };
+    let svc = linked.or(read.as_ref());
+    let mut changed = false;
+    for (s, raw) in waiting {
+        let Some(id) = s.agent_session.as_deref() else {
+            continue;
+        };
+        // Its lock (locks.rs: before the DB) for the look and the POST: a
+        // restart, stop or archive waits, and one that came first is seen.
+        let _session = d.sessions.lock(&s.id);
+        {
+            let db = d.db();
+            let still = db
+                .kv_get(&crate::first_prompt::pending_key(&s.id))?
+                .as_deref()
+                == Some(raw.as_str());
+            let running = db
+                .session_by_id(&s.id)?
+                .is_some_and(|r| r.archived_at.is_none() && r.status != Status::Stopped);
+            if !still || !running {
+                continue;
+            }
+        }
+        let held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        let file = std::path::PathBuf::from(held["file"].as_str().unwrap_or(""));
+        let late = now_ms() - held["at"].as_i64().unwrap_or(0) > FIRST_PROMPT_WAIT_MS;
+        // Its model first: a prompt sent before it would run on another.
+        let model_held = d.db().kv_get(&deferred_key(&s.id))?.is_some();
+        if model_held && !late {
+            continue;
+        }
+        // (Gone: lost. Unreadable for another reason: kept, tried again.)
+        let text = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                tracing::warn!(session = %s.id, error = %e, "reading the first prompt's file");
+                continue;
+            }
+        };
+        let step = first_prompt_step(
+            text.trim().is_empty(),
+            svc.and_then(|svc| svc.has_session(id)),
+            late,
+        );
+        let outcome = match step {
+            FirstStep::Wait => continue,
+            FirstStep::Lost => json!({"sent": false, "why": "its file was gone or empty"}),
+            FirstStep::Post => match svc.map(|svc| svc.prompt(id, &text)) {
+                Some(Posted::Sent) => json!({"sent": true, "via": "server"}),
+                Some(Posted::Refused(why)) => json!({"sent": false, "queued": true, "why": why}),
+                // It may have been admitted: never typed in again.
+                Some(Posted::Unknown(why)) => json!({"sent": "unknown", "via": "server",
+                    "why": format!("no answer from OpenCode, it may have run: {why}")}),
+                None => continue,
+            },
+            FirstStep::Queue => json!({"sent": false, "queued": true, "why": match svc {
+                Some(_) => "OpenCode hasn't created the session in time",
+                None => "OpenCode's server couldn't be reached in time",
+            }}),
+        };
+        let db = d.db();
+        // Settled only if what is held is still what was read (same file,
+        // same words): a newer hold is left for its own turn.
+        let key = crate::first_prompt::pending_key(&s.id);
+        let same_file = db
+            .kv_get(&key)?
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+            .is_some_and(|h| h["file"] == held["file"]);
+        let same = same_file && std::fs::read_to_string(&file).unwrap_or_default() == text;
+        if !same {
+            // (Sent all the same: the hold left is a different prompt.)
+            if outcome["sent"] == true || outcome["sent"] == "unknown" {
+                crate::first_prompt::mark_sent(&db, &s.id, now_ms())?;
+            }
+            db.insert_event(&s.id, now_ms(), "first_prompt", &outcome.to_string())?;
+            continue;
+        }
+        db.kv_delete(&key)?;
+        if outcome["queued"] == true {
+            crate::send::queue_first(&db, &s.id, &text)?;
+        }
+        // (Unknown too: it may be running.)
+        if outcome["sent"] == true || outcome["sent"] == "unknown" {
+            crate::first_prompt::mark_sent(&db, &s.id, now_ms())?;
+        }
+        db.insert_event(&s.id, now_ms(), "first_prompt", &outcome.to_string())?;
+        drop(db);
+        if let Err(e) = std::fs::remove_file(&file) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(session = %s.id, error = %e, "removing the first prompt's file");
+            }
+        }
+        if outcome["sent"] != true {
+            tracing::warn!(session = %s.id, outcome = %outcome, "an OpenCode launch's first prompt");
+        }
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// First prompts held for sessions that aren't running. Each held id's
+/// own row is read under the same DB lock as the kv (a session that just
+/// started is running by then, so never touched):
+/// - stopped: kept, file and all, for its restart to carry
+///   (`first_prompt::restamp`); logged once, marked `stopped`;
+/// - archived or gone: settled, its file removed, logged if it is there.
+fn settle_stopped_first_prompts(d: &Daemon) -> Result<()> {
+    let prefix = crate::first_prompt::pending_key("");
+    let mut remove = Vec::new();
+    {
+        let db = d.db();
+        for (key, raw) in db.kv_prefix(&prefix)? {
+            let id = key.trim_start_matches(&prefix).to_string();
+            // (Only no row at all is gone; a failed read is tried again.)
+            let row = match db.session_by_id(&id) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %e, "reading a session row");
+                    continue;
+                }
+            };
+            let mut held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            match &row {
+                // (A pane that is gone shows as stopped: `discover`.)
+                Some(s) if s.archived_at.is_none() && s.status != Status::Stopped => {}
+                Some(s) if s.archived_at.is_none() => {
+                    if held["stopped"] != true {
+                        held["stopped"] = json!(true);
+                        db.kv_set(&key, &held.to_string())?;
+                        db.insert_event(
+                            &s.id,
+                            now_ms(),
+                            "first_prompt",
+                            &json!({"sent": false, "held": true,
+                                    "why": "the session stopped first; its restart sends it"})
+                            .to_string(),
+                        )?;
+                    }
+                }
+                _ => {
+                    db.kv_delete(&key)?;
+                    if row.is_some() {
+                        db.insert_event(
+                            &id,
+                            now_ms(),
+                            "first_prompt",
+                            &json!({"sent": false, "why": "the session was archived first"})
+                                .to_string(),
+                        )?;
+                    }
+                    if let Some(f) = held["file"].as_str().filter(|f| !f.is_empty()) {
+                        remove.push(f.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for f in remove {
+        let _ = std::fs::remove_file(f);
+    }
+    Ok(())
+}
+
+/// What to do about a launch's first prompt.
+#[derive(Debug, PartialEq)]
+enum FirstStep {
+    Post,
+    Queue,
+    Lost,
+    Wait,
+}
+
+/// `empty`: its file is gone or empty; `has`: whether the server has the
+/// session (None: can't be told, or no server).
+fn first_prompt_step(empty: bool, has: Option<bool>, late: bool) -> FirstStep {
+    match (empty, has) {
+        (true, _) => FirstStep::Lost,
+        (false, Some(true)) => FirstStep::Post,
+        _ if late => FirstStep::Queue,
+        _ => FirstStep::Wait,
+    }
 }
 
 /// What to do about a launch's model.
@@ -933,6 +1191,17 @@ mod tests {
         // Not there yet: wait; past the wait, one last try (the server may
         // have it though its row can't be read), else it is reported.
         assert_eq!(deferred_step(want, None, false), Deferred::Wait);
+        // (A first prompt: posted once the session is there, queued when
+        // it is late, said lost when its file is.)
+        assert_eq!(first_prompt_step(false, Some(true), false), FirstStep::Post);
+        assert_eq!(
+            first_prompt_step(false, Some(false), false),
+            FirstStep::Wait
+        );
+        assert_eq!(first_prompt_step(false, None, false), FirstStep::Wait);
+        assert_eq!(first_prompt_step(false, None, true), FirstStep::Queue);
+        assert_eq!(first_prompt_step(false, Some(true), true), FirstStep::Post);
+        assert_eq!(first_prompt_step(true, Some(true), false), FirstStep::Lost);
         assert_eq!(deferred_step(want, None, true), set);
         assert!(matches!(
             deferred_step("opus", None, false),
@@ -967,6 +1236,37 @@ mod tests {
         db
     }
 
+    /// The resync path keeps why it waits too (a form among what it waits
+    /// on is a question).
+    #[test]
+    fn the_reason_follows_every_write_path() {
+        let db = db_with("01oc", "opencode", "ses_1a");
+        let s = || db.resolve_ref("01oc").unwrap();
+        let reason = || s().attention_reason;
+        crate::reason::record(&db, &s(), "permission_request", WaitingInput, true, false).unwrap();
+        assert_eq!(reason().as_deref(), Some("question"));
+        db.set_status("01oc", WaitingInput, 5).unwrap();
+        crate::reason::record(&db, &s(), "permission_request", WaitingInput, false, false).unwrap();
+        assert_eq!(
+            reason().as_deref(),
+            Some("question"),
+            "still the question it waits on"
+        );
+        crate::reason::record(&db, &s(), "agent_stopped", Idle, false, false).unwrap();
+        assert_eq!(reason().as_deref(), Some("finished"));
+        // A turn lost with its server, not ended: no reason.
+        crate::reason::record(&db, &s(), crate::reason::TURN_LOST, Idle, false, false).unwrap();
+        assert_eq!(reason(), None);
+        crate::reason::record(&db, &s(), "agent_stopped", Idle, false, false).unwrap();
+        // A prompt while still waiting (on another form): the reason stays.
+        db.set_status("01oc", WaitingInput, 6).unwrap();
+        crate::reason::record(&db, &s(), "question", WaitingInput, false, false).unwrap();
+        crate::reason::record(&db, &s(), "prompt_submitted", WaitingInput, false, false).unwrap();
+        assert_eq!(reason().as_deref(), Some("question"));
+        crate::reason::record(&db, &s(), "prompt_submitted", Working, false, false).unwrap();
+        assert_eq!(reason(), None);
+    }
+
     #[test]
     fn signals_write_status_events_and_message_times() {
         let db = db_with("01oc", "opencode", "ses_1a");
@@ -988,11 +1288,13 @@ mod tests {
         assert_eq!(events(), n);
         assert!(on(Signal::Asked("perm:1".into())));
         assert_eq!(get().status, WaitingInput);
+        assert_eq!(get().attention_reason.as_deref(), Some("permission"));
         assert_eq!(get().last_agent_msg_at, None);
         assert!(on(Signal::Answered("perm:1".into())));
         assert_eq!(get().status, Working);
         assert!(on(Signal::Ended));
         assert_eq!(get().status, Idle);
+        assert_eq!(get().attention_reason.as_deref(), Some("finished"));
         assert!(get().last_agent_msg_at.is_some());
         assert!(!on(Signal::Ended));
         // A stopped session (its TUI closed) isn't revived by the server

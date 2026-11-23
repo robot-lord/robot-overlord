@@ -210,6 +210,8 @@ fn tmux_cmd() -> Command {
         }
     });
     let mut c = Command::new("tmux");
+    // A server started from here never keeps a pane's rlord identity.
+    crate::agents::scrub_pane_env(&mut c);
     // Inside rlord's server, TMUX tells tmux which client/pane "current"
     // means; anywhere else it would point at the user's own tmux.
     if !inside_rlord() {
@@ -278,6 +280,68 @@ pub fn has_session(name: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// One tmux session's agent pane, as `agent_panes` saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPane {
+    /// The pane's id (`%3`; `respawn-pane -k` keeps it).
+    pub pane: String,
+    /// Its program exited (rlord keeps a dead agent pane on screen).
+    pub dead: bool,
+}
+
+/// Each tmux session's agent pane, by tmux session name, only where it is
+/// certain: the pinned pane (`@rlord_pane`) when it is in the session; with
+/// no pin at all, the session's only pane. A pin whose pane isn't in the
+/// session (moved by `join-pane`, or gone), or no pin and several panes:
+/// left out (no verdict on it). One `list-panes -a` for every session.
+/// Any failure, "no server running" included, is an error: nothing is
+/// concluded from it.
+pub fn agent_panes() -> Result<std::collections::HashMap<String, AgentPane>> {
+    let out = run(&[
+        "list-panes",
+        "-a",
+        "-F",
+        &format!("#{{pane_id}}\t#{{pane_dead}}\t#{{{AGENT_PANE}}}\t#{{session_name}}"),
+    ])?;
+    Ok(parse_agent_panes(&out))
+}
+
+/// `agent_panes`' lines: pane id, dead (`1`), the session's pinned pane,
+/// session name.
+fn parse_agent_panes(out: &str) -> std::collections::HashMap<String, AgentPane> {
+    // Per session: its pin, and its panes in order.
+    let mut seen: std::collections::HashMap<String, (String, Vec<AgentPane>)> = Default::default();
+    for l in out.lines() {
+        let mut f = l.splitn(4, '\t');
+        let (Some(pane), Some(dead), Some(pin), Some(session)) =
+            (f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let e = seen
+            .entry(session.to_string())
+            .or_insert_with(|| (pin.to_string(), Vec::new()));
+        e.1.push(AgentPane {
+            pane: pane.to_string(),
+            dead: dead == "1",
+        });
+    }
+    seen.into_iter()
+        .filter_map(|(session, (pin, panes))| {
+            let agent = if pin.is_empty() {
+                // No pin: only a lone pane is surely the agent's.
+                match panes.as_slice() {
+                    [only] => only.clone(),
+                    _ => return None,
+                }
+            } else {
+                panes.into_iter().find(|p| p.pane == pin)?
+            };
+            Some((session, agent))
+        })
+        .collect()
 }
 
 /// Session option naming the agent's pane. With the user's tmux profile a
@@ -412,6 +476,20 @@ pub fn new_plain_session(name: &str, cwd: &str, cmd: &str) -> Result<()> {
 pub fn respawn_pane(name: &str, cwd: &str, pane_cmd: &str) -> Result<()> {
     let (_, pane_id) = window_pane_ids(name)?;
     run(&["respawn-pane", "-k", "-c", cwd, "-t", &pane_id, pane_cmd])?;
+    // The agent runs in this pane now: pinned to it (when the pinned pane
+    // was gone, `window_pane_ids` fell back to the first one), and kept on
+    // screen when it exits. Best effort: the respawn itself went through.
+    let pin = run(&[
+        "set-option",
+        "-t",
+        &format!("{}:", exact(name)),
+        AGENT_PANE,
+        &pane_id,
+    ])
+    .and_then(|_| keep_agent_pane_on_exit(name));
+    if let Err(e) = pin {
+        tracing::debug!(session = name, error = %e, "re-pinning the agent pane");
+    }
     Ok(())
 }
 
@@ -461,6 +539,11 @@ pub struct Client {
     pub session: String,
     /// Last input/output activity, epoch seconds.
     pub activity: i64,
+    /// Its terminal window has focus. rlord's server has `focus-events on`
+    /// (tmux 3.2+, rlord's minimum, reports it); a terminal that never
+    /// reports focus reads as focused (tmux starts a client focused), so
+    /// this is false only after it said it lost it.
+    pub focused: bool,
 }
 
 /// The terminals attached to the server, people only: no control-mode
@@ -483,29 +566,38 @@ fn all_clients() -> Vec<(Client, String)> {
     let Ok(out) = run(&[
         "list-clients",
         "-F",
-        "#{client_activity}\t#{client_control_mode}\t#{client_name}\t#{session_group}\t#{session_name}",
+        // Tab-separated: the session name (which may have spaces) last.
+        "#{client_activity}\t#{client_control_mode}\t#{client_name}\t#{client_flags}\t#{session_group}\t#{session_name}",
     ]) else {
         return vec![]; // no server
     };
     parse_clients(&out)
 }
 
-/// `list-clients` lines as `all_clients` asks for them (tab-separated).
+/// `list-clients` lines as `all_clients` asks for them (tab-separated):
+/// activity, control mode, name, flags (`attached,focused,UTF-8`), group,
+/// session.
 fn parse_clients(out: &str) -> Vec<(Client, String)> {
     out.lines()
         .filter_map(|l| {
-            let mut f = l.splitn(5, '\t');
+            let mut f = l.splitn(6, '\t');
             let activity = f.next()?.parse().ok()?;
             if f.next()? == "1" {
                 return None; // control-mode client (a program, not a person)
             }
             let name = f.next()?.to_string();
+            let flags = f.next()?;
             let group = f.next()?.to_string();
             let session = f.next()?.to_string();
             Some((
                 Client {
                     activity,
                     name,
+                    // tmux 3.2+ (rlord's minimum) lists `focused` among the
+                    // flags ("Include focused in client flags", 3.2's
+                    // CHANGES): a list without it says unfocused. No flags
+                    // at all: no focus info, counted as focused.
+                    focused: flags.is_empty() || flags.split(',').any(|x| x == "focused"),
                     session,
                 },
                 group,
@@ -686,6 +778,40 @@ pub fn sweep_views() -> Vec<String> {
         .filter(|(_, name)| run(&["kill-session", "-t", &exact(name)]).is_ok())
         .map(|(_, name)| name.to_string())
         .collect()
+}
+
+/// The client events that change who is looking at what: each runs
+/// `rlord attention poke` (in the background), so the attention queue
+/// looks at presence again. Checked on a scratch tmux 3.8 socket: all five
+/// fire (focus in and out with `focus-events on`).
+const PRESENCE_HOOKS: [&str; 5] = [
+    "client-focus-in",
+    "client-focus-out",
+    "client-session-changed",
+    "client-attached",
+    "client-detached",
+];
+
+/// Set the presence hooks on rlord's server, at their own index (90) so
+/// the user's own hooks of the same name stay.
+pub fn set_presence_hooks(rlord_bin: &str) -> Result<()> {
+    let cmd = format!(
+        "run-shell -b {}",
+        tmux_dq(&format!("{} attention poke", shell_quote(rlord_bin)))
+    );
+    // Each on its own: one this tmux lacks doesn't stop the others.
+    let failed: Vec<String> = PRESENCE_HOOKS
+        .iter()
+        .filter_map(|h| {
+            run(&["set-hook", "-g", &format!("{h}[90]"), &cmd])
+                .err()
+                .map(|e| format!("{h}: {e}"))
+        })
+        .collect();
+    if !failed.is_empty() {
+        bail!("presence hooks not set: {}", failed.join("; "));
+    }
+    Ok(())
 }
 
 /// Point a specific client at a session.
@@ -1726,12 +1852,61 @@ mod tests {
 
     use super::*;
 
+    /// As tmux 3.8 answered on a scratch socket (2026-11-18): the pinned
+    /// pane when it is in the session; no pin, the only pane; else left
+    /// out. A session name may hold spaces.
+    #[test]
+    fn agent_panes_are_the_pinned_ones() {
+        let p = parse_agent_panes(
+            "%0\t0\t%0\ta b\n%1\t1\t%0\ta b\n%2\t1\t\tc\n%3\t0\t%4\td\n%4\t1\t%4\td\n\
+             %5\t1\t%8\te\n%6\t0\t%8\te\n%7\t0\t%9\tf\n%10\t0\t\tg\n%11\t1\t\tg",
+        );
+        assert_eq!(
+            (p["a b"].pane.as_str(), p["a b"].dead),
+            ("%0", false),
+            "the pinned pane, not the split"
+        );
+        assert!(p["c"].dead, "no pin, one pane: that one");
+        assert_eq!((p["d"].pane.as_str(), p["d"].dead), ("%4", true));
+        // The agent moved out by join-pane, a dead split left first: no
+        // verdict (not that split).
+        assert!(!p.contains_key("e"));
+        // Its pin gone, a live split left: no verdict either.
+        assert!(!p.contains_key("f"));
+        // No pin and two panes: no telling which.
+        assert!(!p.contains_key("g"));
+    }
+
+    /// Flags as tmux 3.8 printed them on a scratch socket with
+    /// `focus-events on` (live check, 2026-11-18): `focused` goes when the
+    /// terminal reports focus out and comes back on focus in.
+    #[test]
+    fn clients_say_whether_their_window_has_focus() {
+        let out = "1795035108\t0\t/dev/ttys044\tattached,focused,UTF-8\t\ta b\n\
+                   1795035109\t0\t/dev/ttys045\tattached,UTF-8\t\tc\n\
+                   1795035110\t1\tclient-1\tattached,focused,control-mode\t\td";
+        let c = people(parse_clients(out));
+        assert_eq!(c.len(), 2, "a control-mode client is a program");
+        assert!(c[0].focused && c[0].session == "a b");
+        assert!(!c[1].focused && c[1].session == "c");
+        // A flag list without `focused`: explicitly unfocused (tmux 3.2+
+        // reports focus); an empty flag field: no focus info, focused.
+        let c = people(parse_clients("1\t0\t/dev/ttys046\t\t\te"));
+        assert!(c[0].focused && c[0].session == "e");
+        // None focused: nobody is looking.
+        let c = people(parse_clients(
+            "1\t0\t/dev/ttys044\tattached,UTF-8\t\ta\n2\t0\t/dev/ttys045\tattached\t\tc",
+        ));
+        assert!(c.iter().all(|c| !c.focused));
+    }
+
     #[test]
     fn user_client_is_most_recent() {
         let c = |n: &str, a| Client {
             name: n.into(),
             session: "s".into(),
             activity: a,
+            focused: true,
         };
         let clients = vec![c("/dev/ttys1", 10), c("/dev/ttys2", 20)];
         assert_eq!(user_client(&clients, None).unwrap().name, "/dev/ttys2");
@@ -1749,10 +1924,10 @@ mod tests {
 
     #[test]
     fn web_views_are_not_the_users_terminal() {
-        let out = "10\t0\t/dev/ttys1\t\trlord-red-fox\n\
-                   30\t0\t/dev/ttys9\trlord-red-fox\twebview-1\n\
-                   40\t1\tclient-77\t\trlord-red-fox\n\
-                   20\t0\t/dev/ttys2\t\thome sweet home\n";
+        let out = "10\t0\t/dev/ttys1\tattached\t\trlord-red-fox\n\
+                   30\t0\t/dev/ttys9\tattached\trlord-red-fox\twebview-1\n\
+                   40\t1\tclient-77\tcontrol-mode\t\trlord-red-fox\n\
+                   20\t0\t/dev/ttys2\tattached\t\thome sweet home\n";
         let all = parse_clients(out);
         // The control-mode client is gone; names with spaces survive.
         assert_eq!(all.len(), 3);
@@ -1840,6 +2015,25 @@ mod tests {
         let (w, p) = window_pane_ids(name).unwrap();
         assert!(w.starts_with('@') && p.starts_with('%'));
         respawn_pane(name, "/tmp", "sleep 30").unwrap();
+        // A pin naming a pane that is gone: the respawn re-pins to the pane
+        // it used, so the agent reads alive (not stopped again).
+        run(&[
+            "set-option",
+            "-t",
+            &format!("={name}:"),
+            AGENT_PANE,
+            "%9999",
+        ])
+        .unwrap();
+        respawn_pane(name, "/tmp", "sleep 30").unwrap();
+        let pin = run(&["show-options", "-v", "-t", &format!("={name}:"), AGENT_PANE]).unwrap();
+        assert_eq!(pin, window_pane_ids(name).unwrap().1);
+        assert_eq!(
+            run(&["show-options", "-p", "-v", "-t", &pin, "remain-on-exit"]).unwrap(),
+            "on"
+        );
+        let panes = agent_panes().unwrap();
+        assert!(!panes[name].dead);
 
         // Key hints: a slim bar of rlord's own without a profile...
         let opt = |o: &str| run(&["show-options", "-v", "-t", &format!("={name}:"), o]).unwrap();

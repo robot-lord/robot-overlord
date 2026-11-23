@@ -62,6 +62,19 @@ struct Seen {
     stamp: (u64, u64, i64),
 }
 
+/// What one look at a session's transcript found (`refresh`).
+struct Refreshed {
+    shown: Shown,
+    /// A new agent process dropped work launched before it (a restart:
+    /// that work didn't end, it went with the old process).
+    dropped: bool,
+    /// The transcript was read up to date.
+    complete: bool,
+    /// When the session last wrote anything its work's staleness goes by
+    /// (its transcript, or its open subagents' output; ms).
+    last_write: i64,
+}
+
 /// What a session shows, as of the last scan.
 #[derive(Default, Clone, PartialEq, Debug)]
 struct Shown {
@@ -126,17 +139,22 @@ fn last_write(main: i64, t: &Tracker) -> i64 {
 /// Bring a tracker up to date: read what was appended and drop the work
 /// launched before the agent was last started again (`started_at`: its
 /// tasks died with the old process). Returns what it shows at `now`.
-fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u64) -> Shown {
+fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u64) -> Refreshed {
     use std::os::unix::fs::MetadataExt;
     // One stat: unchanged since the last read, nothing is opened.
     let Ok(meta) = std::fs::metadata(path) else {
         // A new process (after a restart in rlord): what ran before is
         // gone, even before its new transcript exists.
-        drop_before(&mut s.tracker, started_at);
+        let dropped = drop_before(&mut s.tracker, started_at);
         // (The transcript can't be seen: its subagents' own files still
         // tell whether they run.)
         let agents = last_write(0, &s.tracker);
-        return shown(&s.tracker, agents, 0, now);
+        return Refreshed {
+            shown: shown(&s.tracker, agents, 0, now),
+            dropped,
+            complete: false,
+            last_write: agents,
+        };
     };
     let main = meta_mtime_ms(&meta).unwrap_or(0);
     let stamp = (meta.len(), meta.ino(), main);
@@ -158,23 +176,32 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u6
     let t = &mut s.tracker;
     // A new process: what ran before it is gone (what the read just found
     // included).
-    drop_before(t, started_at);
+    let dropped = drop_before(t, started_at);
     // (The subagents' own files only while some are open.)
     let agents = if t.of(Kind::Agent).next().is_some() {
         last_write(main, t)
     } else {
         main
     };
-    shown(t, agents, main, now)
+    Refreshed {
+        shown: shown(t, agents, main, now),
+        dropped,
+        // (Read to this stat's end: the stamp was saved for it.)
+        complete: s.stamp == stamp,
+        last_write: agents,
+    }
 }
 
 /// Drop the work launched before the agent process last started
 /// (`started_at`; 0: unknown). A task with no launch time can't be placed
 /// after the start: dropped too.
-fn drop_before(t: &mut Tracker, started_at: i64) {
+/// Returns whether any was dropped.
+fn drop_before(t: &mut Tracker, started_at: i64) -> bool {
+    let before = t.open.len();
     if started_at > 0 {
         t.open.retain(|_, task| task.started_at >= started_at);
     }
+    t.open.len() != before
 }
 
 /// What a tracker shows at `now`: its subagents while the session wrote
@@ -231,17 +258,45 @@ fn scan(d: &Daemon) -> Result<()> {
         .turn
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let n = sources.len().max(1);
+    // Sessions whose work going isn't work ending: an old process's
+    // dropped (a restart).
+    let mut unsure: HashSet<String> = HashSet::new();
+    // Not read up to date this scan (a budget-cut chunk, a file it couldn't
+    // see): what they showed stays shown (`keep_unread`), so what is shown
+    // always comes from a complete read, and an end is read from two.
+    let mut unread: HashSet<String> = HashSet::new();
     for l in sources.iter().cycle().skip(start % n).take(sources.len()) {
         let s = seen.entry(l.id.clone()).or_default();
         s.tracker.switch_hint = l.switched_at;
         // (A new path, after a `/clear`: the tracker notices the new file
         // by its inode and carries the open work over.)
-        let sh = refresh(s, Path::new(&l.path), l.started_at, now, &mut budget);
+        let r = refresh(s, Path::new(&l.path), l.started_at, now, &mut budget);
+        if r.dropped {
+            unsure.insert(l.id.clone());
+        } else if keeps_previous(&r, now) {
+            unread.insert(l.id.clone());
+        }
+        let sh = r.shown;
         if sh != Shown::default() {
             after.insert(l.id.clone(), sh);
         }
     }
     drop(seen);
+    let running: HashSet<String> = running.into_iter().map(str::to_string).collect();
+    // Sessions whose background work stops being shown: when, for the
+    // attention queue (`overlay_end_key`), written before what is shown
+    // changes (a look in between never sees the work gone with no end).
+    let ended = {
+        let shown = d.background.shown.lock().expect("background mutex");
+        keep_unread(&shown, &mut after, &unread);
+        work_ended(&shown, &after, &running, &unsure)
+    };
+    if !ended.is_empty() {
+        let db = d.db();
+        for id in &ended {
+            record_end(&db, id, now)?;
+        }
+    }
     // Compared with what was shown: going stale is a change too.
     let changed = {
         let mut shown = d.background.shown.lock().expect("background mutex");
@@ -259,6 +314,62 @@ fn task_list(v: &[Task]) -> Value {
     v.iter()
         .map(|t| json!({"label": t.label, "started_at": t.started_at}))
         .collect()
+}
+
+/// Whether a session's last shown entry stands instead of this read: the
+/// read wasn't up to date (a budget-cut chunk, a transcript it can't see)
+/// and the session wrote within `STALE_MS`. Past that, the usual stale
+/// hiding applies (and the work's end is recorded then): a transcript gone
+/// for good never keeps "background" showing.
+fn keeps_previous(r: &Refreshed, now: i64) -> bool {
+    !r.complete && !r.dropped && now - r.last_write < STALE_MS
+}
+
+/// For sessions not read up to date this scan (`unread`), keep what was
+/// shown before instead of what the partial read says: their work's end,
+/// if it ended, is then seen (and recorded) on the next complete scan.
+fn keep_unread(
+    before: &HashMap<String, Shown>,
+    after: &mut HashMap<String, Shown>,
+    unread: &HashSet<String>,
+) {
+    // (Nothing shown before: what the partial read found is shown.)
+    for id in unread {
+        if let Some(sh) = before.get(id) {
+            after.insert(id.clone(), sh.clone());
+        }
+    }
+}
+
+/// Sessions whose background work was shown (`before`) and isn't now,
+/// because it ended: still `running`, and not `unsure` (work dropped with
+/// an old process; a session past its stop grace isn't running). (A
+/// partial read keeps what was shown: `keep_unread`.)
+fn work_ended(
+    before: &HashMap<String, Shown>,
+    after: &HashMap<String, Shown>,
+    running: &HashSet<String>,
+    unsure: &HashSet<String>,
+) -> Vec<String> {
+    before
+        .iter()
+        .filter(|(id, sh)| sh.agent_count > 0 && after.get(*id).is_none_or(|a| a.agent_count == 0))
+        .filter(|(id, _)| running.contains(*id) && !unsure.contains(*id))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+pub(crate) use rlord_core::db::overlay_end_key;
+
+/// Record that session `id`'s overlay ended at `at` (kv
+/// `overlay_end_key`), never moving a recorded end backwards.
+pub(crate) fn record_end(db: &rlord_core::db::Db, id: &str, at: i64) -> Result<()> {
+    let key = overlay_end_key(id);
+    let had: Option<i64> = db.kv_get(&key)?.and_then(|v| v.parse().ok());
+    if had.is_none_or(|h| at > h) {
+        db.kv_set(&key, &at.to_string())?;
+    }
+    Ok(())
 }
 
 /// Annotate rows with background work:
@@ -285,6 +396,100 @@ pub fn annotate(d: &Daemon, rows: &mut [Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Background work that stops being shown is noticed where it is
+    /// computed (its end recorded for the attention queue).
+    #[test]
+    fn the_end_of_background_work_is_noticed() {
+        let shown = |n: usize| Shown {
+            agent_count: n,
+            ..Default::default()
+        };
+        let before: HashMap<String, Shown> = [
+            ("a".into(), shown(1)),
+            ("b".into(), shown(2)),
+            ("c".into(), shown(0)),
+            ("r".into(), shown(1)),
+            ("gone".into(), shown(1)),
+        ]
+        .into();
+        let after: HashMap<String, Shown> = [("b".into(), shown(1))].into();
+        let running: HashSet<String> = ["a", "b", "c", "r"].map(String::from).into();
+        // "r" restarted (its old process's work dropped), "gone" past its
+        // stop grace: neither is work ending.
+        let restarted: HashSet<String> = ["r".to_string()].into();
+        assert_eq!(work_ended(&before, &after, &running, &restarted), ["a"]);
+        // Not read up to date: what was shown stays (its end is read on
+        // the next complete scan), whatever the partial read said.
+        let mut partial: HashMap<String, Shown> =
+            [("b".into(), shown(0)), ("new".into(), shown(3))].into();
+        keep_unread(
+            &before,
+            &mut partial,
+            &["a", "b", "new"].map(String::from).into(),
+        );
+        assert_eq!(partial.get("a"), Some(&shown(1)));
+        assert_eq!(partial.get("b"), Some(&shown(2)));
+        // Nothing shown before: what the partial read found stays.
+        assert_eq!(partial.get("new"), Some(&shown(3)));
+        let ended = work_ended(&before, &partial, &running, &HashSet::new());
+        assert!(!ended.contains(&"a".to_string()) && !ended.contains(&"b".to_string()));
+        // A recorded end only moves forward.
+        let db = rlord_core::db::Db::open_in_memory().unwrap();
+        record_end(&db, "a", 10).unwrap();
+        record_end(&db, "a", 7).unwrap();
+        assert_eq!(
+            db.kv_get(&overlay_end_key("a")).unwrap().as_deref(),
+            Some("10")
+        );
+    }
+
+    /// A read cut by the budget isn't up to date: no overlay end can be
+    /// read from that scan.
+    #[test]
+    fn a_budget_cut_read_is_not_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("m.jsonl");
+        let line = format!(
+            "{}\n",
+            serde_json::json!({"type": "user", "message": {"content": "x".repeat(200)}})
+        );
+        std::fs::write(&main, line.repeat(50)).unwrap();
+        let mut s = Seen::default();
+        let mut small = 300u64;
+        assert!(!refresh(&mut s, &main, 0, now_ms(), &mut small).complete);
+        assert!(refresh(&mut s, &main, 0, now_ms(), &mut all()).complete);
+        // Nothing new: still up to date.
+        assert!(refresh(&mut s, &main, 0, now_ms(), &mut 0).complete);
+        // A file it can't see: not.
+        assert!(!refresh(&mut s, &dir.path().join("gone"), 0, now_ms(), &mut all()).complete);
+    }
+
+    /// A read that isn't up to date keeps what was shown only while the
+    /// session wrote lately; past `STALE_MS` it goes stale as usual.
+    #[test]
+    fn an_unread_session_keeps_its_entry_only_while_fresh() {
+        let r = |complete: bool, dropped: bool, last_write: i64| Refreshed {
+            shown: Shown::default(),
+            dropped,
+            complete,
+            last_write,
+        };
+        let now = 10 * STALE_MS;
+        assert!(keeps_previous(&r(false, false, now - 1_000), now));
+        assert!(
+            !keeps_previous(&r(false, false, now - STALE_MS), now),
+            "stale: hidden"
+        );
+        assert!(
+            !keeps_previous(&r(true, false, now - 1_000), now),
+            "read up to date"
+        );
+        assert!(
+            !keeps_previous(&r(false, true, now - 1_000), now),
+            "a restart"
+        );
+    }
 
     /// A budget with no limit, for one call.
     fn all() -> u64 {
@@ -315,14 +520,20 @@ mod tests {
         std::fs::write(&main, format!("{}\n{}\n", agent("a1"), shell("b1"))).unwrap();
         let mut t = Seen::default();
         let now = now_ms();
-        assert_eq!(refresh(&mut t, &main, 0, now, &mut all()).agent_count, 1);
+        assert_eq!(
+            refresh(&mut t, &main, 0, now, &mut all()).shown.agent_count,
+            1
+        );
         // Nothing written for the stale time: the agent and the shell are
         // hidden, back to "your turn".
-        let later = refresh(&mut t, &main, 0, now + STALE_MS, &mut all());
+        let later = refresh(&mut t, &main, 0, now + STALE_MS, &mut all()).shown;
         assert_eq!(later, Shown::default());
         // Not forgotten: shown again once it writes (here: `now` again).
         assert_eq!(t.tracker.open.len(), 2);
-        assert_eq!(refresh(&mut t, &main, 0, now, &mut all()).agent_count, 1);
+        assert_eq!(
+            refresh(&mut t, &main, 0, now, &mut all()).shown.agent_count,
+            1
+        );
         // A late notification still closes it.
         let done = json!({"type": "attachment", "attachment": {"type": "queued_command",
             "commandMode": "task-notification",
@@ -346,7 +557,7 @@ mod tests {
             rlord_core::agents::transcript::parse_iso_ms("2026-01-01T00:05:00.000Z").unwrap();
         let mut t = Seen::default();
         // (`now` right after: fresh enough by the file's mtime.)
-        let sh = refresh(&mut t, &main, started, now_ms(), &mut all());
+        let sh = refresh(&mut t, &main, started, now_ms(), &mut all()).shown;
         assert_eq!(sh.agent_count, 1);
         assert_eq!(t.tracker.open.keys().collect::<Vec<_>>(), ["a2"]);
     }
@@ -425,10 +636,12 @@ mod tests {
         let forked =
             rlord_core::agents::transcript::parse_iso_ms("2026-01-02T00:00:00.000Z").unwrap();
         let mut s = Seen::default();
-        assert_eq!(
-            refresh(&mut s, &main, forked, now_ms(), &mut all()),
-            Shown::default()
-        );
+        let r = refresh(&mut s, &main, forked, now_ms(), &mut all());
+        assert_eq!(r.shown, Shown::default());
+        // Dropped with the old process: a restart, not work ending (no
+        // overlay end is recorded for it: `work_ended`).
+        assert!(r.dropped);
+        assert!(r.complete, "read up to date");
     }
 
     #[test]
@@ -456,11 +669,13 @@ mod tests {
         std::fs::write(&main, format!("{}\n", agent("a1"))).unwrap();
         let mut s = Seen::default();
         assert_eq!(
-            refresh(&mut s, &main, 0, now_ms(), &mut all()).agent_count,
+            refresh(&mut s, &main, 0, now_ms(), &mut all())
+                .shown
+                .agent_count,
             1
         );
         assert_eq!(
-            refresh(&mut s, &main, 1, now_ms(), &mut all()),
+            refresh(&mut s, &main, 1, now_ms(), &mut all()).shown,
             Shown::default()
         );
     }
@@ -493,7 +708,9 @@ mod tests {
         refresh(&mut t, &old, 0, now_ms(), &mut all());
         // Same process (no new start): the open work goes on.
         assert_eq!(
-            refresh(&mut t, &new, 0, now_ms(), &mut all()).agent_count,
+            refresh(&mut t, &new, 0, now_ms(), &mut all())
+                .shown
+                .agent_count,
             1
         );
     }

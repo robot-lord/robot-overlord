@@ -17,6 +17,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 mod forkform;
 mod groups;
+mod importoffer;
 mod keyscreen;
 mod launcher;
 mod mouse;
@@ -28,6 +29,7 @@ mod relay;
 mod setupform;
 /// A session's status in words (also `rlord show`).
 pub mod statustext;
+mod tagsform;
 mod theme;
 use groups::Tab;
 use newform::NewForm;
@@ -186,8 +188,8 @@ enum Mode {
     Filter(String),
     Rename(String),
     Describe(String),
-    /// Editing the selected session's tags (space-separated).
-    Tags(String),
+    /// The tags editor (`#`).
+    Tags(Box<tagsform::TagEditor>),
     /// Renaming a group (tag) on every session: (from, buffer).
     RenameGroup(String),
     NewSession(Box<NewForm>),
@@ -199,6 +201,11 @@ enum Mode {
     Fork(Box<forkform::ForkForm>),
     OverlordUpgrade(Box<overlord::Upgrade>),
     RemoteOffer(Box<overlord::RemoteOffer>),
+    /// The active overlord is out of usage: switch to another agent's?
+    LimitSwitch(Box<overlord::LimitSwitch>),
+    /// Initial setup: import existing sessions? (`importoffer`).
+    /// (When it opened: keys right after are dropped.)
+    ImportOffer(std::time::Instant),
     /// "Quit rlord?" — quitting is deliberate (y/enter), anything else stays.
     ConfirmQuit,
     /// The cheat sheet (`?`).
@@ -293,6 +300,18 @@ struct App {
     /// The first-run code-folder form was put off (Esc) this run: closing
     /// another dialog doesn't reopen it (`check_setup`).
     setup_put_off: bool,
+    /// The import offer was looked for this run (`start_import_offer`).
+    import_offer_checked: bool,
+    /// The offer applies, waiting for nothing else to be open.
+    import_offer_ready: bool,
+    /// A `y` on its way to the overlord (`poll_import_offer`).
+    import_send: Option<mpsc::Receiver<Result<(), String>>>,
+    /// `setup.import_offer` on its way (None inside: not reached).
+    import_offer_rx: Option<mpsc::Receiver<Option<Value>>>,
+    /// Why the last `y` wasn't sent, shown when the offer reopens.
+    import_offer_error: Option<String>,
+    /// The first-run overlay waits for the offer to close.
+    import_then_overlord: bool,
     /// The startup sequence (overlord dialog, model upgrade, Remote
     /// Control offer, then the code folder) is still running: a dialog
     /// closing leads to setup once nothing is open (`continue_startup`).
@@ -396,6 +415,12 @@ impl App {
             launch_send: None,
             launch_retry: None,
             setup_put_off: false,
+            import_offer_checked: false,
+            import_offer_ready: false,
+            import_send: None,
+            import_offer_rx: None,
+            import_offer_error: None,
+            import_then_overlord: false,
             startup_chain: false,
             overlay_after_startup: false,
             last_suggestion: None,
@@ -431,7 +456,20 @@ impl App {
     /// `:overlord <agent>`): started, or created the first time. The one
     /// it replaces keeps running with its conversation.
     pub(crate) fn switch_overlord(&mut self, agent: &str) {
-        if let Some(v) = self.call("overlord.switch", json!({"agent": agent})) {
+        if let Err(e) = self.try_switch_overlord(agent) {
+            self.status_line = format!("error: {e:#}");
+        }
+    }
+
+    /// `switch_overlord`, handing a failure back (the limit offer keeps
+    /// its dialog open on one).
+    pub(crate) fn try_switch_overlord(&mut self, agent: &str) -> Result<()> {
+        {
+            let v = client_call(
+                &paths::socket_path(),
+                "overlord.switch",
+                json!({"agent": agent}),
+            )?;
             let label = rlord_core::agents::Agent::parse(agent).map_or(agent, |a| a.label());
             self.status_line = match (v["switched"] == true, v["created"] == true) {
                 (false, _) => format!("the overlord is already on {label}"),
@@ -442,6 +480,7 @@ impl App {
             };
             self.dirty = true;
         }
+        Ok(())
     }
 
     /// Schedule the selected session to carry on once its usage limit
@@ -556,6 +595,8 @@ impl App {
                     .call("overlord.get", json!({}))
                     .filter(|o| !o.is_null())
                 {
+                    // Out of usage: offer another agent's (once a limit).
+                    self.offer_limit_switch(&o);
                     self.sessions.insert(0, o);
                     self.overlord_rows = 1;
                 }
@@ -904,7 +945,11 @@ impl App {
                 self.dirty = true;
                 self.refresh_devices();
             }
-            if self.poll_setup() || self.poll_setup_send() || self.poll_fork() || self.poll_launch()
+            if self.poll_setup()
+                || self.poll_setup_send()
+                || self.poll_fork()
+                || self.poll_launch()
+                || self.poll_import_offer()
             {
                 self.dirty = true;
             }
@@ -928,7 +973,7 @@ impl App {
             Mode::Filter(buf) => self.handle_input(k, buf, InputKind::Filter, terminal)?,
             Mode::Rename(buf) => self.handle_input(k, buf, InputKind::Rename, terminal)?,
             Mode::Describe(buf) => self.handle_input(k, buf, InputKind::Describe, terminal)?,
-            Mode::Tags(buf) => self.handle_input(k, buf, InputKind::Tags, terminal)?,
+            Mode::Tags(ed) => self.handle_tags_form(k, ed),
             Mode::RenameGroup(buf) => {
                 self.handle_input(k, buf, InputKind::RenameGroup, terminal)?
             }
@@ -942,6 +987,8 @@ impl App {
             Mode::Fork(f) => self.handle_fork_form(k, f),
             Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
             Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
+            Mode::LimitSwitch(l) => self.handle_limit_switch(k, l),
+            Mode::ImportOffer(t) => self.handle_import_offer(k, t),
             Mode::Help => {}
             Mode::Command(l) => self.handle_launcher(k, l, terminal)?,
             Mode::Keys(ks) => self.handle_keys(k, ks),
@@ -1127,20 +1174,7 @@ impl App {
                 Tab::Sessions => Tab::Groups,
                 Tab::Groups => Tab::Sessions,
             }),
-            Action::Tags => {
-                if let Some(s) = self.selected() {
-                    let cur = s["tags"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .unwrap_or_default();
-                    self.mode = Mode::Tags(cur);
-                }
-            }
+            Action::Tags => self.open_tags_form(),
             Action::New => self.open_new_form(newform::FormKind::Overlord),
             Action::NewManual => self.open_new_form(newform::FormKind::Manual),
             Action::Fork => self.open_fork_form(),
@@ -1246,7 +1280,6 @@ impl App {
                         self.dirty = true;
                     }
                 }
-                InputKind::Tags => self.save_tags(&buf),
                 InputKind::RenameGroup => {
                     let to = buf.trim().trim_start_matches('#').to_string();
                     if let Some(from) = self.group_sel.clone().filter(|g| *g != to) {
@@ -1298,32 +1331,16 @@ impl App {
         Ok(())
     }
 
-    /// Edit the selected session's notes in $EDITOR (vi fallback), then save.
-    /// Replace the selected session's tags with `buf` (space/comma separated).
-    fn save_tags(&mut self, buf: &str) {
-        let Some(s) = self.selected().cloned() else {
-            return;
-        };
-        let new: Vec<String> = buf
-            .split([' ', ','])
-            .map(|t| t.trim().trim_start_matches('#').to_lowercase())
-            .filter(|t| !t.is_empty())
-            .collect();
-        let old: Vec<String> = s["tags"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let add: Vec<&String> = new.iter().filter(|t| !old.contains(t)).collect();
-        let remove: Vec<&String> = old.iter().filter(|t| !new.contains(t)).collect();
-        if add.is_empty() && remove.is_empty() {
-            return;
-        }
-        let id = s["id"].as_str().unwrap_or("");
+    /// Save the tags editor's result: `new` is the full set, `add` and
+    /// `remove` the change from what the session had.
+    fn save_tags(
+        &mut self,
+        id: &str,
+        name: &str,
+        new: &[String],
+        add: &[String],
+        remove: &[String],
+    ) {
         if self
             .call(
                 "session.tag",
@@ -1349,11 +1366,10 @@ impl App {
                 }
             }
             self.status_line = if new.is_empty() {
-                format!("{}: untagged", s["name"].as_str().unwrap_or("?"))
+                format!("{name}: untagged")
             } else {
                 format!(
-                    "{}: {}",
-                    s["name"].as_str().unwrap_or("?"),
+                    "{name}: {}",
                     new.iter()
                         .map(|t| format!("#{t}"))
                         .collect::<Vec<_>>()
@@ -1364,6 +1380,7 @@ impl App {
         self.dirty = true;
     }
 
+    /// Edit the selected session's notes in $EDITOR (vi fallback), then save.
     fn edit_notes(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let Some(s) = self.selected().cloned() else {
             return Ok(());
@@ -1561,15 +1578,18 @@ impl App {
         }
         self.draw_footer(f, footer_area);
         if matches!(self.mode, Mode::Normal) {
-            self.draw_hover(f);
+            self.draw_hover(f, list_area.width);
         }
         match &self.mode {
             Mode::NewSession(form) => self.draw_form(f, form),
             Mode::OverlordSetup(s) => self.draw_setup(f, s),
             Mode::Setup(s) => self.draw_setup_form(f, s),
             Mode::Fork(s) => self.draw_fork_form(f, s),
+            Mode::Tags(ed) => self.draw_tags_form(f, ed),
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
             Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
+            Mode::LimitSwitch(l) => self.draw_limit_switch(f, l),
+            Mode::ImportOffer(_) => self.draw_import_offer(f),
             Mode::ConfirmQuit => self.draw_confirm_quit(f),
             Mode::Help => self.draw_help(f),
             Mode::Command(l) => self.draw_launcher(f, l),
@@ -1583,7 +1603,7 @@ impl App {
 
     /// The popup over the list row under the pointer: its status, and every
     /// symbol on the row, in words.
-    fn draw_hover(&self, f: &mut Frame) {
+    fn draw_hover(&self, f: &mut Frame, list_w: u16) {
         let Some((id, x, y)) = &self.hover_row else {
             return;
         };
@@ -1591,11 +1611,21 @@ impl App {
         let Some(s) = self.sessions.iter().find(|s| s["id"] == id.as_str()) else {
             return;
         };
-        let lines = statustext::describe(s, rlord_core::types::now_ms());
+        let cols = ListCols::for_width(list_w);
+        let lines = statustext::describe(
+            s,
+            cols.narrow,
+            usize::from(cols.status_w),
+            rlord_core::types::now_ms(),
+        );
+        if lines.is_empty() {
+            return;
+        }
+        let plains: Vec<String> = lines.iter().map(statustext::Item::plain).collect();
         let area = f.area();
         // (Border and padding: 2 columns a side; wide characters count
         // two.)
-        let w = lines
+        let w = plains
             .iter()
             .map(|l| Span::raw(l.as_str()).width() as u16 + 4)
             .max()
@@ -1603,13 +1633,13 @@ impl App {
             .min(64)
             .min(area.width);
         let inner = usize::from(w.saturating_sub(4));
-        let rows: u16 = lines
+        let rows: u16 = plains
             .iter()
             .map(|l| theme::wrapped_rows(l, inner) as u16)
             .sum();
         let text: Vec<Line> = lines
-            .into_iter()
-            .map(|l| Line::styled(l, Style::default().fg(theme::text())))
+            .iter()
+            .map(|l| l.line(Style::default().fg(theme::text())))
             .collect();
         let p = Paragraph::new(text)
             .wrap(Wrap { trim: true })
@@ -1749,31 +1779,12 @@ impl App {
                         spans.push(Span::styled(others_up(s), theme::faint()));
                         spans
                     })),
-                    Cell::from(Line::from(vec![
-                        // Not loaded yet (the daemon's warm-up): say so
-                        // rather than show half-known data.
-                        if narrow {
-                            // The glyph alone (`○`, `●`, `◷`).
-                            let chip = state_chip(s, false);
-                            let glyph: String = chip.content.chars().take(1).collect();
-                            Span::styled(glyph, chip.style)
-                        } else {
-                            state_chip(s, false)
-                        },
-                        // Its sub-agents are still loading (warm-up): the
-                        // status is known, the agent counts aren't yet.
-                        Span::styled(if s["loading"] == true { " ◌" } else { "" }, theme::faint()),
-                        // Remote Control: connected, connecting, or wanted
-                        // but not to be had.
-                        remote_chip(&s["remote"]),
-                        Span::styled(
-                            match s["agents_running"].as_i64().unwrap_or(0) {
-                                0 => String::new(),
-                                n => format!(" ⚙{n}"),
-                            },
-                            Style::default().fg(theme::overlord()),
-                        ),
-                    ])),
+                    // Every mark, as the status popup explains them.
+                    Cell::from(Line::from(statustext::column_spans(
+                        s,
+                        narrow,
+                        usize::from(status_w),
+                    ))),
                     // The time the list is sorted by (activity otherwise).
                     Cell::from(Span::styled(
                         rel_age(match sort {
@@ -2123,13 +2134,11 @@ impl App {
                 ))
             },
         ];
-        // Every symbol on its row, in words.
-        for (n, l) in statustext::describe(s, rlord_core::types::now_ms())
-            .into_iter()
-            .enumerate()
-        {
+        // The status in words, and any background shells (the chip is
+        // in the headline; remote and agents have their own rows).
+        for (label, l) in statustext::describe_status(s, rlord_core::types::now_ms()) {
             lines.push(Line::from(vec![
-                key(if n == 0 { "status" } else { "" }),
+                key(label),
                 Span::styled(l, theme::muted()),
             ]));
         }
@@ -2232,39 +2241,21 @@ impl App {
                 ),
             ]));
         }
-        if let Some(st) = s["remote"]["state"].as_str() {
-            let (text, style) = match st {
-                "on" => (
-                    format!(
-                        "on · {}",
-                        s["remote"]["url"].as_str().unwrap_or("in the Claude app")
-                    ),
-                    Style::default().fg(theme::green()),
-                ),
-                "connecting" => ("connecting…".into(), theme::muted()),
-                "pending" => (
-                    format!(
-                        "on · {}",
-                        s["remote"]["reason"].as_str().unwrap_or("needs a restart")
-                    ),
-                    theme::muted(),
-                ),
-                "disconnecting" => ("off · disconnects at its restart".into(), theme::muted()),
-                "stopped" => ("on · connects when it starts".into(), theme::muted()),
-                other => (
-                    format!(
-                        "{other}: {}",
-                        s["remote"]["reason"].as_str().unwrap_or("unknown")
-                    ),
-                    Style::default().fg(theme::red()),
-                ),
-            };
+        // Remote Control as the list's ⇄ says it, in its colour (and
+        // where to reach it); nothing for a state the list doesn't draw.
+        if let Some((style, mut text)) = statustext::remote_parts(&s["remote"]) {
+            if let Some(url) = s["remote"]["url"]
+                .as_str()
+                .filter(|_| s["remote"]["state"] == "on")
+            {
+                text = format!("{text} {url}");
+            }
             lines.push(Line::from(vec![key("remote"), Span::styled(text, style)]));
         }
         if s["loading"] == true {
             lines.push(Line::from(vec![
                 key("agents"),
-                Span::styled("◌ loading sub-agents…", theme::faint()),
+                Span::styled("⋯ loading sub-agents", theme::faint()),
             ]));
         } else if !self.agents.is_empty() && self.preview_for == self.selected_id() {
             let running = self
@@ -2491,9 +2482,7 @@ impl App {
             )),
             Mode::Rename(b) => Some(format!("rename: {b}▏")),
             Mode::Describe(b) => Some(format!("description: {b}▏   (enter: save · esc: cancel)")),
-            Mode::Tags(b) => Some(format!(
-                "tags (= groups): {b}▏   (space-separated · enter: save · esc: cancel)"
-            )),
+            Mode::Tags(_) => Some("tags — see dialog".to_string()),
             Mode::RenameGroup(b) => Some(format!(
                 "rename group (on every session): #{b}▏   (enter: save · esc: cancel)"
             )),
@@ -2501,7 +2490,11 @@ impl App {
             Mode::ConfirmQuit => {
                 Some("quit rlord?  y / enter: quit · any other key: stay".to_string())
             }
-            Mode::OverlordSetup(_) | Mode::OverlordUpgrade(_) | Mode::RemoteOffer(_) => {
+            Mode::OverlordSetup(_)
+            | Mode::OverlordUpgrade(_)
+            | Mode::RemoteOffer(_)
+            | Mode::LimitSwitch(_)
+            | Mode::ImportOffer(_) => {
                 Some("overlord — see dialog".to_string())
             }
             Mode::Setup(_) => Some("code folder — see form".to_string()),
@@ -2629,6 +2622,30 @@ impl App {
         self.hits.spans(left.x, left.y, global_hits);
         // (After the divider, "│  ".)
         let mut ctx_hits = vec![(3, None)];
+        // Too many row keys for the room: keep what fits and end on
+        // "? more" (the help lists every key), never a key cut in half.
+        let cap_w = |k: &str, l: &str| -> usize {
+            keycap(k, l, Cap::Context).iter().map(|s| s.width()).sum()
+        };
+        let room = usize::from(right.width).saturating_sub(3);
+        let total: usize = ctx.iter().map(|(k, l, _)| cap_w(k, l)).sum();
+        if total > room {
+            let help = self.keys.label(Action::Help);
+            let more = cap_w(&help, "more");
+            let mut used = more;
+            let keep = ctx
+                .iter()
+                .take_while(|(k, l, _)| {
+                    used += cap_w(k, l);
+                    used <= room
+                })
+                .count();
+            ctx.truncate(keep);
+            // (Not even "more" fits: nothing.)
+            if more <= room {
+                ctx.push((help, "more", press(Action::Help)));
+            }
+        }
         let ctx_line = context_line(
             ctx.into_iter()
                 .map(|(k, label, hit)| {
@@ -2702,7 +2719,6 @@ enum InputKind {
     Filter,
     Rename,
     Describe,
-    Tags,
     RenameGroup,
 }
 
@@ -2712,7 +2728,6 @@ impl InputKind {
             InputKind::Filter => Mode::Filter(buf),
             InputKind::Rename => Mode::Rename(buf),
             InputKind::Describe => Mode::Describe(buf),
-            InputKind::Tags => Mode::Tags(buf),
             InputKind::RenameGroup => Mode::RenameGroup(buf),
         }
     }
@@ -2842,7 +2857,7 @@ fn hover_rect(area: Rect, x: u16, y: u16, w: u16, h: u16) -> Rect {
 /// `↻`: a resume is scheduled for when it resets. Its turn over while
 /// subagents it started still run (`async_tasks`, from the daemon's
 /// `background`): that, in place of "your turn".
-fn state_chip(s: &Value, full: bool) -> Span<'static> {
+pub(crate) fn state_chip(s: &Value, full: bool) -> Span<'static> {
     let l = &s["limit"];
     let until = match shown(s) {
         "limited" => l["until"].as_str().unwrap_or("?"),
@@ -2894,21 +2909,6 @@ fn others_up(s: &Value) -> String {
         String::new()
     } else {
         format!(" +{}", marks.join(" "))
-    }
-}
-
-/// The list's Remote Control mark: ⇄ connected (green), connecting (dim),
-/// wanted but failing or unavailable (red); nothing when off.
-fn remote_chip(r: &Value) -> Span<'static> {
-    match r["state"].as_str() {
-        Some("on") => Span::styled(" ⇄", Style::default().fg(theme::green())),
-        Some("connecting" | "stopped" | "pending" | "disconnecting") => {
-            Span::styled(" ⇄", theme::faint())
-        }
-        Some("failed") | Some("unavailable") => {
-            Span::styled(" ⇄", Style::default().fg(theme::red()))
-        }
-        _ => Span::raw(""),
     }
 }
 
@@ -3543,6 +3543,10 @@ fn context_legend(
         // Its row is fixed: no name, pin, tags, description, notes, archive.
         return v;
     }
+    // (A conversation to copy.) Early: a narrow footer drops the last keys.
+    if resumable {
+        v.push((Action::Fork, "fork"));
+    }
     if archived {
         v.push((Action::Unarchive, "unarchive"));
     } else {
@@ -3560,10 +3564,6 @@ fn context_legend(
     v.push((Action::Tags, "tags"));
     v.push((Action::Describe, "describe"));
     v.push((Action::Notes, "notes"));
-    // (A conversation to copy.)
-    if resumable {
-        v.push((Action::Fork, "fork"));
-    }
     v
 }
 
@@ -3680,8 +3680,8 @@ mod tests {
         assert_eq!(
             labels(&context_legend(false, None, Some(&running))),
             [
-                "attach", "restart", "stop", "archive", "rename", "pin", "tags", "describe",
-                "notes", "fork"
+                "attach", "restart", "stop", "fork", "archive", "rename", "pin", "tags",
+                "describe", "notes"
             ]
         );
         let archived = json!({"status": "stopped", "agent": "claude", "agent_session": "x",
@@ -3792,6 +3792,7 @@ mod tests {
         assert!(out.join("\n").contains("Groups"));
 
         // Every theme renders; themes with a background paint all of it.
+        let _pin = theme::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for p in rlord_core::themes::THEMES {
             theme::set(p);
             term.draw(|f| app.draw(f)).unwrap();
@@ -3821,6 +3822,7 @@ mod tests {
         assert_eq!(text(&["release", "tooling", "wip"]), "#3");
         assert_eq!(text(&["a-very-long-group-name"]), "#1");
         // The count is dim, not a tag's colour.
+        let _pin = theme::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cell = tags_cell(&["release", "tooling"], 15);
         assert_eq!(cell.spans[0].style, theme::muted());
         // Squeezed: the count fits 3 cells (4 for 10 or more), then "…".
@@ -3923,8 +3925,17 @@ mod tests {
         );
         assert!(!right.contains("unarchive"), "{running}");
 
-        // Narrower than both halves: the global keys stay whole.
+        // A normal width: fork shows, and keys that don't fit end on
+        // "more" (the help), never a cut-off label.
         app.table.select(Some(1));
+        let mid = footer_row(&app, 160);
+        assert!(mid.contains(" fork "), "{mid}");
+        let (_, right) = mid.split_once('│').unwrap();
+        assert!(right.trim_end().ends_with("more"), "{mid}");
+        let wide = footer_row(&app, 200);
+        assert!(wide.contains(" fork "), "{wide}");
+
+        // Narrower than both halves: the global keys stay whole.
         let narrow = footer_row(&app, 120);
         assert!(
             narrow.contains(" new ") && narrow.contains(" quit ") && narrow.contains(" overlord "),

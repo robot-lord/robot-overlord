@@ -279,7 +279,7 @@ pub fn overlord_config(
         );
         agents.insert(name.to_string(), serde_json::json!({"permissions": own}));
     }
-    let environment: serde_json::Map<String, Value> = super::MCP_ENV
+    let environment: serde_json::Map<String, Value> = super::PANE_ENV
         .iter()
         .map(|k| (k.to_string(), Value::String(String::new())))
         .collect();
@@ -784,9 +784,7 @@ pub fn list_models(bin: Option<&Path>) {
 /// which would inherit a pipe and hold it open long after the command.
 fn run_bounded(bin: &Path, args: &[&str], limit: Duration) -> Option<String> {
     let mut cmd = std::process::Command::new(bin);
-    cmd.args(args)
-        .env_remove("RLORD_SESSION_ID")
-        .stderr(std::process::Stdio::null());
+    super::scrub_pane_env(cmd.args(args)).stderr(std::process::Stdio::null());
     crate::process::run_to_file(cmd, &std::env::temp_dir(), limit, None)
         .ok()
         .filter(|(st, _)| st.success())
@@ -2074,6 +2072,7 @@ pub(crate) mod tests {
         // The caller's id isn't inherited from whichever pane started
         // OpenCode's shared server.
         assert_eq!(server["environment"]["RLORD_SESSION_ID"], "");
+        assert_eq!(server["environment"]["RLORD_SESSION_LOOKUP_FILE"], "");
         let rules = cfg["permissions"].as_array().unwrap();
         // The last matching rule wins: "ask" for everything comes first.
         assert_eq!(
