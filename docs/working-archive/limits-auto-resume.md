@@ -28,6 +28,8 @@ and `crates/daemon/src/overlord.md`. The full working doc is in git history
   - Return early from `auto_schedule` when no session is limited.
   - `drop_auto_jobs` reads the jobs map on every tick while auto-resume
     is off. Run it only when the setting changes.
+  - `save_markers` (end of `auto_schedule`) can race `drop_auto_jobs`:
+    a marker it merges back may be one `drop_auto_jobs` just cleared.
 - **Stand-down check**
   - `native_auto_resume` has three call sites; make it a single check.
   - Its always-false match arms are dead branches.
@@ -41,3 +43,11 @@ and `crates/daemon/src/overlord.md`. The full working doc is in git history
   - `offer_auto_resume` makes a blocking daemon call inside refresh.
   - Ctrl+D ("don't ask again") in the setup form drops the auto-resume
     pick made on that form.
+  - The import offer is lost when a pushed UI command replaces it. A
+    general pending slot for timed dialogs (`timed.rs`) would fix it and
+    the auto-resume one alike.
+  - `timed::draw_timed` builds the Paragraph twice (to count rows, then
+    to draw).
+- **MCP**
+  - `set_auto_resume` validates `on` in `mcp.rs` and again in
+    `limits::set_auto_resume_at`.

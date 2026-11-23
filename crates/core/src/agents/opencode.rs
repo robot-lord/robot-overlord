@@ -1830,10 +1830,11 @@ pub(crate) mod tests {
         assert_eq!(last(&cfg)["action"], "rlord_*");
         // Sends confirmed: asked, after rlord's tools are allowed.
         let cfg = overlord_config("/bin/rlord", "/s", &[], &users, true);
-        assert_eq!(last(&cfg)["action"], "rlord_resume_after_limit");
+        assert_eq!(last(&cfg)["action"], "rlord_set_auto_resume");
         assert_eq!(last(&cfg)["effect"], "ask");
         let rules = cfg["permissions"].as_array().unwrap();
-        assert_eq!(rules[rules.len() - 2]["action"], "rlord_send_to_session");
+        assert_eq!(rules[rules.len() - 2]["action"], "rlord_resume_after_limit");
+        assert_eq!(rules[rules.len() - 3]["action"], "rlord_send_to_session");
         assert_eq!(cfg["agents"]["mine"]["permissions"], cfg["permissions"]);
     }
 

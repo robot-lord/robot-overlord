@@ -75,7 +75,7 @@ pub fn scrub_pane_env(cmd: &mut std::process::Command) -> &mut std::process::Com
 
 /// rlord's MCP tools that type into sessions (now or later): with
 /// `[overlord] confirm_sends` each asks the user first, on every agent.
-pub const SEND_TOOLS: &[&str] = &["send_to_session", "resume_after_limit"];
+pub const SEND_TOOLS: &[&str] = &["send_to_session", "resume_after_limit", "set_auto_resume"];
 
 /// The arguments for the overlord's `rlord mcp`: the full toolset
 /// (`--overlord`; without it the server is read-only), talking to the

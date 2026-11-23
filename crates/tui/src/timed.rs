@@ -58,7 +58,19 @@ impl App {
         let h = rows(&lines, w.saturating_sub(4)) + 2;
         let area = newform::centered(f.area(), w, u16::try_from(h).unwrap_or(u16::MAX));
         f.render_widget(Clear, area);
-        self.modal_hits(f.area(), area, &lines);
+        self.hits.add(f.area(), mouse::Hit::Outside);
+        self.hits.add(area, mouse::Hit::Inside);
+        // Keycaps where each line lands as wrapped. A line that wraps gets
+        // none: its keys may sit on any of its rows, and a click must never
+        // land on the wrong key (they still work from the keyboard).
+        let mut y = area.y + 1;
+        for line in &lines {
+            let n = rows(std::slice::from_ref(line), w.saturating_sub(4));
+            if n == 1 {
+                self.hits.keycaps(area.x + 2, y, std::slice::from_ref(line));
+            }
+            y = y.saturating_add(u16::try_from(n).unwrap_or(u16::MAX));
+        }
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })

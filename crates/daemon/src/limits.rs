@@ -582,8 +582,9 @@ fn merge_newer(into: &mut Map<String, Value>, from: Map<String, Value>) {
 }
 
 /// Auto-resume is off: drop the jobs it made (`auto`), keep the ones
-/// asked for, each logged. A dropped job's marker (kv `limit_auto`) goes
-/// too: turned back on during the same limit, the job is made again.
+/// asked for, each logged. A dropped job never sent nor rescheduled loses
+/// its marker (kv `limit_auto`) too: turned back on during the same
+/// limit, the job is made again.
 fn drop_auto_jobs(d: &Daemon) -> Result<()> {
     let ids: Vec<String> = d
         .db()
@@ -601,10 +602,14 @@ fn drop_auto_jobs(d: &Daemon) -> Result<()> {
         let db = d.db();
         let mut jobs = db.kv_map(JOBS_KEY)?;
         if jobs.get(&id).is_some_and(|j| j["auto"] == true) {
-            jobs.remove(&id);
+            let job = jobs.remove(&id).unwrap_or_default();
             db.kv_set_map(JOBS_KEY, &jobs)?;
+            // Only a job never sent nor rescheduled: one that was keeps
+            // its marker, so turning it on again doesn't reset the
+            // `MAX_ATTEMPTS` cap with a fresh job.
+            let untouched = job["attempts"].as_u64().unwrap_or(0) == 0 && job["sent_at"].is_null();
             let mut done = db.kv_map(AUTO_KEY)?;
-            if done.remove(&id).is_some() {
+            if untouched && done.remove(&id).is_some() {
                 db.kv_set_map(AUTO_KEY, &done)?;
             }
             db.insert_event(
@@ -1449,6 +1454,24 @@ mod tests {
         set_auto_resume_at(&d, &json!({"on": true}), &cfg).unwrap();
         auto_schedule(&d).unwrap();
         assert_eq!(d.db().kv_map(JOBS_KEY).unwrap()["s1"]["auto"], true);
+    }
+
+    /// A job already sent (or rescheduled) keeps its marker when dropped:
+    /// off then on doesn't start a fresh job past the attempts cap.
+    #[test]
+    fn off_then_on_keeps_a_sent_jobs_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        auto_schedule(&d).unwrap();
+        let mut jobs = d.db().kv_map(JOBS_KEY).unwrap();
+        jobs["s1"]["attempts"] = json!(1);
+        jobs["s1"]["sent_at"] = json!(5);
+        d.db().kv_set_map(JOBS_KEY, &jobs).unwrap();
+        let cfg = dir.path().join("config.toml");
+        set_auto_resume_at(&d, &json!({"on": false}), &cfg).unwrap();
+        set_auto_resume_at(&d, &json!({"on": true}), &cfg).unwrap();
+        auto_schedule(&d).unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
     }
 
     /// A session limited after `auto_schedule` read the limits keeps the

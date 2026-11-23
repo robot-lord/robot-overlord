@@ -38,8 +38,10 @@ impl App {
     /// else is (`poll_auto_resume`). The daemon's config is asked first:
     /// another rlord window may have answered it already.
     pub(crate) fn offer_auto_resume(&mut self) {
+        // (Only from the list: the daemon call below blocks.)
         if self.auto_resume_asked
             || self.auto_resume_pending
+            || !matches!(self.mode, Mode::Normal)
             || !wants_ask(self.config.limits.auto_resume, &self.all)
         {
             return;
@@ -74,6 +76,18 @@ impl App {
             return false;
         }
         self.auto_resume_pending = false;
+        // Answered meanwhile (the setup form, the overlord's tool, another
+        // window): don't ask over it. The daemon's value first.
+        if !cfg!(test) {
+            if let Ok(v) = client_call(&paths::socket_path(), "limits.auto_resume", json!({})) {
+                if let Some(on) = v["auto_resume"].as_bool() {
+                    self.config.limits.auto_resume = Some(on);
+                }
+            }
+        }
+        if !wants_ask(self.config.limits.auto_resume, &self.all) {
+            return false;
+        }
         self.mode = Mode::AutoResume(Shown::default());
         true
     }
@@ -205,12 +219,39 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
+    /// Answered meanwhile (the setup form, the overlord): the pending
+    /// question doesn't open over the answer.
+    #[test]
+    fn a_pending_question_answered_meanwhile_stays_shut() {
+        let mut app = app();
+        app.all = vec![json!({"id": "a", "limit": {"until": "3:00pm"}})];
+        app.auto_resume_pending = true;
+        app.config.limits.auto_resume = Some(true);
+        assert!(!app.poll_auto_resume());
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(!app.auto_resume_pending);
+    }
+
+    /// Not asked (nor the daemon called) outside the list.
+    #[test]
+    fn offered_only_from_the_list() {
+        let mut app = app();
+        app.all = vec![json!({"id": "a", "limit": {"until": "3:00pm"}})];
+        app.mode = Mode::Filter(String::new());
+        app.offer_auto_resume();
+        assert!(!app.auto_resume_asked);
+        app.mode = Mode::Normal;
+        app.offer_auto_resume();
+        assert!(app.auto_resume_asked);
+    }
+
     /// Asked during a refresh right before an attach: it doesn't open
     /// then, and once open, a key before it was drawn doesn't answer it
     /// however long it has been open.
     #[test]
     fn a_key_before_the_dialog_is_drawn_doesnt_answer_it() {
         let mut app = app();
+        app.all = vec![json!({"id": "a", "limit": {"until": "3:00pm"}})];
         app.auto_resume_pending = true;
         app.mode = Mode::Filter(String::new());
         assert!(!app.poll_auto_resume(), "not over another mode");
@@ -230,6 +271,7 @@ mod tests {
     #[test]
     fn a_pushed_form_keeps_the_question_pending() {
         let mut app = app();
+        app.all = vec![json!({"id": "a", "limit": {"until": "3:00pm"}})];
         app.mode = Mode::AutoResume(Shown::default());
         app.handle_ui_cmd(json!({"cmd": "new_session", "prefill": {}}));
         assert!(!matches!(app.mode, Mode::AutoResume(_)));
@@ -257,6 +299,22 @@ mod tests {
             .collect();
         assert!(text.contains("later"), "esc line clipped");
         assert!(!shown.ready(), "grace starts at the draw");
+        // Every keycap click area sits on the row its key is drawn on.
+        let buf = t.backend().buffer().clone();
+        for y in 0..40 {
+            let row: String = (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            for x in 0..40 {
+                if let Some(mouse::Hit::Key(k)) = app.hits.at(x, y) {
+                    let cap = match k.code {
+                        KeyCode::Esc => "esc",
+                        KeyCode::Char('y') => " y ",
+                        KeyCode::Char('n') => " n ",
+                        _ => continue,
+                    };
+                    assert!(row.contains(cap), "{cap} hit on row {y}: {row}");
+                }
+            }
+        }
     }
 
     #[test]
