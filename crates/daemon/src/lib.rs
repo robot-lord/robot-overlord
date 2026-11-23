@@ -64,6 +64,8 @@ pub struct Daemon {
     /// the TUI (set_view, new_session) issued by the overlord;
     /// `{"notify":"ui","to":"web","page":"<id>","cmd":{...}}` — one for a
     /// web page (`web.subscribe` passes these on; the TUI ignores them);
+    /// `{"notify":"ui","to":"device","device":"<id>","n"?,"cmd":{...}}` —
+    /// one for a paired device (the same; `n` when it is parked);
     /// `{"notify":"remote","id","req"}` — a user's relay command for the
     /// plugin (`relay.rs`; only `web.subscribe` gets these).
     notify: tokio::sync::broadcast::Sender<String>,
@@ -280,10 +282,12 @@ impl Daemon {
             .send(json!({"notify": "ui", "to": "terminal", "cmd": cmd}).to_string());
     }
 
-    /// Push a UI command to `to` (`ui::target`): the terminal's TUIs, or
-    /// one web page. A web command is also parked, for the next page that
-    /// asks, in case it never reaches its page (`page.pending`). Nowhere:
-    /// nothing is sent.
+    /// Push a UI command to `to` (`ui::target`): the terminal's TUIs, one
+    /// web page, or one paired device. A web command is also parked, for
+    /// the next page that asks, in case it never reaches its page
+    /// (`page.pending`); a device's is parked for that device until its
+    /// live session has it (`web.ui_delivered`) or it asks at its next
+    /// hello. Nowhere: nothing is sent.
     pub(crate) fn ui_cmd_to(&self, to: &ui::Target, cmd: Value) {
         match to {
             ui::Target::Terminal(_) => self.ui_cmd(cmd),
@@ -294,6 +298,13 @@ impl Daemon {
                     json!({"notify": "ui", "to": "web", "page": page, "cmd": cmd}).to_string(),
                 );
             }
+            ui::Target::Device(device) => {
+                let n = self.web_ui().park(device, cmd.clone());
+                let _ = self.notify.send(
+                    json!({"notify": "ui", "to": "device", "device": device, "n": n, "cmd": cmd})
+                        .to_string(),
+                );
+            }
             ui::Target::None => {}
         }
     }
@@ -301,10 +312,21 @@ impl Daemon {
     /// A one-line notice (never parked) on the surfaces other than `to`
     /// that are there now: the terminal's TUI, or the most recently used
     /// web page. So a command landing on the screen the user isn't
-    /// looking at doesn't go unseen.
+    /// looking at doesn't go unseen. (A phone in a pocket gets none.)
     pub(crate) fn notice_others(&self, to: &ui::Target, text: &str) {
         let cmd = json!({"cmd": "notice", "text": text});
         match to {
+            ui::Target::Device(_) => {
+                if self.tui_count() > 0 {
+                    let _ = self
+                        .notify
+                        .send(json!({"notify": "ui", "to": "terminal", "cmd": cmd}).to_string());
+                } else if let Some(page) = ui::latest_page(self) {
+                    let _ = self.notify.send(
+                        json!({"notify": "ui", "to": "web", "page": page, "cmd": cmd}).to_string(),
+                    );
+                }
+            }
             ui::Target::Web(_) => {
                 if self.tui_count() > 0 {
                     let _ = self
@@ -665,6 +687,8 @@ impl Daemon {
                     rlord_core::plugin::RPC_ERR_INCOMPATIBLE
                 } else if e.downcast_ref::<web::NotAllowed>().is_some() {
                     rlord_core::plugin::RPC_ERR_NOT_ALLOWED
+                } else if e.downcast_ref::<web::BadRequest>().is_some() {
+                    rlord_core::plugin::RPC_ERR_BAD_REQUEST
                 } else {
                     rpc::ERR_INTERNAL
                 };
@@ -1159,6 +1183,7 @@ impl Daemon {
             "web.call" => web::call(self, params),
             "web.pane_target" => web::pane_target(self, params),
             "web.pages" => web::pages(self, params),
+            "web.ui_delivered" => web::ui_delivered(self, params),
             "web.status" => web::status(self),
             "web.start" => web::start(self),
             "web.stop" => web::stop(self),
@@ -1193,15 +1218,30 @@ const CHANGED: &str = r#"{"notify":"changed"}"#;
 const CHANGED_RELAY: &str = r#"{"notify":"changed","relay":true}"#;
 
 /// A broadcast line as `web.subscribe` passes it on: a UI command for a
-/// web page (`{"notify":"ui","page","cmd"}`), or a relay command for the
+/// web page (`{"notify":"ui","page","cmd"}`) or for a paired device
+/// (`{"notify":"ui","device","n"?,"cmd"}`), or a relay command for the
 /// plugin (`{"notify":"remote","id","req"}`, as is).
 fn web_line(line: &str) -> Option<String> {
     let v: Value = serde_json::from_str(line).ok()?;
     if v["notify"] == "remote" {
         return Some(line.to_string());
     }
-    (v["notify"] == "ui" && v["to"] == "web")
-        .then(|| json!({"notify": "ui", "page": v["page"], "cmd": v["cmd"]}).to_string())
+    if v["notify"] != "ui" {
+        return None;
+    }
+    match v["to"].as_str() {
+        Some("web") => {
+            Some(json!({"notify": "ui", "page": v["page"], "cmd": v["cmd"]}).to_string())
+        }
+        Some("device") => {
+            let mut l = json!({"notify": "ui", "device": v["device"], "cmd": v["cmd"]});
+            if let Some(n) = v["n"].as_u64() {
+                l["n"] = json!(n);
+            }
+            Some(l.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// A relay command (`relay.rs`), which only the plugin's stream carries.
@@ -1773,6 +1813,22 @@ mod tests {
         assert!(!is_remote_line(
             r#"{"notify":"ui","to":"web","page":"p","cmd":{"cmd":"notice","text":"\"notify\":\"remote\""}}"#
         ));
+    }
+
+    /// A device's UI command reaches the plugin's stream with its device
+    /// and number (and no `to`); the TUI's never.
+    #[test]
+    fn device_lines_are_the_plugins() {
+        let line = json!({"notify": "ui", "to": "device", "device": "ab12", "n": 4,
+                          "cmd": {"cmd": "show_list"}})
+        .to_string();
+        let got: Value = serde_json::from_str(&web_line(&line).unwrap()).unwrap();
+        assert_eq!(
+            got,
+            json!({"notify": "ui", "device": "ab12", "n": 4, "cmd": {"cmd": "show_list"}})
+        );
+        let term = json!({"notify": "ui", "to": "terminal", "cmd": {"cmd": "show_list"}});
+        assert_eq!(web_line(&term.to_string()), None);
     }
 
     /// A command for a page that closed before it arrived is handed to the

@@ -98,6 +98,8 @@ export const OPS = [
   "device.confirm",
   "device.reject",
   "device.revoke",
+  "session.messages",
+  "device.leave",
 ] as const;
 
 export type Op = (typeof OPS)[number];
@@ -498,6 +500,14 @@ export interface OverlordMessage {
 
 export interface OverlordMessages {
   overlord: { id: string; agent: string; conversation: string | null } | null;
+  messages: OverlordMessage[];
+  /** Earlier ones are left. */
+  more: boolean;
+}
+
+/** A session's recent conversation (op `session.messages {ref, before, limit}`), read as `overlord.messages`. */
+export interface SessionMessages {
+  session: { id: string; name: string; agent: string; conversation: string | null };
   messages: OverlordMessage[];
   /** Earlier ones are left. */
   more: boolean;
