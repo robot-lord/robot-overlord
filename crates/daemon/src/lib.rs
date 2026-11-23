@@ -131,9 +131,6 @@ pub struct Daemon {
     pub(crate) proposals: Mutex<std::collections::VecDeque<(String, Value)>>,
     /// The open web pages and what each shows (web.rs `WebUi`).
     web_ui: Mutex<web::WebUi>,
-    /// Open `web.subscribe` streams (the plugin's; a restarted plugin's
-    /// may overlap the old one's briefly). The pages go with the last.
-    web_subscribers: AtomicUsize,
     /// The attention queue's watcher (attention.rs).
     pub(crate) attention: attention::Watch,
     /// Live OpenCode sessions can't be followed (no server reached): their
@@ -174,7 +171,6 @@ impl Daemon {
             web: Default::default(),
             web_ui: Default::default(),
             proposals: Default::default(),
-            web_subscribers: AtomicUsize::new(0),
             attention: Default::default(),
             opencode_blind: Default::default(),
         })
@@ -238,7 +234,7 @@ impl Daemon {
 
     /// How many `web.subscribe` streams are open (the plugin's).
     pub(crate) fn web_subscribers(&self) -> usize {
-        self.web_subscribers.load(Ordering::SeqCst)
+        self.web.streams()
     }
 
     /// The open web pages.
@@ -585,7 +581,7 @@ impl Daemon {
                     let mut out = serde_json::to_vec(&Response::ok(req.id, ack))?;
                     out.push(b'\n');
                     write_half.write_all(&out).await?;
-                    return self.push_loop(write_half, kind).await;
+                    return self.push_loop(lines, write_half, kind).await;
                 }
             }
             let resp = match serde_json::from_str::<Request>(&line) {
@@ -604,15 +600,22 @@ impl Daemon {
         Ok(())
     }
 
-    /// A subscription's push stream, until the client hangs up or the
-    /// daemon goes. `events.subscribe` gets every notify line as sent;
+    /// A subscription's push stream, until the client hangs up (`from`,
+    /// its end, reads EOF: a plugin that exited is let go of at once, not
+    /// on the next line that fails to write) or the daemon goes.
+    /// `events.subscribe` gets every notify line as sent;
     /// `web.subscribe` gets `{"notify":"changed","rev"}`, at most one per
     /// 100 ms (the changes in between folded into it; `"relay": true` when
     /// all of them were `changed_relay`), and the UI commands
     /// addressed to web pages (`{"notify":"ui","page","cmd"}`), never
     /// folded or dropped by the folding. A lagged receiver counts as a
     /// change (and may lose a command: `page.pending` has the last one).
-    async fn push_loop(&self, mut w: tokio::net::unix::OwnedWriteHalf, kind: Push) -> Result<()> {
+    async fn push_loop(
+        &self,
+        mut from: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+        mut w: tokio::net::unix::OwnedWriteHalf,
+        kind: Push,
+    ) -> Result<()> {
         use tokio::sync::broadcast::error::{RecvError, TryRecvError};
         const WEB_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
         let mut rx = self.notify.subscribe();
@@ -621,11 +624,19 @@ impl Daemon {
             self.tui_subscribers.fetch_add(1, Ordering::SeqCst);
         }
         if let Push::Web = kind {
-            self.web_subscribers.fetch_add(1, Ordering::SeqCst);
+            self.web.stream_opened();
         }
         let mut last_web: Option<std::time::Instant> = None;
         let r = loop {
-            let line = match rx.recv().await {
+            let got = tokio::select! {
+                got = rx.recv() => got,
+                read = from.next_line() => match read {
+                    // (Nothing is expected after the subscribe.)
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => break Ok(()), // client gone
+                },
+            };
+            let line = match got {
                 Ok(line) => line,
                 Err(RecvError::Lagged(_)) => CHANGED.to_string(),
                 Err(RecvError::Closed) => break Ok(()),
@@ -690,12 +701,12 @@ impl Daemon {
         // The plugin is gone, and its pages and relay state with it (unless
         // a restarted plugin's stream is already up: it reports its own).
         if let Push::Web = kind {
-            if self.web_subscribers.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.web.stream_closed(|| {
                 self.web_ui().clear();
                 if self.relay.plugin_gone() {
                     self.changed();
                 }
-            }
+            });
         }
         r
     }
@@ -1830,18 +1841,18 @@ mod tests {
     fn web_stream(
         d: &Arc<Daemon>,
         rt: &tokio::runtime::Runtime,
-    ) -> tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>> {
+    ) -> tokio::io::Lines<BufReader<UnixStream>> {
         rt.block_on(async {
             let (a, b) = UnixStream::pair().unwrap();
-            let (_, w) = a.into_split();
+            let (r, w) = a.into_split();
             let d = Arc::clone(d);
             tokio::spawn(async move {
-                let _ = d.push_loop(w, Push::Web).await;
+                let _ = d.push_loop(BufReader::new(r).lines(), w, Push::Web).await;
             });
-            let (r, _) = b.into_split();
-            // (Subscribed once the loop runs.)
+            // (Subscribed once the loop runs. `b` stays whole: a closed
+            // end is a client gone.)
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            BufReader::new(r).lines()
+            BufReader::new(b).lines()
         })
     }
 

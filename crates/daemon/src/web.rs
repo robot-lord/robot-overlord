@@ -1107,6 +1107,12 @@ pub fn pages(d: &Daemon, params: &Value) -> Result<Value> {
 const HELLO_WAIT: Duration = Duration::from_secs(5);
 /// How long a stopped plugin gets between SIGTERM and SIGKILL.
 const TERM_WAIT: Duration = Duration::from_secs(2);
+/// How long a stop waits, after SIGKILL, for the plugin to be reaped.
+const KILL_WAIT: Duration = Duration::from_millis(500);
+/// How long a stop waits, once the plugin is gone, for the daemon to let
+/// go of its `web.subscribe` stream (a plugin this daemon didn't start
+/// may hold one open: not waited for longer).
+const STREAM_WAIT: Duration = Duration::from_secs(1);
 /// Restarts after an unexpected exit: from 1 s, doubling, at most 60 s;
 /// none after five failures in a row.
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -1118,7 +1124,7 @@ const STABLE_RUN: Duration = Duration::from_secs(60);
 /// The plugin as the daemon runs it.
 pub struct Web {
     sup: Mutex<Sup>,
-    /// Signalled on a hello and on every exit.
+    /// Signalled on a hello, on every exit, and when a stream ends.
     moved: Condvar,
     /// The SHA-256 the plugin must have: the compiled-in one (tests set
     /// another, `set_expected_hash`).
@@ -1148,6 +1154,9 @@ struct Sup {
     /// The executable last started, and whether it was checked.
     path: Option<PathBuf>,
     verified: bool,
+    /// Open `web.subscribe` streams (`Daemon::push_loop`): the plugin's.
+    /// A restarted plugin's may overlap the old one's briefly.
+    streams: usize,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -1390,7 +1399,11 @@ impl Web {
         self.moved.notify_all();
     }
 
-    /// `web.stop`: SIGTERM, SIGKILL after 2 s; not restarted.
+    /// `web.stop`: SIGTERM, SIGKILL after 2 s; not restarted. Returns once
+    /// the plugin is reaped and the daemon has let go of its stream (its
+    /// pages and relay state gone with it): a relay command after it, or
+    /// after a `start` right after it, never counts the stopped plugin's
+    /// stream as one that will answer.
     pub fn stop(&self) {
         let mut sup = self.lock();
         sup.want = false;
@@ -1402,20 +1415,56 @@ impl Web {
         };
         let generation = sup.generation;
         signal(pid, libc::SIGTERM);
-        let deadline = Instant::now() + TERM_WAIT;
+        let mut deadline = Instant::now() + TERM_WAIT;
+        let mut killed = false;
         while sup.generation == generation && sup.pid.is_some() {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                if killed {
+                    // (Reaped by its thread later.)
+                    return;
+                }
                 signal(pid, libc::SIGKILL);
-                // (Reaped by its thread; wait for that, briefly.)
-                let _ = self
-                    .moved
-                    .wait_timeout(sup, Duration::from_millis(500))
-                    .expect("web mutex");
+                killed = true;
+                deadline = Instant::now() + KILL_WAIT;
+                continue;
+            }
+            sup = self.moved.wait_timeout(sup, left).expect("web mutex").0;
+        }
+        let deadline = Instant::now() + STREAM_WAIT;
+        while sup.streams > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                tracing::info!(
+                    streams = sup.streams,
+                    "a web.subscribe stream outlived the plugin"
+                );
                 return;
             }
             sup = self.moved.wait_timeout(sup, left).expect("web mutex").0;
         }
+    }
+
+    /// A `web.subscribe` stream opened (`Daemon::push_loop`).
+    pub(crate) fn stream_opened(&self) {
+        self.lock().streams += 1;
+    }
+
+    /// A `web.subscribe` stream ended; `gone` runs when it was the last
+    /// one, under the supervisor's lock, so a `stop` waiting for it
+    /// returns after `gone`.
+    pub(crate) fn stream_closed(&self, gone: impl FnOnce()) {
+        let mut sup = self.lock();
+        sup.streams = sup.streams.saturating_sub(1);
+        if sup.streams == 0 {
+            gone();
+        }
+        self.moved.notify_all();
+    }
+
+    /// How many `web.subscribe` streams are open (the plugin's).
+    pub(crate) fn streams(&self) -> usize {
+        self.lock().streams
     }
 }
 

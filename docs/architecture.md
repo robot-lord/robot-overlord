@@ -1127,8 +1127,14 @@ SIGTERM then SIGKILL on `web.stop` and at daemon exit. The plugin's first
 call is `web.hello {protocol, version, pid, port}`; another
 `plugin::WEB_PROTOCOL` is refused, and the plugin exits 3 (not retried);
 a taken port is exit 4 (not retried). The plugin also exits when its
-`web.subscribe` stream ends, so a crashed daemon leaves no listener. A
-daemon restart restarts it; open pages reconnect with the same token.
+`web.subscribe` stream ends, so a crashed daemon leaves no listener. The
+daemon ends that stream as soon as the plugin's end closes (it watches
+the read side, not only failed writes), and `web.stop` returns only once
+the plugin is reaped and its stream is let go (its pages and relay state
+cleared), so a start right after it waits for the new plugin's own
+stream: a stale one would let a `relay.*` command go to a plugin that is
+gone. A daemon restart restarts it; open pages reconnect with the same
+token.
 
 **The daemon's side** (no HTTP types): `web.call {op, args}` is the only
 way a browser request reaches the daemon. `web::OPS` lists each op, the
