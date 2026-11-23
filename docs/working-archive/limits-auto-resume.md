@@ -23,13 +23,13 @@ and `crates/daemon/src/overlord.md`. The full working doc is in git history
   - The OpenCode retry hold covers only `Source::Resume`; extend it to
     `Source::Send`.
 - **`auto_schedule` and `limit_auto`**
-  - `auto_schedule`'s final `retain` prunes `limit_auto` with the
-    `limits` snapshot taken at its start, which may be stale by then.
   - The `limit_auto` marker is pruned when a session is archived or
     unarchived across a restart, so its limit can be scheduled again.
   - Return early from `auto_schedule` when no session is limited.
   - `drop_auto_jobs` reads the jobs map on every tick while auto-resume
     is off. Run it only when the setting changes.
+  - `save_markers` (end of `auto_schedule`) can race `drop_auto_jobs`:
+    a marker it merges back may be one `drop_auto_jobs` just cleared.
 - **Stand-down check**
   - `native_auto_resume` has three call sites; make it a single check.
   - Its always-false match arms are dead branches.
@@ -43,9 +43,20 @@ and `crates/daemon/src/overlord.md`. The full working doc is in git history
   - `offer_auto_resume` makes a blocking daemon call inside refresh.
   - Ctrl+D ("don't ask again") in the setup form drops the auto-resume
     pick made on that form.
-
-## Open decision (the user's)
-
-- There is no `confirm_*` form or overlord tool for this option. The
-  overlord can only point the user at `[limits] auto_resume`. Whether it
-  should be able to set the option is the user's call.
+  - The import offer is lost when a pushed UI command replaces it. A
+    general pending slot for timed dialogs (`timed.rs`) would fix it and
+    the auto-resume one alike.
+  - `timed::draw_timed` builds the Paragraph twice (to count rows, then
+    to draw), and `rows()` clones the lines for it.
+  - Opening and answering the auto-resume dialog each make a blocking
+    `limits.auto_resume` read: two blocking calls on the UI thread.
+  - The pending slot should be generic for every pushed-over dialog,
+    `LimitSwitch` included.
+  - `modal_hits` (other dialogs) isn't wrap-aware; `draw_timed` is.
+  - A dead guard remains in the auto-resume dialog code (review item 9
+    on #90).
+- **MCP**
+  - `set_auto_resume` validates `on` in `mcp.rs` and again in
+    `limits::set_auto_resume_at`.
+  - `set_auto_resume` without `on` (a read) is gated by `confirm_sends`
+    too: split the read into its own read-only tool.

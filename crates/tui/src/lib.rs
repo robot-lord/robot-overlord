@@ -31,6 +31,7 @@ mod setupform;
 pub mod statustext;
 mod tagsform;
 mod theme;
+mod timed;
 use groups::Tab;
 use newform::NewForm;
 pub use overlay::run as run_overlay;
@@ -196,11 +197,11 @@ enum Mode {
     /// The active overlord is out of usage: switch to another agent's?
     LimitSwitch(Box<overlord::LimitSwitch>),
     /// The one-time `[limits] auto_resume` question (`autoresume`).
-    /// (When it opened: keys right after are dropped.)
-    AutoResume(std::time::Instant),
+    /// (When first drawn: keys right after are dropped.)
+    AutoResume(timed::Shown),
     /// Initial setup: import existing sessions? (`importoffer`).
-    /// (When it opened: keys right after are dropped.)
-    ImportOffer(std::time::Instant),
+    /// (When first drawn: keys right after are dropped.)
+    ImportOffer(timed::Shown),
     /// "Quit rlord?" — quitting is deliberate (y/enter), anything else stays.
     ConfirmQuit,
     /// The cheat sheet (`?`).
@@ -295,6 +296,8 @@ struct App {
     setup_put_off: bool,
     /// The auto-resume question was asked (or put off) this run.
     auto_resume_asked: bool,
+    /// The question is due: it opens once nothing else is (`poll_auto_resume`).
+    auto_resume_pending: bool,
     /// Why the last auto-resume answer wasn't saved.
     auto_resume_error: Option<String>,
     /// The import offer was looked for this run (`start_import_offer`).
@@ -413,6 +416,7 @@ impl App {
             launch_retry: None,
             setup_put_off: false,
             auto_resume_asked: false,
+            auto_resume_pending: false,
             auto_resume_error: None,
             import_offer_checked: false,
             import_offer_ready: false,
@@ -602,6 +606,7 @@ impl App {
             }
             // A session is limited and auto-resume isn't chosen: ask once.
             self.offer_auto_resume();
+            self.close_answered_auto_resume();
             let n = self.sessions.len();
             let sel = self.table.selected().unwrap_or(0);
             let at = keep
@@ -950,6 +955,7 @@ impl App {
                 || self.poll_fork()
                 || self.poll_launch()
                 || self.poll_import_offer()
+                || self.poll_auto_resume()
             {
                 self.dirty = true;
             }
@@ -1589,8 +1595,8 @@ impl App {
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
             Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
             Mode::LimitSwitch(l) => self.draw_limit_switch(f, l),
-            Mode::AutoResume(_) => self.draw_auto_resume(f),
-            Mode::ImportOffer(_) => self.draw_import_offer(f),
+            Mode::AutoResume(t) => self.draw_auto_resume(f, t),
+            Mode::ImportOffer(t) => self.draw_import_offer(f, t),
             Mode::ConfirmQuit => self.draw_confirm_quit(f),
             Mode::Help => self.draw_help(f),
             Mode::Command(l) => self.draw_launcher(f, l),

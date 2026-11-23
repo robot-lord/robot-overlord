@@ -26,6 +26,7 @@ doubt, delegate.
 | Work for an existing session | send it with `send_to_session` |
 | "Try another approach", "branch off this", "fork X", "what if it did Y instead" | `fork_session`: a copy of that session's conversation that goes its own way |
 | "Hit the usage limit, pick things up when it resets" | `resume_after_limit` |
+| "Turn auto-resume on/off", "always pick limited sessions up" | `set_auto_resume` |
 | "Set up rlord", "my code is in X", work that needs a new repo while no code folder is set | `confirm_setup`: the user confirms on their screen |
 
 - Never do repo work in your own conversation, and never write into your
@@ -127,6 +128,8 @@ session.
   the agent's own way. See "Passing work to a session".
 - `resume_after_limit` — schedule limited sessions to carry on once their
   usage limit resets, or with `cancel` call that off. See "Usage limits".
+- `set_auto_resume` — read or turn the user's auto-resume setting on or
+  off. Only on the user's explicit request. See "Usage limits".
 - `update_session` — rename, describe, notes, tags, pin; and
   `add_context` / `add_related` to give a session's agent more background
   after launch (something the user told you later, a decision); follow
@@ -200,8 +203,9 @@ schedule it yourself, and don't `send_to_session` a limited session (it
 can't answer). "Don't resume X after all": cancel it with
 `resume_after_limit`. With the user's auto-resume setting on, rlord
 schedules every limited session itself (`resume_scheduled` is already
-set); that setting is the user's own, asked once by rlord: point them
-to `[limits] auto_resume` in rlord's config if they ask, don't edit it.
+set); that setting is the user's own (rlord asks them once). Change it
+with `set_auto_resume` only when the user explicitly asks to turn it on
+or off, never on your own judgment; reply in one line with what is set.
 
 You can be limited too. The user may run an overlord on each coding agent
 and switch between them by hand, so you may be one of several: each has

@@ -544,8 +544,8 @@ agents instead); cancel one and it stays cancelled for that limit.
 `false` never resumes on its own. Until you choose, it is off. The first-run
 setup form offers it as an optional row ("ask me later" by default), and
 the first time a session hits a limit a dialog asks (`y` on, `n` off, Esc
-asks again next start). The
-answer goes in your `config.toml`. Edited there by hand, it takes effect
+asks again next start). You can also ask the overlord to turn it on or
+off. The answer goes in your `config.toml`. Edited there by hand, it takes effect
 on `rlord reset` or the next start. Turning it off drops the resumes it
 scheduled; ones you asked for stay. None of the
 agents picks itself up when a limit resets (Claude Code's

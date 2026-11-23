@@ -435,7 +435,12 @@ fn schedule(d: &Daemon, id: &str, l: &Value, message: &str, now: i64, auto: bool
     let mut jobs = db.kv_map(JOBS_KEY)?;
     // Automatic: never over a job, nor for a limit already handled (a
     // resume made and cancelled meanwhile), checked under the lock.
-    if auto && (jobs.contains_key(id) || db.kv_map(AUTO_KEY)?.get(id) == Some(&l["at"])) {
+    // Nor once auto-resume was turned off meanwhile.
+    if auto
+        && (!d.config().limits.auto_resume_on()
+            || jobs.contains_key(id)
+            || db.kv_map(AUTO_KEY)?.get(id) == Some(&l["at"]))
+    {
         return Ok(false);
     }
     jobs.insert(id.to_string(), job.clone());
@@ -522,20 +527,22 @@ fn auto_schedule(d: &Daemon) -> Result<()> {
         // (Limits that are over are forgotten: the map stays small.)
         done.retain(|id, _| limits.contains_key(id));
         if due.is_empty() {
-            if done != saved {
-                db.kv_set_map(AUTO_KEY, &done)?;
-            }
-            return Ok(());
+            (Vec::new(), done)
+        } else {
+            let todo: Vec<(String, Option<Session>)> = due
+                .into_iter()
+                .map(|id| {
+                    let s = db.resolve_ref(&id).ok();
+                    (id, s)
+                })
+                .collect();
+            (todo, done)
         }
-        let todo: Vec<(String, Option<Session>)> = due
-            .into_iter()
-            .map(|id| {
-                let s = db.resolve_ref(&id).ok();
-                (id, s)
-            })
-            .collect();
-        (todo, done)
     };
+    if todo.is_empty() {
+        // (Pruned by a fresh read, as below.)
+        return save_markers(d, done);
+    }
     let now = now_ms();
     let message = default_message(d);
     for (id, s) in todo {
@@ -551,16 +558,25 @@ fn auto_schedule(d: &Daemon) -> Result<()> {
         }
         tracing::info!(session = %s.name, "resume scheduled by itself (auto_resume)");
     }
-    {
-        // (Over what `schedule` recorded meanwhile.)
-        let db = d.db();
-        let mut now_done = db.kv_map(AUTO_KEY)?;
-        merge_newer(&mut now_done, done);
-        now_done.retain(|id, _| limits.contains_key(id));
-        db.kv_set_map(AUTO_KEY, &now_done)?;
-    }
+    save_markers(d, done)?;
     d.changed();
     Ok(())
+}
+
+/// Save `auto_schedule`'s markers `done` (kv `limit_auto`) over what was
+/// recorded meanwhile, forgetting sessions no longer limited per a fresh
+/// read of the limits: one limited since the tick began keeps its marker.
+fn save_markers(d: &Daemon, done: Map<String, Value>) -> Result<()> {
+    let limits = limits(d);
+    let db = d.db();
+    let saved = db.kv_map(AUTO_KEY)?;
+    let mut now_done = saved.clone();
+    merge_newer(&mut now_done, done);
+    now_done.retain(|id, _| limits.contains_key(id));
+    if now_done == saved {
+        return Ok(());
+    }
+    db.kv_set_map(AUTO_KEY, &now_done)
 }
 
 /// Markers in `from` over `into` (kv `limit_auto`), keeping the later
@@ -577,7 +593,9 @@ fn merge_newer(into: &mut Map<String, Value>, from: Map<String, Value>) {
 }
 
 /// Auto-resume is off: drop the jobs it made (`auto`), keep the ones
-/// asked for, each logged.
+/// asked for, each logged. A dropped job never sent nor rescheduled loses
+/// its marker (kv `limit_auto`) too: turned back on during the same
+/// limit, the job is made again.
 fn drop_auto_jobs(d: &Daemon) -> Result<()> {
     let ids: Vec<String> = d
         .db()
@@ -595,8 +613,16 @@ fn drop_auto_jobs(d: &Daemon) -> Result<()> {
         let db = d.db();
         let mut jobs = db.kv_map(JOBS_KEY)?;
         if jobs.get(&id).is_some_and(|j| j["auto"] == true) {
-            jobs.remove(&id);
+            let job = jobs.remove(&id).unwrap_or_default();
             db.kv_set_map(JOBS_KEY, &jobs)?;
+            // Only a job never sent: one that was (or was rescheduled) keeps
+            // its marker, so turning it on again doesn't reset the
+            // `MAX_ATTEMPTS` cap with a fresh job.
+            let untouched = job["attempts"].as_u64().unwrap_or(0) == 0 && job["sent_at"].is_null();
+            let mut done = db.kv_map(AUTO_KEY)?;
+            if untouched && done.remove(&id).is_some() {
+                db.kv_set_map(AUTO_KEY, &done)?;
+            }
             db.insert_event(
                 &id,
                 now,
@@ -822,6 +848,10 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
     let native = s.as_ref().is_some_and(native_auto_resume);
     let next = if native {
         Step::Drop("its agent picks itself up when the limit resets", false)
+    } else if job["auto"] == true && !d.config().limits.auto_resume_on() {
+        // Turned off since: an automatic job isn't sent (checked under
+        // the lock, as `drop_auto_jobs` drops it).
+        Step::Drop("auto-resume was turned off", false)
     } else {
         step(&job, s.as_ref(), hit.as_ref(), now)
     };
@@ -1424,6 +1454,75 @@ mod tests {
         d.update_config(|c| c.limits.auto_resume = Some(false));
         auto_schedule(&d).unwrap();
         assert!(d.db().kv_map(JOBS_KEY).unwrap().contains_key("s1"));
+    }
+
+    /// Off, then on again during the same limit: the job it dropped is
+    /// made again (its marker went with it).
+    #[test]
+    fn auto_resume_off_then_on_makes_the_job_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        auto_schedule(&d).unwrap();
+        let cfg = dir.path().join("config.toml");
+        set_auto_resume_at(&d, &json!({"on": false}), &cfg).unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
+        set_auto_resume_at(&d, &json!({"on": true}), &cfg).unwrap();
+        auto_schedule(&d).unwrap();
+        assert_eq!(d.db().kv_map(JOBS_KEY).unwrap()["s1"]["auto"], true);
+    }
+
+    /// An auto job whose setting was turned off isn't sent: `run_job`
+    /// drops it, and `schedule` doesn't make one.
+    #[test]
+    fn an_auto_job_isnt_sent_once_auto_resume_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        auto_schedule(&d).unwrap();
+        d.update_config(|c| c.limits.auto_resume = Some(false));
+        run_job(&d, "s1").unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
+        let l = limits(&d)["s1"].clone();
+        d.db().kv_set_map(AUTO_KEY, &Map::new()).unwrap();
+        assert!(!schedule(&d, "s1", &l, "continue", 3, true).unwrap());
+    }
+
+    /// A job already sent (or rescheduled) keeps its marker when dropped:
+    /// off then on doesn't start a fresh job past the attempts cap.
+    #[test]
+    fn off_then_on_keeps_a_sent_jobs_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        auto_schedule(&d).unwrap();
+        let mut jobs = d.db().kv_map(JOBS_KEY).unwrap();
+        jobs["s1"]["attempts"] = json!(1);
+        jobs["s1"]["sent_at"] = json!(5);
+        d.db().kv_set_map(JOBS_KEY, &jobs).unwrap();
+        let cfg = dir.path().join("config.toml");
+        set_auto_resume_at(&d, &json!({"on": false}), &cfg).unwrap();
+        set_auto_resume_at(&d, &json!({"on": true}), &cfg).unwrap();
+        auto_schedule(&d).unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
+    }
+
+    /// A session limited after `auto_schedule` read the limits keeps the
+    /// marker recorded for it meanwhile: markers are pruned by a fresh read.
+    #[test]
+    fn markers_are_pruned_by_the_limits_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        let at = limits(&d)["s1"]["at"].clone();
+        // s2 is limited and handled (by `resume`, say) mid-tick.
+        d.limits
+            .now
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .insert("s2".into(), json!({"at": 7, "resets_at": 99999999999i64}));
+        mark_handled(&d.db(), "s2", &json!(7)).unwrap();
+        save_markers(&d, Map::from_iter([("s1".to_string(), at)])).unwrap();
+        let done = d.db().kv_map(AUTO_KEY).unwrap();
+        assert!(done.contains_key("s1") && done.contains_key("s2"));
     }
 
     /// A job that gives up because the limit kept hitting: auto-resume

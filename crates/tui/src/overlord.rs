@@ -651,8 +651,17 @@ impl App {
         })
     }
 
-    /// A command the overlord sent (via the daemon).
+    /// A command the overlord sent (via the daemon). One that replaces
+    /// the auto-resume question leaves it pending: it opens again after.
     pub(crate) fn handle_ui_cmd(&mut self, cmd: Value) {
+        let asking = matches!(self.mode, Mode::AutoResume(_));
+        self.ui_cmd(cmd);
+        if asking && !matches!(self.mode, Mode::AutoResume(_)) {
+            self.auto_resume_pending = true;
+        }
+    }
+
+    fn ui_cmd(&mut self, cmd: Value) {
         match cmd["cmd"].as_str() {
             Some("set_view") => {
                 self.mode = Mode::Normal;

@@ -1456,6 +1456,7 @@ mod tests {
         let tools: Vec<&str> = on.split(',').collect();
         assert!(!tools.contains(&"mcp__rlord") && !on.contains("send_to_session"));
         assert!(!on.contains("resume_after_limit"));
+        assert!(!on.contains("set_auto_resume"));
         assert!(tools.contains(&"mcp__rlord__list_sessions") && tools.contains(&"Read"));
         assert_eq!(
             tools.len(),
@@ -1473,7 +1474,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(d.join("opencode.json")).unwrap())
                 .unwrap();
         let rules = cfg["permissions"].as_array().unwrap();
-        assert_eq!(rules.last().unwrap()["action"], "rlord_resume_after_limit");
+        assert_eq!(rules.last().unwrap()["action"], "rlord_set_auto_resume");
     }
 
     /// Each agent gets rlord's MCP server with its tools pre-allowed, in
