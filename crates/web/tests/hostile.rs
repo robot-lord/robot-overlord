@@ -130,7 +130,13 @@ async fn two_devices_frames_swapped() {
     // The links' ids, as the relay told the host.
     let links: Arc<Mutex<Vec<u32>>> = Arc::default();
     let swap: Arc<Mutex<Option<(u32, u32)>>> = Arc::default();
-    let (l2, s2) = (links.clone(), swap.clone());
+    // The first frame of the pair is held until the other's comes, then
+    // both go to the host swapped, back to back: passed on at once, the
+    // host could drop the second link (for the first frame) before the
+    // relay forwarded the second, leaving one phone waiting on a live
+    // session for an answer that never comes (no answer watchdog yet).
+    let held: Arc<Mutex<Vec<(u32, Vec<u8>)>>> = Arc::default();
+    let (l2, s2, h2) = (links.clone(), swap.clone(), held.clone());
     w.tamper.set_filter(Box::new(move |p, dir, m| {
         if p.role != Role::Host || dir != Dir::Down {
             return vec![m];
@@ -144,17 +150,28 @@ async fn two_devices_frames_swapped() {
         let Message::Binary(bytes) = &m else {
             return vec![m];
         };
+        let swapped = |link: u32, payload: Vec<u8>| {
+            let other = if link == x { y } else { x };
+            Message::Binary(
+                ToHost::Live {
+                    link: other,
+                    payload,
+                }
+                .encode()
+                .into(),
+            )
+        };
         match ToHost::decode(bytes) {
             Ok(ToHost::Live { link, payload }) if link == x || link == y => {
-                let other = if link == x { y } else { x };
-                vec![Message::Binary(
-                    ToHost::Live {
-                        link: other,
-                        payload,
-                    }
-                    .encode()
-                    .into(),
-                )]
+                let mut h = h2.lock().unwrap();
+                if h.first().is_none_or(|(first, _)| *first == link) {
+                    h.push((link, payload));
+                    return vec![];
+                }
+                *s2.lock().unwrap() = None;
+                let mut out: Vec<Message> = h.drain(..).map(|(l, p)| swapped(l, p)).collect();
+                out.push(swapped(link, payload));
+                out
             }
             _ => vec![m],
         }
