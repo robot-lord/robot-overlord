@@ -2766,7 +2766,6 @@ name = "robot-overlord-e2e-ffi"
 version = "1.16.0-dev.2"
 dependencies = [
  "robot-overlord-e2e-client",
- "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "uniffi",

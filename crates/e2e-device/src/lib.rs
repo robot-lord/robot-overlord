@@ -9,7 +9,10 @@
 //!   sessions, the cheap check, the mailbox), for tests that need to do
 //!   what the engine never would (`crates/web/tests/remote.rs`).
 //! - `testing`: the hostile relays of the adversarial tests.
+//! - [`bridge`]: `rlord-device bridge`, the engine behind a loopback
+//!   websocket that plays the phone shell's message bridge (debug only).
 
+pub mod bridge;
 pub mod client;
 pub mod phone;
 pub mod testing;
