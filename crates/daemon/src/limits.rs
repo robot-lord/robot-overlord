@@ -687,6 +687,10 @@ fn cancel(d: &Daemon, params: &Value) -> Result<Value> {
 }
 
 /// What to do with a job now.
+/// Why a job gives up on a limit that keeps hitting (the only drop that
+/// marks the newer limit handled).
+const KEPT_HITTING: &str = "the limit kept hitting";
+
 #[derive(Debug, PartialEq)]
 enum Step {
     Wait,
@@ -721,7 +725,7 @@ fn step(job: &Value, s: Option<&Session>, hit: Option<&LimitHit>, now: i64) -> S
         }
         return match newer {
             Some(_) if job["attempts"].as_u64().unwrap_or(0) >= MAX_ATTEMPTS => {
-                Step::Drop("the limit kept hitting", false)
+                Step::Drop(KEPT_HITTING, false)
             }
             Some(h) => Step::Reschedule(h.at, h.resets_at.max(h.at)),
             None if now - sent > WATCH_MS => Step::Drop("resumed", true),
@@ -829,10 +833,9 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
             })?;
             // A newer limit it gives up on (it kept hitting) is handled
             // too: `auto_schedule` doesn't start over on it.
-            if let Some(h) = hit
-                .as_ref()
-                .filter(|h| !h.touched && h.at > job["limit_at"].as_i64().unwrap_or(0))
-            {
+            if let Some(h) = hit.as_ref().filter(|h| {
+                why == KEPT_HITTING && !h.touched && h.at > job["limit_at"].as_i64().unwrap_or(0)
+            }) {
                 mark_handled(&d.db(), id, &json!(h.at))?;
             }
             if !done {
