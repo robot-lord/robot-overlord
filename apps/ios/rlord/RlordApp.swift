@@ -7,7 +7,9 @@ import SwiftUI
 
 @main
 struct RlordApp: App {
-    @StateObject private var shell = Shell()
+    // One shell for the process: a background launch for the OS's refresh
+    // runs the same engine the window would.
+    @StateObject private var shell = Shell.shared
     @Environment(\.scenePhase) private var phase
 
     var body: some Scene {
@@ -16,7 +18,7 @@ struct RlordApp: App {
                 .onChange(of: phase, initial: true) { _, now in shell.phase(now) }
         }
         .backgroundTask(.appRefresh(refreshTask)) {
-            await shell.backgroundRefresh()
+            await Shell.shared.backgroundRefresh()
         }
     }
 }

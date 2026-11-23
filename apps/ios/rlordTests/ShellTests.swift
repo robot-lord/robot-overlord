@@ -144,3 +144,35 @@ final class BridgeTests: XCTestCase {
         XCTAssertFalse(web.allow(URL(string: "https://example.com/#x"), current: page))
     }
 }
+
+final class BackgroundTests: XCTestCase {
+    final class Quiet: Listener, @unchecked Sendable {
+        func toPage(json: String) {}
+        func notify(kind: String, count: UInt32) {}
+    }
+
+    /// The real engine behind the FFI: with nothing paired, a background
+    /// check returns at once without touching the network.
+    func testAnUnpairedEngineChecksNothing() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let engine = try Engine(
+            dir: dir.path, caPem: nil, vault: EnclaveVault(), signers: EnclaveSigners(), listener: Quiet())
+        defer { engine.shutdown() }
+        let start = Date()
+        // Off the main thread, as the refresh task runs it.
+        let r = await Task.detached { engine.backgroundCheck(budgetMs: 5_000) }.value
+        XCTAssertEqual(r.outcome, "not_paired")
+        XCTAssertFalse(r.reached)
+        XCTAssertFalse(r.handshake)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 2)
+    }
+
+    /// A notification is a count, never a session's name.
+    func testANotificationSaysACount() {
+        XCTAssertEqual(PageListener.text(kind: "waiting", count: 1), "1 session needs you")
+        XCTAssertEqual(PageListener.text(kind: "waiting", count: 3), "3 sessions need you")
+        XCTAssertNil(PageListener.text(kind: "waiting", count: 0))
+        XCTAssertNil(PageListener.text(kind: "other", count: 2))
+    }
+}

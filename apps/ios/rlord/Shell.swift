@@ -32,14 +32,22 @@ final class PageListener: Listener, @unchecked Sendable {
     }
 
     func notify(kind: String, count: UInt32) {
-        guard kind == "waiting", count > 0,
+        guard let body = Self.text(kind: kind, count: count),
               UserDefaults.standard.bool(forKey: Setting.notifications)
         else { return }
         let content = UNMutableNotificationContent()
         content.title = "rlord"
-        content.body = count == 1 ? "1 session needs you" : "\(count) sessions need you"
+        content.body = body
+        // One notification at a time: a newer count replaces the last.
         let request = UNNotificationRequest(identifier: "waiting", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
+    }
+
+    /// What a notification says: a count, made on the phone, no session
+    /// names (nil: nothing to say).
+    static func text(kind: String, count: UInt32) -> String? {
+        guard kind == "waiting", count > 0 else { return nil }
+        return count == 1 ? "1 session needs you" : "\(count) sessions need you"
     }
 }
 
@@ -58,6 +66,8 @@ final class FlushTask {
 
 @MainActor
 final class Shell: ObservableObject {
+    static let shared = Shell()
+
     let web = WebController()
     private(set) var engine: Engine?
     @Published var startError: String?
@@ -255,11 +265,19 @@ final class Shell: ObservableObject {
         BackgroundRefresh.schedule()
     }
 
-    /// One bounded check, run by the OS's refresh task.
+    /// The OS's refresh: one bounded check (the engine dials, asks the
+    /// relay whether anything waits, and only then makes a session, takes
+    /// the state and calls `notify` with the sessions newly waiting). Then
+    /// the next refresh is asked for. The OS gives about 30 s; the check
+    /// gets 20 of them.
     nonisolated func backgroundRefresh() async {
         let engine = await MainActor.run { self.engine }
-        guard let engine else { return }
-        await Task.detached { _ = engine.backgroundCheck(budgetMs: 20_000) }.value
+        if let engine {
+            let r = await Task.detached { engine.backgroundCheck(budgetMs: Self.refreshBudgetMs) }.value
+            NSLog("rlord: background check: \(r.outcome)\(r.reason.map { " (\($0))" } ?? "")")
+        }
         BackgroundRefresh.schedule()
     }
+
+    nonisolated static let refreshBudgetMs: UInt64 = 20_000
 }
