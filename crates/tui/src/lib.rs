@@ -606,6 +606,7 @@ impl App {
             }
             // A session is limited and auto-resume isn't chosen: ask once.
             self.offer_auto_resume();
+            self.close_answered_auto_resume();
             let n = self.sessions.len();
             let sel = self.table.selected().unwrap_or(0);
             let at = keep

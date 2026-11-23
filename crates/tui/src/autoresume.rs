@@ -34,6 +34,14 @@ pub(crate) fn resume_text(cfg: &Config) -> String {
 }
 
 impl App {
+    /// Close the open question once the setting is answered elsewhere
+    /// (seen on a refresh).
+    pub(crate) fn close_answered_auto_resume(&mut self) {
+        if matches!(self.mode, Mode::AutoResume(_)) && self.config.limits.auto_resume.is_some() {
+            self.mode = Mode::Normal;
+        }
+    }
+
     /// Ask the question if it applies, once a run: it opens once nothing
     /// else is (`poll_auto_resume`). The daemon's config is asked first:
     /// another rlord window may have answered it already.
@@ -120,6 +128,20 @@ impl App {
                 return;
             }
         };
+        // Answered elsewhere meanwhile (the overlord's tool, another
+        // window): that answer stands, nothing is saved over it.
+        if !cfg!(test) {
+            if let Ok(v) = client_call(&paths::socket_path(), "limits.auto_resume", json!({})) {
+                if let Some(set) = v["auto_resume"].as_bool() {
+                    self.config.limits.auto_resume = Some(set);
+                }
+            }
+        }
+        if self.config.limits.auto_resume.is_some() {
+            self.status_line =
+                "auto-resume was already set elsewhere · [limits] auto_resume".into();
+            return;
+        }
         match client_call(
             &paths::socket_path(),
             "limits.auto_resume",
@@ -243,6 +265,20 @@ mod tests {
         app.mode = Mode::Normal;
         app.offer_auto_resume();
         assert!(app.auto_resume_asked);
+    }
+
+    /// Set elsewhere while open: a key doesn't save over it, and a
+    /// refresh closes it.
+    #[test]
+    fn an_answer_given_elsewhere_isnt_saved_over() {
+        let mut app = app();
+        app.config.limits.auto_resume = Some(false);
+        app.handle_auto_resume(key('y'), Shown::seen_long_ago());
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.config.limits.auto_resume, Some(false));
+        app.mode = Mode::AutoResume(Shown::default());
+        app.close_answered_auto_resume();
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     /// Asked during a refresh right before an attach: it doesn't open

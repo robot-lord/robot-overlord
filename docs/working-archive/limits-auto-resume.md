@@ -47,7 +47,16 @@ and `crates/daemon/src/overlord.md`. The full working doc is in git history
     general pending slot for timed dialogs (`timed.rs`) would fix it and
     the auto-resume one alike.
   - `timed::draw_timed` builds the Paragraph twice (to count rows, then
-    to draw).
+    to draw), and `rows()` clones the lines for it.
+  - Opening and answering the auto-resume dialog each make a blocking
+    `limits.auto_resume` read: two blocking calls on the UI thread.
+  - The pending slot should be generic for every pushed-over dialog,
+    `LimitSwitch` included.
+  - `modal_hits` (other dialogs) isn't wrap-aware; `draw_timed` is.
+  - A dead guard remains in the auto-resume dialog code (review item 9
+    on #90).
 - **MCP**
   - `set_auto_resume` validates `on` in `mcp.rs` and again in
     `limits::set_auto_resume_at`.
+  - `set_auto_resume` without `on` (a read) is gated by `confirm_sends`
+    too: split the read into its own read-only tool.
