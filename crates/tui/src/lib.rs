@@ -15,6 +15,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, ListState, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
+mod autoresume;
 mod forkform;
 mod groups;
 mod importoffer;
@@ -194,6 +195,9 @@ enum Mode {
     RemoteOffer(Box<overlord::RemoteOffer>),
     /// The active overlord is out of usage: switch to another agent's?
     LimitSwitch(Box<overlord::LimitSwitch>),
+    /// The one-time `[limits] auto_resume` question (`autoresume`).
+    /// (When it opened: keys right after are dropped.)
+    AutoResume(std::time::Instant),
     /// Initial setup: import existing sessions? (`importoffer`).
     /// (When it opened: keys right after are dropped.)
     ImportOffer(std::time::Instant),
@@ -289,6 +293,10 @@ struct App {
     /// The first-run code-folder form was put off (Esc) this run: closing
     /// another dialog doesn't reopen it (`check_setup`).
     setup_put_off: bool,
+    /// The auto-resume question was asked (or put off) this run.
+    auto_resume_asked: bool,
+    /// Why the last auto-resume answer wasn't saved.
+    auto_resume_error: Option<String>,
     /// The import offer was looked for this run (`start_import_offer`).
     import_offer_checked: bool,
     /// The offer applies, waiting for nothing else to be open.
@@ -404,6 +412,8 @@ impl App {
             launch_send: None,
             launch_retry: None,
             setup_put_off: false,
+            auto_resume_asked: false,
+            auto_resume_error: None,
             import_offer_checked: false,
             import_offer_ready: false,
             import_send: None,
@@ -590,6 +600,8 @@ impl App {
                     self.overlord_rows = 1;
                 }
             }
+            // A session is limited and auto-resume isn't chosen: ask once.
+            self.offer_auto_resume();
             let n = self.sessions.len();
             let sel = self.table.selected().unwrap_or(0);
             let at = keep
@@ -976,6 +988,7 @@ impl App {
             Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
             Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
             Mode::LimitSwitch(l) => self.handle_limit_switch(k, l),
+            Mode::AutoResume(t) => self.handle_auto_resume(k, t),
             Mode::ImportOffer(t) => self.handle_import_offer(k, t),
             Mode::Help => {}
             Mode::Command(l) => self.handle_launcher(k, l, terminal)?,
@@ -1576,6 +1589,7 @@ impl App {
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
             Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
             Mode::LimitSwitch(l) => self.draw_limit_switch(f, l),
+            Mode::AutoResume(_) => self.draw_auto_resume(f),
             Mode::ImportOffer(_) => self.draw_import_offer(f),
             Mode::ConfirmQuit => self.draw_confirm_quit(f),
             Mode::Help => self.draw_help(f),
@@ -2480,6 +2494,7 @@ impl App {
             | Mode::OverlordUpgrade(_)
             | Mode::RemoteOffer(_)
             | Mode::LimitSwitch(_)
+            | Mode::AutoResume(_)
             | Mode::ImportOffer(_) => {
                 Some("overlord — see dialog".to_string())
             }
