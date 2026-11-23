@@ -7,15 +7,21 @@
 // into dist-app/, which the app bundles and serves itself: `cargo xtask
 // web build --app` names it index.html, writes its asset table and runs
 // the checks on it (no network, no xterm.js, no LocalTransport).
+//
+// `--mode app-dev` builds the same page for a desktop browser
+// (app-dev.html, src/appDev.ts) into dist-app-dev/, with the dev bridge
+// to `rlord-device bridge` on VITE_RLORD_BRIDGE_PORT: `cargo xtask app
+// dev` only, never shipped.
 import { defineConfig } from "vitest/config";
 
 export default defineConfig(({ mode }) => {
-  const app = mode === "app";
+  const entries: Record<string, string> = { app: "app.html", "app-dev": "app-dev.html" };
+  const entry = entries[mode];
   return {
     build: {
-      outDir: app ? "dist-app" : "dist",
+      outDir: entry ? `dist-${mode}` : "dist",
       emptyOutDir: true,
-      ...(app ? { rolldownOptions: { input: "app.html" } } : {}),
+      ...(entry ? { rolldownOptions: { input: entry } } : {}),
       // Everything as files: the CSP allows 'self' (no data: fonts or
       // scripts), and the plugin's asset test checks every file is local.
       assetsInlineLimit: 0,
@@ -31,8 +37,10 @@ export default defineConfig(({ mode }) => {
     test: {
       include: ["test/**/*.test.ts"],
       // The WASM crypto core's tests need its build (`cargo xtask e2e
-      // test-wasm` runs them with vitest.e2e.config.ts).
-      exclude: ["test/e2e/**", "node_modules/**"],
+      // test-wasm` runs them with vitest.e2e.config.ts); the phone page's
+      // end-to-end tests need a host and the bridge (`cargo xtask app
+      // test-e2e`, vitest.app-e2e.config.ts).
+      exclude: ["test/e2e/**", "test/app-e2e/**", "node_modules/**"],
       environment: "node",
     },
   };

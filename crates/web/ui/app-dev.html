@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      Development only (`cargo xtask app dev`): the phone page in a desktop
+      browser, its engine behind `rlord-device bridge` on loopback. The
+      phone page's policy (app.html) but for connect-src, which names that
+      one websocket; `cargo xtask app dev` checks the built page holds it.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src ws://127.0.0.1:%VITE_RLORD_BRIDGE_PORT%; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>rlord (dev)</title>
+  </head>
+  <body class="phone">
+    <div id="app"></div>
+    <script type="module" src="/src/appDev.ts"></script>
+  </body>
+</html>

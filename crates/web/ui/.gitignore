@@ -3,3 +3,5 @@
 /dist
 # Built by `cargo xtask web build --app`; bundled into the phone apps.
 /dist-app
+# Built by `cargo xtask app dev`: the phone page for a desktop browser, never shipped.
+/dist-app-dev

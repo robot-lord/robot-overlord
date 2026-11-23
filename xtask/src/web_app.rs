@@ -11,6 +11,12 @@
 //! `connect-src 'none'` and `trusted-types 'none'`, and neither xterm.js nor
 //! the local page's transport bundled. And the local page's bundle holds
 //! none of the phone's bridge code.
+//!
+//! Neither bundle holds the dev bridge (`src/devBridge.ts`, the shell
+//! played over `rlord-device bridge`'s loopback websocket): it is built
+//! only into `dist-app-dev/` (`cargo xtask app dev`), whose page has the
+//! phone page's policy but for `connect-src`, which names that one
+//! websocket ([`check_dev`]).
 
 use std::path::Path;
 
@@ -48,6 +54,8 @@ const NETWORK_APIS: &[&str] = &[
 /// shows which it has even minified.
 const LOCAL_MARKER: &str = "rlord-local-transport";
 const REMOTE_MARKER: &str = "rlord-remote-transport";
+/// The dev bridge's (`DEV_MARKER` in `src/devBridge.ts`).
+const DEV_MARKER: &str = "rlord-dev-bridge";
 
 /// CSP directives the phone page's `<meta>` must have, exactly.
 const CSP_REQUIRED: &[(&str, &str)] = &[
@@ -113,6 +121,26 @@ pub fn check_local(dist: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The dev page (`dist-app-dev/app-dev.html`, built for a desktop
+/// browser by `cargo xtask app dev`): the phone page's policy, but
+/// `connect-src` names the bridge's websocket on `port` and nothing else.
+pub fn check_dev(dist: &Path, port: u16) -> Result<()> {
+    let page = dist.join("app-dev.html");
+    let html =
+        std::fs::read_to_string(&page).with_context(|| format!("reading {}", page.display()))?;
+    let policy = csp_meta(&html).context("app-dev.html has no Content-Security-Policy <meta>")?;
+    let found = csp_problems_for(&policy, &dev_connect(port));
+    if !found.is_empty() {
+        bail!("the dev page's CSP is wrong:\n  {}", found.join("\n  "));
+    }
+    Ok(())
+}
+
+/// What the dev page may connect to: the bridge, nothing else.
+fn dev_connect(port: u16) -> String {
+    format!("ws://127.0.0.1:{port}")
 }
 
 /// Every file under `dist` but the manifest, as (`/path`, bytes), sorted.
@@ -242,6 +270,11 @@ fn attrs(html: &str, name: &str) -> Vec<String> {
 
 /// What is wrong with the CSP `policy` for the phone page.
 fn csp_problems(policy: &str) -> Vec<String> {
+    csp_problems_for(policy, "'none'")
+}
+
+/// [`csp_problems`] with `connect` as `connect-src` (the dev page's).
+fn csp_problems_for(policy: &str, connect: &str) -> Vec<String> {
     let mut out = vec![];
     let directives: Vec<(String, String)> = policy
         .split(';')
@@ -251,7 +284,8 @@ fn csp_problems(policy: &str) -> Vec<String> {
             Some((name, words.collect::<Vec<_>>().join(" ")))
         })
         .collect();
-    for (name, want) in CSP_REQUIRED {
+    for &(name, want) in CSP_REQUIRED {
+        let want = if name == "connect-src" { connect } else { want };
         match directives.iter().find(|(n, _)| n == name) {
             Some((_, v)) if v == want => {}
             Some((_, v)) => out.push(format!("CSP {name} is `{v}`, not `{want}`")),
@@ -337,6 +371,9 @@ pub fn problems(files: &[(String, Vec<u8>)]) -> Vec<String> {
         if text.contains(LOCAL_MARKER) {
             out.push(format!("{path} carries LocalTransport"));
         }
+        if text.contains(DEV_MARKER) {
+            out.push(format!("{path} carries the dev bridge"));
+        }
         remote |= text.contains(REMOTE_MARKER);
         if path.ends_with(".js") || path.ends_with(".mjs") || path.ends_with(".html") {
             for api in NETWORK_APIS {
@@ -378,7 +415,7 @@ pub fn local_problems(files: &[(String, Vec<u8>)]) -> Vec<String> {
     let mut out = vec![];
     for (path, bytes) in files {
         let text = String::from_utf8_lossy(bytes);
-        for mark in [REMOTE_MARKER, "__rlord_recv", "messageHandlers"] {
+        for mark in [REMOTE_MARKER, DEV_MARKER, "__rlord_recv", "messageHandlers"] {
             if text.contains(mark) {
                 out.push(format!("{path} carries {mark}"));
             }
@@ -476,6 +513,7 @@ mod tests {
                 "static marker=\"rlord-local-transport\"",
                 "carries LocalTransport",
             ),
+            ("const D=\"rlord-dev-bridge\"", "carries the dev bridge"),
         ] {
             let js = format!("class R{{static marker=\"rlord-remote-transport\"}};{planted}");
             let got = problems(&with(&good(), "/assets/app-1.js", js.as_bytes()));
@@ -596,6 +634,41 @@ mod tests {
             Some(META),
             "the meta's content, read back"
         );
+    }
+
+    #[test]
+    fn the_dev_page_connects_to_the_bridge_only() {
+        let dev = META.replace("connect-src 'none'", "connect-src ws://127.0.0.1:4100");
+        assert!(csp_problems_for(&dev, &dev_connect(4100)).is_empty());
+        // Another port, more than the bridge, or the phone page's policy.
+        for policy in [
+            META.replace("connect-src 'none'", "connect-src ws://127.0.0.1:4101"),
+            META.replace(
+                "connect-src 'none'",
+                "connect-src ws://127.0.0.1:4100 'self'",
+            ),
+            META.to_string(),
+        ] {
+            let got = csp_problems_for(&policy, &dev_connect(4100));
+            assert!(
+                got.iter().any(|p| p.contains("connect-src")),
+                "{policy}: {got:?}"
+            );
+        }
+        // The rest stays the phone page's.
+        let loose = dev.replace("script-src 'self'", "script-src 'self' 'unsafe-inline'");
+        assert!(!csp_problems_for(&loose, &dev_connect(4100)).is_empty());
+        // The dev page's policy is never the phone page's.
+        assert!(!csp_problems(&dev).is_empty());
+    }
+
+    #[test]
+    fn the_local_page_has_no_dev_bridge() {
+        let local = vec![(
+            "/assets/index-1.js".to_string(),
+            b"const D=\"rlord-dev-bridge\"".to_vec(),
+        )];
+        assert_eq!(local_problems(&local).len(), 1);
     }
 
     /// The real build, when there is one (`cargo xtask web build --app`).
