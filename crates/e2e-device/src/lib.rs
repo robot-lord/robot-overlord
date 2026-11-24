@@ -293,6 +293,17 @@ pub struct Live {
     next_id: u64,
     /// The host's hello (after `Device::live`).
     pub hello: Value,
+    /// Pane streams: bytes received and not yet taken, and totals (what an
+    /// `ack` says).
+    pub panes: std::collections::BTreeMap<u8, PaneIn>,
+}
+
+/// One pane stream's received side.
+#[derive(Default, Debug, Clone)]
+pub struct PaneIn {
+    pub data: Vec<u8>,
+    pub bytes: u64,
+    pub frames: u64,
 }
 
 impl Live {
@@ -303,6 +314,7 @@ impl Live {
             inbox: VecDeque::new(),
             next_id: 0,
             hello: Value::Null,
+            panes: Default::default(),
         }
     }
 
@@ -323,7 +335,12 @@ impl Live {
             let p = self.session.decrypt(&w).map_err(|e| anyhow!("{e}"))?;
             if let Some(m) = self.reasm.push(&p).map_err(|e| anyhow!("{e}"))? {
                 if m.stream != CONTROL {
-                    bail!("a message on stream {}", m.stream);
+                    // A pane frame: kept for `pane_wait`.
+                    let p = self.panes.entry(m.stream).or_default();
+                    p.bytes += m.body.len() as u64;
+                    p.frames += 1;
+                    p.data.extend_from_slice(&m.body);
+                    continue;
                 }
                 return Ok(serde_json::from_slice(&m.body)?);
             }
@@ -350,6 +367,93 @@ impl Live {
         self.send_json(conn, &json!({"id": id, "op": op, "args": args}))
             .await?;
         self.answer(conn, &id, Duration::from_secs(30)).await
+    }
+
+    /// Input for a pane: frames of at most `stream::CHUNK` bytes.
+    pub async fn pane_send(&mut self, conn: &mut Conn, s: u8, bytes: &[u8]) -> Result<()> {
+        for c in bytes.chunks(stream::CHUNK) {
+            let f = stream::pane_frame(s, c).map_err(|e| anyhow!("{e}"))?;
+            let w = self.session.encrypt(&f).map_err(|e| anyhow!("{e}"))?;
+            conn.send_live(w).await?;
+        }
+        Ok(())
+    }
+
+    /// A pane event (`resize`, `ack`, `close`) with these fields.
+    pub async fn pane_event(
+        &mut self,
+        conn: &mut Conn,
+        s: u8,
+        kind: &str,
+        mut more: Value,
+    ) -> Result<()> {
+        more["event"] = json!("pane");
+        more["stream"] = json!(s);
+        more["type"] = json!(kind);
+        self.send_json(conn, &more).await
+    }
+
+    /// Acknowledge everything received on stream `s`.
+    pub async fn pane_ack(&mut self, conn: &mut Conn, s: u8) -> Result<()> {
+        let p = self.panes.get(&s).cloned().unwrap_or_default();
+        self.pane_event(
+            conn,
+            s,
+            "ack",
+            json!({"bytes": p.bytes, "frames": p.frames}),
+        )
+        .await
+    }
+
+    /// Receive until `done` holds for stream `s`'s unread bytes, keeping
+    /// control messages in the inbox. `ack`: acknowledge as it goes (a
+    /// page that keeps up).
+    pub async fn pane_wait(
+        &mut self,
+        conn: &mut Conn,
+        s: u8,
+        ack: bool,
+        limit: Duration,
+        mut done: impl FnMut(&[u8]) -> bool,
+    ) -> Result<()> {
+        let until = tokio::time::Instant::now() + limit;
+        loop {
+            if done(
+                &self
+                    .panes
+                    .get(&s)
+                    .map(|p| p.data.clone())
+                    .unwrap_or_default(),
+            ) {
+                return Ok(());
+            }
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                bail!("timed out waiting on pane stream {s}");
+            }
+            let before = self.panes.get(&s).map_or(0, |p| p.frames);
+            match tokio::time::timeout(
+                left.min(Duration::from_millis(200)),
+                self.recv_json(conn, left),
+            )
+            .await
+            {
+                Ok(Ok(v)) => self.inbox.push_back(v),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {}
+            }
+            if ack && self.panes.get(&s).map_or(0, |p| p.frames) != before {
+                self.pane_ack(conn, s).await?;
+            }
+        }
+    }
+
+    /// Take stream `s`'s unread bytes.
+    pub fn pane_take(&mut self, s: u8) -> Vec<u8> {
+        self.panes
+            .get_mut(&s)
+            .map(|p| std::mem::take(&mut p.data))
+            .unwrap_or_default()
     }
 
     /// The answer to request `id`.

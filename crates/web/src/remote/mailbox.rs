@@ -50,7 +50,7 @@ use super::session::error_answer;
 use super::Actor;
 
 /// Ops a device may send by mailbox.
-pub const MAILBOX_OPS: &[&str] = &["overlord.ask", "overlord.new_session"];
+pub const MAILBOX_OPS: &[&str] = &["overlord.new_session"];
 /// Requests remembered per device.
 const REMEMBER: usize = 64;
 /// A stored answer larger than this is kept as a short note instead.
@@ -453,7 +453,7 @@ impl Actor {
                 error_answer(
                     &r["id"],
                     "not_allowed",
-                    "only overlord.ask and overlord.new_session travel by mailbox",
+                    "only overlord.new_session travels by mailbox",
                 ),
             ),
             Some(r) => self.admit(&device, r, Waiter::Mailbox),
