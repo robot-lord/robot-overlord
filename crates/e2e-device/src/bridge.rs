@@ -9,9 +9,13 @@
 //! - every websocket text message from the page goes to
 //!   [`Engine::page_message`], except the two the shell serves itself:
 //!   `{"app":"settings",…}` (answered with a `settings` event, kept in
-//!   memory) and `{"app":"scan"}` (there is no camera: it says
+//!   memory), `{"app":"scan"}` (there is no camera: it says
 //!   `{"event":"scan"}` on stdout, and whoever runs the bridge answers
-//!   with a `qr` line on stdin);
+//!   with a `qr` line on stdin), and the pasteboard's `{"app":"copy",
+//!   "text"}` and `{"app":"paste"}` (answered `{"event":"paste","text"}`;
+//!   a clipboard of its own, in memory, never the desktop's);
+//! - everything else, the pane messages (`{"pane":…}`) included, goes to
+//!   the engine as it is;
 //! - every [`Listener::to_page`](rlord_e2e_client::Listener) message goes
 //!   back as one text message;
 //! - the engine is in the foreground while a page is connected, in the
@@ -123,6 +127,8 @@ enum ShellMessage {
         app_lock: Option<bool>,
         notifications: Option<bool>,
     },
+    Copy(String),
+    Paste,
 }
 
 fn shell_message(text: &str) -> Option<ShellMessage> {
@@ -133,6 +139,8 @@ fn shell_message(text: &str) -> Option<ShellMessage> {
             app_lock: v["app_lock"].as_bool(),
             notifications: v["notifications"].as_bool(),
         }),
+        "copy" => Some(ShellMessage::Copy(v["text"].as_str()?.to_string())),
+        "paste" => Some(ShellMessage::Paste),
         _ => None,
     }
 }
@@ -230,6 +238,7 @@ impl Bridge {
             engine: engine.clone(),
             page: page.clone(),
             settings: Arc::default(),
+            clipboard: Arc::default(),
             origins: Arc::new(o.origins.clone()),
             events: ev_tx,
             next: Arc::default(),
@@ -291,6 +300,8 @@ struct Shared {
     engine: Arc<Engine>,
     page: Arc<Mutex<Option<Page>>>,
     settings: Arc<Mutex<Settings>>,
+    /// The pasteboard's stand-in.
+    clipboard: Arc<Mutex<String>>,
     origins: Arc<Vec<String>>,
     events: mpsc::UnboundedSender<Value>,
     next: Arc<Mutex<u64>>,
@@ -401,6 +412,11 @@ impl Shared {
                 };
                 self.reply(s.event());
             }
+            Some(ShellMessage::Copy(t)) => *self.clipboard.lock().unwrap() = t,
+            Some(ShellMessage::Paste) => {
+                let text = self.clipboard.lock().unwrap().clone();
+                self.reply(json!({"event": "paste", "text": text}).to_string());
+            }
             None => self.engine.page_message(text.to_string()),
         }
     }
@@ -465,10 +481,23 @@ mod tests {
                 notifications: None
             })
         );
+        assert_eq!(
+            shell_message(r#"{"app":"copy","text":"hi"}"#),
+            Some(ShellMessage::Copy("hi".into()))
+        );
+        assert_eq!(
+            shell_message(r#"{"app":"paste"}"#),
+            Some(ShellMessage::Paste)
+        );
         for engine in [
             r#"{"app":"ready"}"#,
             r#"{"app":"status"}"#,
             r#"{"id":1,"op":"snapshot","args":{}}"#,
+            r#"{"id":2,"op":"pane.open","args":{"stream":1}}"#,
+            r#"{"pane":"input","stream":1,"b":"eA=="}"#,
+            r#"{"pane":"resize","stream":1,"cols":80,"rows":24}"#,
+            r#"{"pane":"ack","stream":1,"bytes":1,"frames":1}"#,
+            r#"{"pane":"close","stream":1}"#,
             "not json",
         ] {
             assert_eq!(shell_message(engine), None, "{engine}");
