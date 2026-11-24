@@ -39,8 +39,9 @@ export default defineConfig(({ mode }) => {
       // The WASM crypto core's tests need its build (`cargo xtask e2e
       // test-wasm` runs them with vitest.e2e.config.ts); the phone page's
       // end-to-end tests need a host and the bridge (`cargo xtask app
-      // test-e2e`, vitest.app-e2e.config.ts).
-      exclude: ["test/e2e/**", "test/app-e2e/**", "node_modules/**"],
+      // test-e2e`, vitest.app-e2e.config.ts), and its terminal tests a
+      // real-Claude demo too (`app test-term`, vitest.app-term.config.ts).
+      exclude: ["test/e2e/**", "test/app-e2e/**", "test/app-term/**", "node_modules/**"],
       environment: "node",
     },
   };

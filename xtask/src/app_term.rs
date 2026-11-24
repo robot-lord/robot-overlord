@@ -203,7 +203,9 @@ impl Demo {
         run(Command::new(root.join("scripts/demo/demo.sh"))
             .args(["--real-claude", "--web"])
             .arg(&dir)
-            .env("RLORD_DEMO_SOCKET", &socket))?;
+            .env("RLORD_DEMO_SOCKET", &socket)
+            // Answers slow enough to interrupt one with Esc.
+            .env("RLORD_FAKE_MODEL_DELAY_MS", "250"))?;
         // The plugin on a free port of its own (another demo or a real
         // install may have the default one).
         let cfg = dir.join("config/robot-overlord/config.toml");

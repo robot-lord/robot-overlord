@@ -147,6 +147,15 @@ fn start_fake_model(dir: &Path) -> Result<u16> {
     use std::os::unix::process::CommandExt;
     let child = Command::new(std::env::current_exe()?)
         .args(["fake-model", "--port", "0"])
+        // A slower stream for tests that interrupt an answer (`app
+        // test-term`): `RLORD_FAKE_MODEL_DELAY_MS`.
+        .args(
+            std::env::var("RLORD_FAKE_MODEL_DELAY_MS")
+                .ok()
+                .filter(|v| v.parse::<u64>().is_ok())
+                .map(|v| vec!["--delay-ms".to_string(), v])
+                .unwrap_or_default(),
+        )
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
