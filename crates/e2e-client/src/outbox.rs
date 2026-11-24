@@ -6,9 +6,9 @@
 //! - Every request that changes something gets an entry with a
 //!   device-unique id (16 random bytes, base64url), saved before it is
 //!   sent and resent by that id after any reconnect.
-//! - Only [`may_wait`] ops are accepted without a live session; they
-//!   travel by the mailbox or wait for the host, for up to
-//!   [`EXPIRY_MS`] (then `expired`).
+//! - Only [`may_wait`] ops (a described new session) are accepted
+//!   without a live session; they travel by the mailbox or wait for the
+//!   host, for up to [`EXPIRY_MS`] (then `expired`).
 //! - Any other entry is resent for [`RESEND_WINDOW_MS`] after it first
 //!   left, then ends `interrupted` ("check, then ask anew").
 //! - At most [`MAX_ENTRIES`]; the oldest finished-with-an-error entry
@@ -19,15 +19,17 @@ use serde_json::{json, Value};
 
 /// At most this many entries.
 pub const MAX_ENTRIES: usize = 16;
-/// A sent request that changes something (other than an ask) is resent by
-/// id for this long, then ends `interrupted`.
+/// A sent request that changes something (other than one that may wait)
+/// is resent by id for this long, then ends `interrupted`.
 pub const RESEND_WINDOW_MS: u64 = 2 * 60 * 1000;
-/// An ask that never got an answer ends `expired` after this long.
+/// A request that may wait and never got an answer ends `expired` after
+/// this long.
 pub const EXPIRY_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// The ops that may wait for the host (by mailbox, or until it is back).
+/// The ops that may wait for the host (by mailbox, or until it is back):
+/// only a described new session (`overlord.ask` left the remote API).
 pub fn may_wait(op: &str) -> bool {
-    matches!(op, "overlord.ask" | "overlord.new_session")
+    op == "overlord.new_session"
 }
 
 /// Look-ups: they run again harmlessly, so they get no entry; one in
@@ -38,7 +40,9 @@ pub fn may_wait(op: &str) -> bool {
 /// (`crates/web/tests/engine_surface.rs` holds the two lists together).
 /// `page.report` is one (reporting what the page shows twice is the same
 /// as once); `page.pending` is not (it takes the parked command, so a
-/// resend must get the stored answer).
+/// resend must get the stored answer). `pane.open` and `pane.take` are
+/// too: a pane lives in one session, so neither is ever kept to be sent
+/// again on another.
 pub fn is_lookup(op: &str) -> bool {
     matches!(
         op,
@@ -46,11 +50,12 @@ pub fn is_lookup(op: &str) -> bool {
             | "session.get"
             | "session.messages"
             | "overlord.ensure"
-            | "overlord.messages"
             | "view.default"
             | "form.defaults"
             | "form.repos"
             | "page.report"
+            | "pane.open"
+            | "pane.take"
     )
 }
 
@@ -128,7 +133,11 @@ impl Entry {
             "at": self.at,
             "state": self.state,
         });
-        if let Some(t) = self.args.get("text").and_then(Value::as_str) {
+        // What the list shows of it: a new session's description.
+        let text = ["text", "description"]
+            .iter()
+            .find_map(|k| self.args.get(*k).and_then(Value::as_str));
+        if let Some(t) = text {
             v["text"] = json!(t);
         }
         if let Some(e) = &self.error {
@@ -193,7 +202,7 @@ impl Outbox {
         self.entries.is_empty()
     }
 
-    /// Ends what has waited too long: an ask after [`EXPIRY_MS`]
+    /// Ends what has waited too long: one that may wait after [`EXPIRY_MS`]
     /// (`expired`), anything else [`RESEND_WINDOW_MS`] after it first
     /// left (`interrupted`) unless the host said it is running it on a
     /// session that is still live (`running_live`). The ids ended.
@@ -240,30 +249,35 @@ impl Outbox {
 mod tests {
     use super::*;
 
-    fn ask(id: &str, at: u64) -> Entry {
-        Entry::new(id.into(), "overlord.ask", json!({"text": id}), at)
+    fn waiting(id: &str, at: u64) -> Entry {
+        Entry::new(
+            id.into(),
+            "overlord.new_session",
+            json!({"description": id}),
+            at,
+        )
     }
 
     #[test]
     fn outbox_bounds() {
         let mut o = Outbox::default();
         for i in 0..MAX_ENTRIES {
-            o.add(ask(&format!("a{i}"), 0)).unwrap();
+            o.add(waiting(&format!("a{i}"), 0)).unwrap();
         }
-        assert_eq!(o.add(ask("x", 0)), Err(Full));
+        assert_eq!(o.add(waiting("x", 0)), Err(Full));
         // A finished one makes room (the oldest such).
         o.get_mut("a3").unwrap().state = State::Failed;
         o.get_mut("a5").unwrap().state = State::Interrupted;
-        o.add(ask("y", 0)).unwrap();
+        o.add(waiting("y", 0)).unwrap();
         assert!(o.get("a3").is_none() && o.get("a5").is_some());
         assert_eq!(o.len(), MAX_ENTRIES);
         assert_eq!(o.open_ids().len(), MAX_ENTRIES - 1);
     }
 
     #[test]
-    fn asks_expire_after_a_day_others_after_their_window() {
+    fn new_sessions_expire_after_a_day_others_after_their_window() {
         let mut o = Outbox::default();
-        o.add(ask("a", 0)).unwrap();
+        o.add(waiting("a", 0)).unwrap();
         let mut r = Entry::new("r".into(), "session.rename", json!({}), 0);
         r.state = State::Sent;
         r.first_sent = Some(1000);
@@ -289,10 +303,12 @@ mod tests {
     }
 
     #[test]
-    fn only_asks_and_new_sessions_wait() {
-        assert!(may_wait("overlord.ask") && may_wait("overlord.new_session"));
-        assert!(!may_wait("session.rename") && !may_wait("snapshot"));
+    fn only_a_new_session_may_wait() {
+        assert!(may_wait("overlord.new_session"));
+        assert!(!may_wait("overlord.ask") && !may_wait("session.rename"));
+        assert!(!may_wait("snapshot") && !may_wait("pane.open"));
         assert!(is_lookup("snapshot") && !is_lookup("session.rename"));
-        assert!(!is_lookup("some.new_op"));
+        assert!(is_lookup("pane.open") && is_lookup("pane.take"));
+        assert!(!is_lookup("overlord.messages") && !is_lookup("some.new_op"));
     }
 }

@@ -206,6 +206,7 @@ async fn the_hosts_drop_and_a_stalled_link() {
     let tuning = Tuning {
         ping_ms: 1_000,
         silence_ms: 3_000,
+        ..Tuning::default()
     };
     let (mut phone, _dir) = pair_tuned("stalls", tuning).await;
     // A frame the host can't open: it drops the link (4205) and the

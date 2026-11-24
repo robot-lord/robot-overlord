@@ -19,6 +19,8 @@ struct FakeHost {
     mailbox: Option<MailboxSession>,
     /// Requests and events the device sent on the live session.
     got: Vec<Value>,
+    /// Pane frames the device sent: stream and bytes.
+    pane_got: Vec<(u8, Vec<u8>)>,
     /// Requests the device sent by mailbox.
     mb_got: Vec<Value>,
     /// Message 1s seen.
@@ -29,6 +31,8 @@ struct FakeHost {
     api: Option<u64>,
     /// What its hello says of the device's mailbox.
     hello_mailbox: HelloMailbox,
+    /// More fields for its hello.
+    hello_extra: Value,
     /// Kind-3 message 1s answered (mailboxes keyed).
     keyings: usize,
     /// A pairing offer the host shows.
@@ -159,12 +163,14 @@ impl World {
                 reasm: Reassembler::new(),
                 mailbox: None,
                 got: vec![],
+                pane_got: vec![],
                 mb_got: vec![],
                 handshakes: 0,
                 answer: true,
                 rev: "r1".into(),
-                api: Some(1),
+                api: Some(2),
                 hello_mailbox: HelloMailbox::Current,
+                hello_extra: json!({}),
                 keyings: 0,
                 qr: None,
                 code: None,
@@ -289,6 +295,10 @@ impl World {
         let s = self.host.session.as_mut()?;
         let plain = s.decrypt(p).ok()?;
         let msg = self.host.reasm.push(&plain).unwrap()?;
+        if msg.stream != CONTROL {
+            self.host.pane_got.push((msg.stream, msg.body));
+            return None;
+        }
         let v: Value = serde_json::from_slice(&msg.body).unwrap();
         match v["event"].as_str() {
             Some("hello") => {
@@ -296,6 +306,9 @@ impl World {
                     "device": device_id(&self.host.device)});
                 if let Some(a) = self.host.api {
                     h["api"] = json!(a);
+                }
+                for (k, v) in self.host.hello_extra.as_object().unwrap() {
+                    h[k] = v.clone();
                 }
                 match &self.host.hello_mailbox {
                     HelloMailbox::Current => {
@@ -347,6 +360,16 @@ impl World {
             .decrypt(&p[8..])
             .expect("a mailbox frame opens at the host");
         serde_json::from_slice(&stream::single(&plain).unwrap().body).unwrap()
+    }
+
+    /// The host sends a pane frame on the live session.
+    fn host_pane(&mut self, stream: u8, bytes: &[u8]) {
+        let f = stream::pane_frame(stream, bytes).unwrap();
+        let w = self.host.session.as_mut().unwrap().encrypt(&f).unwrap();
+        self.input(Input::Binary {
+            link: self.link,
+            bytes: ToDevice::Live(w).encode(),
+        });
     }
 
     /// The host answers on the live session.
@@ -491,8 +514,11 @@ impl World {
         assert!(self.m.live(), "live again");
     }
 
+    /// A described new session: the one op that may wait for the host.
     fn ask(&mut self, page_id: u64, text: &str) {
-        self.page_says(json!({"id": page_id, "op": "overlord.ask", "args": {"text": text}}));
+        self.page_says(
+            json!({"id": page_id, "op": "overlord.new_session", "args": {"description": text}}),
+        );
     }
 }
 
@@ -775,7 +801,7 @@ fn mailbox_one_at_a_time() {
     let mut w = offline_with_mailbox();
     w.ask(1, "one");
     w.ask(2, "two");
-    w.page_says(json!({"id": 3, "op": "overlord.new_session", "args": {"text": "three"}}));
+    w.ask(3, "three");
     assert_eq!(w.host.mb_got.len(), 1, "the next waits for queued");
     w.relay_says(FromRelay::Queued {
         seq: 1,
@@ -833,7 +859,7 @@ fn refused_full_resent_first() {
     });
     // Then the newer one.
     assert_eq!(w.mb_raw.len(), 4);
-    assert_eq!(w.host.mb_got.last().unwrap()["args"]["text"], "two");
+    assert_eq!(w.host.mb_got.last().unwrap()["args"]["description"], "two");
 }
 
 #[test]
@@ -1174,7 +1200,7 @@ fn garbage_binary_closes_and_unknown_text_is_skipped() {
 }
 
 #[test]
-fn only_asks_and_new_sessions_wait() {
+fn only_a_new_session_waits() {
     let mut w = World::paired();
     w.foreground();
     w.page_says(json!({"id": 1, "op": "session.rename", "args": {}}));
@@ -1184,10 +1210,22 @@ fn only_asks_and_new_sessions_wait() {
     w.link_up(HostState::Offline);
     w.page_says(json!({"id": 3, "op": "session.rename", "args": {}}));
     assert_eq!(w.reply(3).unwrap()["error"]["code"], "host_offline");
-    w.ask(4, "waits");
-    w.page_says(json!({"id": 5, "op": "overlord.new_session", "args": {"text": "too"}}));
-    assert!(w.reply(4).is_none() && w.reply(5).is_none());
-    assert_eq!(w.saved().outbox.len(), 2);
+    // An ask no longer waits: it left the remote API.
+    w.page_says(json!({"id": 4, "op": "overlord.ask", "args": {"text": "x"}}));
+    assert_eq!(w.reply(4).unwrap()["error"]["code"], "host_offline");
+    w.ask(5, "waits");
+    assert!(w.reply(5).is_none());
+    let saved = w.saved();
+    assert_eq!(saved.outbox.len(), 1);
+    assert_eq!(saved.outbox.entries[0].op, "overlord.new_session");
+    // The list shows its description.
+    let ob = w.page_events("outbox").pop().unwrap();
+    assert_eq!(ob["items"][0]["text"], "waits");
+    // It travels by mailbox.
+    let mut w = offline_with_mailbox();
+    w.ask(1, "by mailbox");
+    assert_eq!(w.host.mb_got.len(), 1);
+    assert_eq!(w.host.mb_got[0]["op"], "overlord.new_session");
 }
 
 #[test]
@@ -1299,7 +1337,10 @@ fn a_crash_between_any_two_steps_neither_repeats_nor_loses() {
         let mut w = offline_with_mailbox();
         w.m.handle(
             w.now,
-            Input::Page(json!({"id": 1, "op": "overlord.ask", "args": {"text": "x"}}).to_string()),
+            Input::Page(
+                json!({"id": 1, "op": "overlord.new_session", "args": {"description": "x"}})
+                    .to_string(),
+            ),
         );
         let mut n = 0;
         while w.m.poll().is_some() {
@@ -1313,7 +1354,10 @@ fn a_crash_between_any_two_steps_neither_repeats_nor_loses() {
         let before = w.host.mb_got.len();
         w.m.handle(
             w.now,
-            Input::Page(json!({"id": 1, "op": "overlord.ask", "args": {"text": "x"}}).to_string()),
+            Input::Page(
+                json!({"id": 1, "op": "overlord.new_session", "args": {"description": "x"}})
+                    .to_string(),
+            ),
         );
         let mut taken = Vec::new();
         while let Some(a) = w.m.poll() {
@@ -1336,7 +1380,7 @@ fn a_crash_between_any_two_steps_neither_repeats_nor_loses() {
             .iter()
             .skip(before)
             .chain(live.iter())
-            .filter(|v| v["op"] == "overlord.ask")
+            .filter(|v| v["op"] == "overlord.new_session")
             .collect();
         let ids: std::collections::BTreeSet<String> = asked
             .iter()
@@ -1641,7 +1685,7 @@ fn the_page_reloading_gets_everything_again() {
 #[test]
 fn an_api_level_out_of_range_stops() {
     let mut w = World::paired();
-    w.host.api = Some(2);
+    w.host.api = Some(3);
     w.foreground();
     w.link_up(HostState::Online);
     assert_eq!(w.last_conn(), "update_app");
@@ -1650,12 +1694,34 @@ fn an_api_level_out_of_range_stops() {
     w.foreground();
     w.link_up(HostState::Online);
     assert_eq!(w.last_conn(), "update_host");
-    // Missing: taken as level 1 (a host from before `api`).
+    // Missing: taken as level 1 (a host from before `api`): too old.
     let mut w = World::paired();
     w.host.api = None;
     w.foreground();
     w.link_up(HostState::Online);
-    assert_eq!(w.last_conn(), "live");
+    assert_eq!(w.last_conn(), "update_host");
+}
+
+#[test]
+fn api_1_host_says_update_host() {
+    let mut w = World::paired();
+    w.host.api = Some(1);
+    w.foreground();
+    w.link_up(HostState::Online);
+    assert!(!w.m.live());
+    assert_eq!(w.last_conn(), "update_host");
+    let c = w.page_events("conn").pop().unwrap();
+    assert!(c["detail"].as_str().unwrap().contains("API 1"), "{c}");
+    // Stopped: no redial until the user comes back.
+    let dials = w.dials.len();
+    w.advance(60_000);
+    assert_eq!(w.dials.len(), dials);
+    // Back in the foreground (the host may be updated): one fresh try.
+    w.host.api = Some(2);
+    w.input(Input::Lifecycle { foreground: false });
+    w.foreground();
+    w.link_up(HostState::Online);
+    assert!(w.m.live());
 }
 
 #[test]
@@ -1899,4 +1965,360 @@ fn ui_commands_reach_the_page_and_its_reports_are_lookups() {
     let mut w = World::live();
     w.page_says(json!({"id": 3, "op": "page.pending", "args": {}}));
     assert_eq!(w.saved().outbox.len(), 1);
+}
+
+// ---- panes ----
+
+fn std_b64(b: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+impl World {
+    /// The page opens a pane on `stream` and the host says yes; the
+    /// page's reply.
+    fn open_pane(&mut self, page_id: u64, stream: u8) -> Value {
+        self.page_says(json!({"id": page_id, "op": "pane.open",
+            "args": {"stream": stream, "target": "overlord", "cols": 54, "rows": 20}}));
+        let rid = self.requests().last().unwrap()["id"].clone();
+        self.host_says(
+            json!({"id": rid, "ok": {"stream": stream, "id": "s1", "name": "n",
+            "overlord": true, "input": true, "control": true, "cols": 54, "rows": 20,
+            "window": {"cols": 54, "rows": 20}}}),
+        );
+        self.reply(page_id).unwrap()
+    }
+
+    fn pane_events(&self, kind: &str) -> Vec<Value> {
+        self.page
+            .iter()
+            .filter(|v| v["event"] == "pane" && v["type"] == kind)
+            .cloned()
+            .collect()
+    }
+
+    /// Events the device sent the host about panes.
+    fn host_pane_events(&self) -> Vec<Value> {
+        self.host
+            .got
+            .iter()
+            .filter(|v| v["event"] == "pane")
+            .cloned()
+            .collect()
+    }
+}
+
+#[test]
+fn the_hello_carries_panes_and_input() {
+    let mut w = World::paired();
+    w.host.hello_extra =
+        json!({"panes": {"max": 2, "window": 65536, "frames": 48}, "input": false});
+    w.foreground();
+    w.link_up(HostState::Online);
+    let hello = w.page_events("hello").pop().unwrap();
+    assert_eq!(hello["api"], 2);
+    assert_eq!(
+        hello["panes"],
+        json!({"max": 2, "window": 65536, "frames": 48})
+    );
+    assert_eq!(hello["input"], false);
+    // A reloaded page gets the same.
+    w.page.clear();
+    w.page_says(json!({"app": "ready"}));
+    assert_eq!(w.page_events("hello")[0]["input"], false);
+}
+
+#[test]
+fn pane_frames_go_to_the_page() {
+    let mut w = World::live();
+    let r = w.open_pane(1, 1);
+    assert_eq!(r["ok"]["stream"], 1, "{r}");
+    // One page message per host frame, base64 with padding.
+    w.host_pane(1, b"hello");
+    w.host_pane(1, b"\x1b[2J");
+    let data = w.pane_events("data");
+    assert_eq!(data.len(), 2);
+    assert_eq!(
+        data[0],
+        json!({"event": "pane", "stream": 1, "type": "data", "b": "aGVsbG8="})
+    );
+    assert_eq!(data[1]["b"], std_b64(b"\x1b[2J"));
+    // A frame for a stream that isn't open is discarded, never an error.
+    w.host_pane(2, b"stray");
+    assert_eq!(w.pane_events("data").len(), 2);
+    assert!(w.m.live());
+    // A refused open opens nothing.
+    w.page_says(json!({"id": 2, "op": "pane.open",
+        "args": {"stream": 3, "target": "x", "cols": 54, "rows": 20}}));
+    let rid = w.requests().last().unwrap()["id"].clone();
+    w.host_says(json!({"id": rid, "error": {"code": "not_running", "message": "no"}}));
+    assert_eq!(w.reply(2).unwrap()["error"]["code"], "not_running");
+    w.host_pane(3, b"x");
+    assert_eq!(w.pane_events("data").len(), 2);
+    // The host's `closed` passes to the page; the stream's frames stop.
+    w.host_says(
+        json!({"event": "pane", "stream": 1, "type": "closed", "reason": "ended",
+        "message": "the session stopped"}),
+    );
+    let c = w.pane_events("closed");
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0]["reason"], "ended");
+    w.host_pane(1, b"late");
+    assert_eq!(w.pane_events("data").len(), 2);
+    // The session ends: `closed` (`link`) for every stream still open,
+    // only those.
+    w.open_pane(4, 5);
+    w.open_pane(5, 6);
+    w.page.clear();
+    w.closed(1006);
+    let mut c: Vec<u64> = w
+        .pane_events("closed")
+        .iter()
+        .inspect(|v| assert_eq!(v["reason"], "link"))
+        .map(|v| v["stream"].as_u64().unwrap())
+        .collect();
+    c.sort();
+    assert_eq!(c, [5, 6]);
+    // The next session starts with none: the page opens them anew.
+    let d = w.m.dial_at.unwrap() - w.now.mono;
+    w.advance(d);
+    w.link_up(HostState::Online);
+    w.page.clear();
+    w.host_pane(5, b"old");
+    assert!(w.pane_events("data").is_empty());
+    assert!(w.m.live());
+}
+
+#[test]
+fn a_session_ending_any_way_closes_its_panes() {
+    // The host goes away (the relay says so).
+    let mut w = World::live();
+    w.open_pane(1, 1);
+    w.relay_says(FromRelay::Host {
+        state: HostState::Offline,
+    });
+    assert_eq!(w.pane_events("closed")[0]["reason"], "link");
+    // A frame that doesn't open (the session is poisoned).
+    let mut w = World::live();
+    w.open_pane(1, 2);
+    w.input(Input::Binary {
+        link: w.link,
+        bytes: ToDevice::Live(vec![0; 64]).encode(),
+    });
+    assert!(!w.m.live());
+    assert_eq!(w.pane_events("closed")[0]["stream"], 2);
+    // Going to the background.
+    let mut w = World::live();
+    w.open_pane(1, 3);
+    w.input(Input::Lifecycle { foreground: false });
+    assert_eq!(w.pane_events("closed")[0]["stream"], 3);
+}
+
+#[test]
+fn page_input_becomes_stream_frames() {
+    let mut w = World::live();
+    w.open_pane(1, 1);
+    w.page_says(json!({"pane": "input", "stream": 1, "b": std_b64(b"y\r")}));
+    assert_eq!(w.host.pane_got, [(1, b"y\r".to_vec())]);
+    // Resize, ack and close are events on the control stream, not ops.
+    w.page_says(json!({"pane": "resize", "stream": 1, "cols": 80, "rows": 24}));
+    w.page_says(json!({"pane": "ack", "stream": 1, "bytes": 16384, "frames": 3}));
+    let ev = w.host_pane_events();
+    assert_eq!(
+        ev,
+        [
+            json!({"event": "pane", "stream": 1, "type": "resize", "cols": 80, "rows": 24}),
+            json!({"event": "pane", "stream": 1, "type": "ack", "bytes": 16384, "frames": 3}),
+        ]
+    );
+    assert!(ev
+        .iter()
+        .all(|e| e.get("op").is_none() && e.get("id").is_none()));
+    // Input for a stream that isn't open, or that isn't base64, goes
+    // nowhere.
+    w.page_says(json!({"pane": "input", "stream": 2, "b": std_b64(b"x")}));
+    w.page_says(json!({"pane": "input", "stream": 1, "b": "not base64!"}));
+    w.page_says(json!({"pane": "input", "stream": 0, "b": std_b64(b"x")}));
+    assert_eq!(w.host.pane_got.len(), 1);
+    // The page closes it: the event, then the host's `closed` to the page;
+    // the stream's frames are discarded meanwhile and its input dropped.
+    w.page_says(json!({"pane": "close", "stream": 1}));
+    assert_eq!(
+        w.host_pane_events().last().unwrap(),
+        &json!({"event": "pane", "stream": 1, "type": "close"})
+    );
+    w.host_pane(1, b"after close");
+    w.page_says(json!({"pane": "input", "stream": 1, "b": std_b64(b"x")}));
+    assert!(w.pane_events("data").is_empty());
+    assert_eq!(w.host.pane_got.len(), 1);
+    w.host_says(
+        json!({"event": "pane", "stream": 1, "type": "closed", "reason": "closed",
+        "message": ""}),
+    );
+    assert_eq!(w.pane_events("closed")[0]["reason"], "closed");
+    // No live session: input is dropped (the page heard `closed`).
+    w.open_pane(2, 1);
+    w.relay_says(FromRelay::Host {
+        state: HostState::Offline,
+    });
+    w.page_says(json!({"pane": "input", "stream": 1, "b": std_b64(b"x")}));
+    assert_eq!(w.host.pane_got.len(), 1);
+}
+
+#[test]
+fn long_input_is_split() {
+    let mut w = World::live();
+    w.open_pane(1, 7);
+    let big: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    w.page_says(json!({"pane": "input", "stream": 7, "b": std_b64(&big)}));
+    let sizes: Vec<usize> = w.host.pane_got.iter().map(|(_, b)| b.len()).collect();
+    assert_eq!(sizes, [16_382, 16_382, 40_000 - 2 * 16_382]);
+    assert!(w.host.pane_got.iter().all(|(s, _)| *s == 7));
+    let joined: Vec<u8> = w
+        .host
+        .pane_got
+        .iter()
+        .flat_map(|(_, b)| b.clone())
+        .collect();
+    assert_eq!(joined, big);
+}
+
+#[test]
+fn pane_open_is_never_kept() {
+    let open = |id: u64| {
+        json!({"id": id, "op": "pane.open",
+            "args": {"stream": 1, "target": "overlord", "cols": 54, "rows": 20}})
+    };
+    let take = |id: u64| json!({"id": id, "op": "pane.take", "args": {"target": "overlord", "cols": 54, "rows": 20}});
+    let mut w = World::paired();
+    w.foreground();
+    w.page_says(open(1));
+    w.page_says(take(2));
+    assert_eq!(w.reply(1).unwrap()["error"]["code"], "disconnected");
+    assert_eq!(w.reply(2).unwrap()["error"]["code"], "disconnected");
+    w.link_up(HostState::Offline);
+    w.page_says(open(3));
+    w.page_says(take(4));
+    assert_eq!(w.reply(3).unwrap()["error"]["code"], "host_offline");
+    assert_eq!(w.reply(4).unwrap()["error"]["code"], "host_offline");
+    assert!(w.saved().outbox.is_empty());
+    assert!(w.host.mb_got.is_empty());
+    // In flight when the link dies: `disconnected`, never sent again.
+    let mut w = World::live();
+    w.page_says(open(5));
+    w.page_says(take(6));
+    assert!(w.saved().outbox.is_empty());
+    assert_eq!(w.requests().len(), 2);
+    w.reconnect();
+    assert_eq!(w.reply(5).unwrap()["error"]["code"], "disconnected");
+    assert_eq!(w.reply(6).unwrap()["error"]["code"], "disconnected");
+    assert_eq!(w.requests().len(), 2, "not resent");
+    // An answer to the old open (none can come) opens nothing.
+    w.host_pane(1, b"x");
+    assert!(w.pane_events("data").is_empty());
+}
+
+#[test]
+fn a_reloaded_page_closes_the_old_panes() {
+    let mut w = World::live();
+    w.open_pane(1, 1);
+    w.open_pane(2, 2);
+    w.open_pane(4, 4);
+    // One the page closed already isn't closed twice.
+    w.page_says(json!({"pane": "close", "stream": 4}));
+    // An open in flight when the page goes: its answer closes it too.
+    w.page_says(json!({"id": 3, "op": "pane.open",
+        "args": {"stream": 3, "target": "overlord", "cols": 54, "rows": 20}}));
+    let rid3 = w.requests().last().unwrap()["id"].clone();
+    w.page.clear();
+    w.page_says(json!({"app": "ready"}));
+    let closes: Vec<Value> = w
+        .host_pane_events()
+        .into_iter()
+        .filter(|e| e["type"] == "close")
+        .collect();
+    assert_eq!(closes.len(), 3);
+    w.host_says(json!({"id": rid3, "ok": {"stream": 3}}));
+    assert_eq!(w.host_pane_events().last().unwrap()["stream"], 3);
+    assert!(w.reply(3).is_none(), "the old page's id means nothing now");
+    // The old streams' frames go nowhere.
+    w.host_pane(1, b"old");
+    assert!(w.pane_events("data").is_empty());
+    // The new page opens stream 1 again: held until the host's `closed`.
+    let before = w.requests().len();
+    w.page_says(json!({"id": 1, "op": "pane.open",
+        "args": {"stream": 1, "target": "overlord", "cols": 54, "rows": 20}}));
+    assert_eq!(w.requests().len(), before, "held");
+    w.host_says(
+        json!({"event": "pane", "stream": 1, "type": "closed", "reason": "closed",
+        "message": ""}),
+    );
+    // The new page never knew the old stream: no `closed` for it.
+    assert!(w.pane_events("closed").is_empty());
+    assert_eq!(w.requests().len(), before + 1);
+    let rid = w.requests().last().unwrap()["id"].clone();
+    w.host_says(json!({"id": rid, "ok": {"stream": 1}}));
+    assert_eq!(w.reply(1).unwrap()["ok"]["stream"], 1);
+    w.host_pane(1, b"new");
+    assert_eq!(w.pane_events("data")[0]["b"], std_b64(b"new"));
+    // The session ends: `closed` only for what this page knows.
+    w.closed(1006);
+    let c: Vec<u64> = w
+        .pane_events("closed")
+        .iter()
+        .map(|v| v["stream"].as_u64().unwrap())
+        .collect();
+    assert_eq!(c, [1]);
+}
+
+#[test]
+fn a_stalled_link_under_input_redials() {
+    let mut w = World::live();
+    w.open_pane(1, 1);
+    let (pings, dials) = (w.pings, w.dials.len());
+    w.page_says(json!({"pane": "input", "stream": 1, "b": std_b64(b"x")}));
+    // Nothing heard for 5 s: a ping at once (not at the 15 s interval).
+    w.advance(STALL_MS - 1_000);
+    assert_eq!(w.pings, pings);
+    w.advance(1_000);
+    assert_eq!(w.pings, pings + 1);
+    // Nothing for 5 s more: the link is given up and dialled again.
+    w.advance(STALL_MS - 1_000);
+    assert_eq!(w.dials.len(), dials);
+    w.advance(1_000);
+    assert_eq!(w.dials.len(), dials + 1, "redialled at once");
+    assert_eq!(w.pane_events("closed")[0]["reason"], "link");
+    // An answer to the ping (or anything) clears it.
+    let mut w = World::live();
+    w.open_pane(1, 1);
+    let dials = w.dials.len();
+    w.page_says(json!({"pane": "input", "stream": 1, "b": std_b64(b"x")}));
+    w.advance(STALL_MS);
+    w.input(Input::Heard { link: w.link });
+    w.advance(2 * STALL_MS);
+    assert_eq!(w.dials.len(), dials);
+    assert!(w.m.live());
+    // The echo is what usually clears it.
+    w.page_says(json!({"pane": "input", "stream": 1, "b": std_b64(b"y")}));
+    w.advance(1_000);
+    w.host_pane(1, b"y");
+    w.advance(3 * STALL_MS);
+    assert_eq!(w.dials.len(), dials);
+    // A quiet link with no input is left to the ordinary pings.
+    let mut w = World::live();
+    w.open_pane(1, 1);
+    let pings = w.pings;
+    w.advance(STALL_MS * 2);
+    assert_eq!(w.pings, pings);
+    // Tuning-able.
+    let mut w = World::live();
+    w.m.set_tuning(Tuning {
+        stall_ms: 1_000,
+        ..Tuning::default()
+    });
+    w.open_pane(1, 1);
+    let dials = w.dials.len();
+    w.page_says(json!({"pane": "input", "stream": 1, "b": std_b64(b"x")}));
+    assert_eq!(w.m.deadline(), Some(w.now.mono + 1_000));
+    w.advance(2_000);
+    assert_eq!(w.dials.len(), dials + 1);
 }

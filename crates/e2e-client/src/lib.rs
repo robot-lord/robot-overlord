@@ -14,7 +14,8 @@
 //!   engine owns its own runtime). `crates/e2e-ffi` wraps it with UniFFI.
 //!
 //! The bridge messages (page to engine and back) are fixed in the slice 4
-//! contract; `machine` documents each where it handles it.
+//! contract, and the pane messages in slice 5's; `machine` documents each
+//! where it handles it.
 
 pub mod driver;
 mod engine;
@@ -113,9 +114,11 @@ pub enum BackgroundOutcome {
     Failed { reason: String },
 }
 
-/// The remote API levels this engine speaks (`hello.api`).
-pub const API_MIN: u32 = 1;
-pub const API_MAX: u32 = 1;
+/// The remote API levels this engine speaks (`hello.api`). Level 2 has
+/// panes and no `overlord.ask` or `overlord.messages`; the app and the
+/// host are the user's own two builds, so only the one level.
+pub const API_MIN: u32 = 2;
+pub const API_MAX: u32 = 2;
 
 /// This engine's version (the workspace's).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
