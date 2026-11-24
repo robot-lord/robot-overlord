@@ -147,9 +147,14 @@ async fn pair_confirm_then_use_it() {
     // A device's snapshot has no relay section (the page's has).
     assert!(snap["ok"].get("relay").is_none());
 
-    // overlord.ask reaches the daemon (no overlord here: its own error).
+    // A described new session reaches the daemon (no overlord here: its
+    // own error).
     let ask = live
-        .request(&mut c, "overlord.ask", json!({"text": "hello"}))
+        .request(
+            &mut c,
+            "overlord.new_session",
+            json!({"description": "hello"}),
+        )
         .await
         .unwrap();
     assert!(
@@ -158,8 +163,10 @@ async fn pair_confirm_then_use_it() {
     );
     assert_ne!(ask["error"]["code"], "not_allowed", "{ask}");
 
-    // What a device may not do.
+    // What a device may not do (overlord.ask is the local page's only:
+    // the phone types into the overlord's pane).
     for op in [
+        "overlord.ask",
         "form.setup_save",
         "keys.list",
         "device.list",
@@ -278,7 +285,11 @@ async fn a_mailbox_request_waits_for_the_host() {
         }
     };
     let req = dev
-        .mailbox_request("m1", "overlord.ask", json!({"text": "while you were away"}))
+        .mailbox_request(
+            "m1",
+            "overlord.new_session",
+            json!({"description": "while you were away"}),
+        )
         .unwrap();
     // The relay says it is queued.
     assert_eq!(c.queue_mailbox(req).await.unwrap(), 1);
@@ -301,12 +312,16 @@ async fn a_mailbox_request_waits_for_the_host() {
     // The same request again is not acted on twice: it gets the stored
     // answer.
     let again = dev
-        .mailbox_request("m1", "overlord.ask", json!({"text": "while you were away"}))
+        .mailbox_request(
+            "m1",
+            "overlord.new_session",
+            json!({"description": "while you were away"}),
+        )
         .unwrap();
     c.send_mailbox(again).await.unwrap();
     let (_, payload) = c.recv_mailbox(WAIT).await.unwrap();
     assert_eq!(dev.mailbox_open(&payload).unwrap(), answer);
-    let marker = format!("{} mailbox op overlord.ask", dev.id());
+    let marker = format!("{} mailbox op overlord.new_session", dev.id());
     assert_eq!(audit().matches(&marker).count(), 1);
     // Only the two ops travel by mailbox.
     let snap = dev.mailbox_request("m2", "snapshot", json!({})).unwrap();
@@ -556,7 +571,7 @@ async fn a_crash_in_the_mailbox_never_repeats_an_op() {
     w.rig.daemon.web().stop();
     let mut c = dev.connect().await.unwrap();
     let req = dev
-        .mailbox_request("c1", "overlord.ask", json!({"text": "one"}))
+        .mailbox_request("c1", "overlord.new_session", json!({"description": "one"}))
         .unwrap();
     c.send_mailbox(req).await.unwrap();
     let pid = start_plugin(&w.rig, Some("mailbox_decrypted"));
@@ -579,14 +594,14 @@ async fn a_crash_in_the_mailbox_never_repeats_an_op() {
     // interrupted (the host can't know whether it happened).
     w.rig.daemon.web().stop();
     let req = dev
-        .mailbox_request("c2", "overlord.ask", json!({"text": "two"}))
+        .mailbox_request("c2", "overlord.new_session", json!({"description": "two"}))
         .unwrap();
     c.send_mailbox(req).await.unwrap();
     let pid = start_plugin(&w.rig, Some("mailbox_saved"));
     gone(pid).await;
     start_plugin(&w.rig, None);
     let again = dev
-        .mailbox_request("c2", "overlord.ask", json!({"text": "two"}))
+        .mailbox_request("c2", "overlord.new_session", json!({"description": "two"}))
         .unwrap();
     c.send_mailbox(again).await.unwrap();
     let (_, payload) = c.recv_mailbox(Duration::from_secs(20)).await.unwrap();
@@ -613,7 +628,7 @@ async fn a_mailbox_frame_that_cant_be_saved_is_handled_when_it_comes_again() {
     w.rig.daemon.web().stop();
     let mut c = dev.connect().await.unwrap();
     let req = dev
-        .mailbox_request("u1", "overlord.ask", json!({"text": "one"}))
+        .mailbox_request("u1", "overlord.new_session", json!({"description": "one"}))
         .unwrap();
     c.send_mailbox(req).await.unwrap();
     // Safety: under LOCK; the daemon passes its environment to the plugin.
@@ -685,14 +700,14 @@ async fn a_request_resent_by_mailbox_after_its_link_died_runs_once() {
     let mut live = dev.live(&mut c).await.unwrap();
     dev.key_mailbox(&mut c, &mut live).await.unwrap();
     keyed(&dev).await;
-    let live_ops = format!("{} op overlord.ask", dev.id());
-    let mailbox_ops = format!("{} mailbox op overlord.ask", dev.id());
+    let live_ops = format!("{} op overlord.new_session", dev.id());
+    let mailbox_ops = format!("{} mailbox op overlord.new_session", dev.id());
     let count = |m: &str| audit().matches(m).count();
 
     // Asked live, and the link dies before the answer is read.
     live.send_json(
         &mut c,
-        &json!({"id": "x1", "op": "overlord.ask", "args": {"text": "on the train"}}),
+        &json!({"id": "x1", "op": "overlord.new_session", "args": {"description": "on the train"}}),
     )
     .await
     .unwrap();
@@ -706,7 +721,11 @@ async fn a_request_resent_by_mailbox_after_its_link_died_runs_once() {
     // Resent by mailbox with the same id: the host's store answers it.
     let mut c = dev.connect().await.unwrap();
     let req = dev
-        .mailbox_request("x1", "overlord.ask", json!({"text": "on the train"}))
+        .mailbox_request(
+            "x1",
+            "overlord.new_session",
+            json!({"description": "on the train"}),
+        )
         .unwrap();
     c.queue_mailbox(req).await.unwrap();
     let a = mailbox_answer(&mut dev, &mut c).await;
@@ -720,7 +739,7 @@ async fn a_request_resent_by_mailbox_after_its_link_died_runs_once() {
     let mut live = dev.live(&mut c).await.unwrap();
     live.send_json(
         &mut c,
-        &json!({"id": "x1", "op": "overlord.ask", "args": {"text": "on the train"}}),
+        &json!({"id": "x1", "op": "overlord.new_session", "args": {"description": "on the train"}}),
     )
     .await
     .unwrap();
@@ -729,7 +748,7 @@ async fn a_request_resent_by_mailbox_after_its_link_died_runs_once() {
     // Without an id, an op that changes something is refused, not run.
     live.send_json(
         &mut c,
-        &json!({"op": "overlord.ask", "args": {"text": "no id"}}),
+        &json!({"op": "overlord.new_session", "args": {"description": "no id"}}),
     )
     .await
     .unwrap();
@@ -742,7 +761,7 @@ async fn a_request_resent_by_mailbox_after_its_link_died_runs_once() {
     assert_eq!(v["error"]["code"], "bad_request", "{v}");
     assert_eq!(count(&live_ops), 1, "ran once");
     assert_eq!(count(&mailbox_ops), 0, "never by mailbox");
-    assert!(audit().contains(&format!("{} repeat overlord.ask", dev.id())));
+    assert!(audit().contains(&format!("{} repeat overlord.new_session", dev.id())));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -764,7 +783,7 @@ async fn a_relay_restart_loses_the_queue_and_a_resend_still_works() {
     rig.daemon.web().stop();
     let mut c = dev.connect().await.unwrap();
     let req = dev
-        .mailbox_request("r1", "overlord.ask", json!({"text": "lost"}))
+        .mailbox_request("r1", "overlord.new_session", json!({"description": "lost"}))
         .unwrap();
     c.queue_mailbox(req).await.unwrap();
     let boot = c.ready.boot.clone();
@@ -780,7 +799,7 @@ async fn a_relay_restart_loses_the_queue_and_a_resend_still_works() {
     // The device sees the new boot with r1 unanswered: it resends r1 (a
     // newer counter; the host skips the lost one).
     let req = dev
-        .mailbox_request("r1", "overlord.ask", json!({"text": "lost"}))
+        .mailbox_request("r1", "overlord.new_session", json!({"description": "lost"}))
         .unwrap();
     c.queue_mailbox(req).await.unwrap();
     rig.daemon.web().start(false).unwrap();
@@ -788,7 +807,7 @@ async fn a_relay_restart_loses_the_queue_and_a_resend_still_works() {
     assert_eq!(a["id"], "r1", "{a}");
     assert_eq!(
         audit()
-            .matches(&format!("{} mailbox op overlord.ask", dev.id()))
+            .matches(&format!("{} mailbox op overlord.new_session", dev.id()))
             .count(),
         1
     );
@@ -863,7 +882,7 @@ async fn an_answer_refused_by_a_full_queue_is_sent_again() {
     let mut c = dev.connect().await.unwrap();
     let boot = c.ready.boot.clone();
     let req = dev
-        .mailbox_request("f1", "overlord.ask", json!({"text": "one"}))
+        .mailbox_request("f1", "overlord.new_session", json!({"description": "one"}))
         .unwrap();
     c.queue_mailbox(req).await.unwrap();
     // f1's answer arrives; the device doesn't acknowledge it yet, so it
@@ -874,14 +893,14 @@ async fn an_answer_refused_by_a_full_queue_is_sent_again() {
         "f1"
     );
     let req = dev
-        .mailbox_request("f2", "overlord.ask", json!({"text": "two"}))
+        .mailbox_request("f2", "overlord.new_session", json!({"description": "two"}))
         .unwrap();
     c.queue_mailbox(req).await.unwrap();
     // f2 ran; its answer was refused (`full`) and is kept.
     let t = Instant::now();
     let ran = || {
         audit()
-            .matches(&format!("{} mailbox op overlord.ask", dev.id()))
+            .matches(&format!("{} mailbox op overlord.new_session", dev.id()))
             .count()
     };
     while ran() < 2 {

@@ -23,7 +23,8 @@ const LONG: Duration = Duration::from_secs(30);
 /// A request that changes something reached the daemon this many times
 /// (live or by mailbox).
 fn asks(id: &str) -> usize {
-    count(&format!("{id} op overlord.ask")) + count(&format!("{id} mailbox op overlord.ask"))
+    count(&format!("{id} op overlord.new_session"))
+        + count(&format!("{id} mailbox op overlord.new_session"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -50,7 +51,11 @@ async fn pairs_and_talks_through_the_engine() {
         "{snap}"
     );
     let ask = phone
-        .request("overlord.ask", json!({"text": "hello"}), WAIT)
+        .request(
+            "overlord.new_session",
+            json!({"description": "hello"}),
+            WAIT,
+        )
         .await
         .unwrap();
     assert!(
@@ -99,7 +104,10 @@ async fn the_relay_restarted_queued_requests_are_resent_and_run_once() {
     let id = device_id(&mut phone).await;
     keyed(&id, 1).await;
     host_away(&w, &mut phone).await;
-    let ask = phone.send("overlord.ask", json!({"text": "while you were away"}));
+    let ask = phone.send(
+        "overlord.new_session",
+        json!({"description": "while you were away"}),
+    );
     // Queued at the relay (by mailbox).
     let t = Instant::now();
     while phone.outbox().first().map(|i| i["state"].clone()) != Some(json!("sent")) {
@@ -150,7 +158,10 @@ async fn a_mailbox_the_host_discarded_is_keyed_again() {
     // Away again: the ask goes by the new mailbox, is taken from the relay
     // when the host is back, and is answered once.
     host_away(&w, &mut phone).await;
-    let ask = phone.send("overlord.ask", json!({"text": "after the rekey"}));
+    let ask = phone.send(
+        "overlord.new_session",
+        json!({"description": "after the rekey"}),
+    );
     let t = Instant::now();
     while phone.outbox().first().map(|i| i["state"].clone()) != Some(json!("sent")) {
         assert!(t.elapsed() < WAIT, "{:?}", phone.outbox());
@@ -161,7 +172,7 @@ async fn a_mailbox_the_host_discarded_is_keyed_again() {
     let a = phone.reply(ask, LONG).await.unwrap();
     assert_eq!(a["id"], ask);
     assert_ne!(a["error"]["code"], "interrupted", "{a}");
-    audit_until(&format!("{id} mailbox op overlord.ask"), 1).await;
+    audit_until(&format!("{id} mailbox op overlord.new_session"), 1).await;
     assert_eq!(asks(&id), 1, "ran once");
     phone.conn("live", LONG).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -172,17 +183,17 @@ async fn a_mailbox_the_host_discarded_is_keyed_again() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_plugin_restarted_mid_request() {
     let _g = LOCK.lock().await;
-    // A slow overlord.ask (the plugin inherits the environment).
+    // A slow overlord.new_session (the plugin inherits the environment).
     // Safety: under LOCK.
-    std::env::set_var("RLORD_WEB_TEST_SLOW", "overlord.ask:3000");
+    std::env::set_var("RLORD_WEB_TEST_SLOW", "overlord.new_session:3000");
     let w = world(1).await;
     std::env::remove_var("RLORD_WEB_TEST_SLOW");
     let (mut phone, _dir) = pair("slow").await;
     let id = device_id(&mut phone).await;
     // In progress: the link is cut while it runs, the resend by id is
     // told `in_progress`, and the answer follows on the new session.
-    let ask = phone.send("overlord.ask", json!({"text": "one"}));
-    audit_until(&format!("{id} op overlord.ask"), 1).await;
+    let ask = phone.send("overlord.new_session", json!({"description": "one"}));
+    audit_until(&format!("{id} op overlord.new_session"), 1).await;
     w.tamper.cut(Role::Device);
     let a = phone.reply(ask, LONG).await.unwrap();
     assert_ne!(a["error"]["code"], "in_progress", "{a}");
@@ -190,8 +201,8 @@ async fn the_plugin_restarted_mid_request() {
     assert_eq!(asks(&id), 1);
     // Interrupted: the plugin stops while it runs. Its resend is told it
     // was interrupted (the host can't know whether it happened).
-    let ask = phone.send("overlord.ask", json!({"text": "two"}));
-    audit_until(&format!("{id} op overlord.ask"), 2).await;
+    let ask = phone.send("overlord.new_session", json!({"description": "two"}));
+    audit_until(&format!("{id} op overlord.new_session"), 2).await;
     w.rig.daemon.web().stop();
     start_plugin(&w, &[]);
     let a = phone.reply(ask, LONG).await.unwrap();
@@ -309,8 +320,8 @@ async fn a_full_queue_refuses_a_frame_then_takes_it() {
             _ => vec![m],
         }
     }));
-    let a1 = phone.send("overlord.ask", json!({"text": "one"}));
-    let a2 = phone.send("overlord.ask", json!({"text": "two"}));
+    let a1 = phone.send("overlord.new_session", json!({"description": "one"}));
+    let a2 = phone.send("overlord.new_session", json!({"description": "two"}));
     let t = Instant::now();
     while seen.lock().unwrap().len() < 2 {
         assert!(t.elapsed() < WAIT, "{:?}", seen.lock().unwrap());
@@ -352,7 +363,10 @@ async fn a_cut_at_each_step_still_answers_once() {
         // (A path change: the engine dials at once rather than after the
         // backoff these short-lived links have built up.)
         phone.engine.network(true);
-        let ask = phone.send("overlord.ask", json!({"text": format!("step {step}")}));
+        let ask = phone.send(
+            "overlord.new_session",
+            json!({"description": format!("step {step}")}),
+        );
         let a = phone.reply(ask, LONG).await.unwrap();
         assert_eq!(a["id"], ask, "step {step}");
         assert_ne!(a["error"]["code"], "disconnected", "step {step}: {a}");
@@ -381,7 +395,10 @@ async fn the_network_away_then_back() {
         .await
         .unwrap();
     assert_eq!(r["error"]["code"], "disconnected");
-    let ask = phone.send("overlord.ask", json!({"text": "on the train"}));
+    let ask = phone.send(
+        "overlord.new_session",
+        json!({"description": "on the train"}),
+    );
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
         w.tamper.connections(Role::Device).len(),

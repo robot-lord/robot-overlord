@@ -23,8 +23,9 @@
 //!
 //! **A fake overlord.** When tmux is installed, the overlord is this same
 //! program in a pane of the scratch tmux server (`remote_stack
-//! fake-overlord`): `overlord.ask` types into it as into a real one, and it
-//! answers each line in a Claude Code transcript that `overlord.messages`
+//! fake-overlord`): a device's pane (and `overlord.new_session`) types into
+//! it as into a real one, and it answers each line in a Claude Code
+//! transcript that `session.messages`
 //! reads. Should rlord ever start an agent here (a restart), `claude`,
 //! `codex` and `opencode` on this stack's PATH are this program too, and
 //! the login shell is never asked: no real agent can run.
@@ -439,7 +440,7 @@ fn start_overlord(db: &Db, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A Claude Code transcript line (what `overlord.messages` reads).
+/// A Claude Code transcript line (what `session.messages` reads).
 fn transcript_line(kind: &str, text: &str) -> String {
     let content = if kind == "user" {
         json!(text)

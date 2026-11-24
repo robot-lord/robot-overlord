@@ -27,7 +27,8 @@ use world::*;
 const LONG: Duration = Duration::from_secs(30);
 
 fn asks(id: &str) -> usize {
-    count(&format!("{id} op overlord.ask")) + count(&format!("{id} mailbox op overlord.ask"))
+    count(&format!("{id} op overlord.new_session"))
+        + count(&format!("{id} mailbox op overlord.new_session"))
 }
 
 fn text(m: &FromRelay) -> Message {
@@ -200,8 +201,8 @@ async fn two_devices_frames_swapped() {
         // (Only these two: the links the phones come back on are not.)
         *swap.lock().unwrap() = Some((ids[k - 2], ids[k - 1]));
     }
-    let qa = a.send("overlord.ask", json!({"text": "from a"}));
-    let qb = b.send("overlord.ask", json!({"text": "from b"}));
+    let qa = a.send("overlord.new_session", json!({"description": "from a"}));
+    let qb = b.send("overlord.new_session", json!({"description": "from b"}));
     // Neither frame opens under the other's session: both links are
     // dropped, both phones come back on new links and resend.
     device_conns(&w, n + 2).await;
@@ -234,7 +235,7 @@ async fn a_mailbox_frame_replayed() {
         }
         vec![m]
     }));
-    let q = phone.send("overlord.ask", json!({"text": "twice?"}));
+    let q = phone.send("overlord.new_session", json!({"description": "twice?"}));
     let t = Instant::now();
     while !once.load(Ordering::SeqCst) {
         assert!(t.elapsed() < WAIT);
@@ -272,7 +273,7 @@ async fn a_mailbox_frame_skipped() {
         }
         vec![m]
     }));
-    let q1 = phone.send("overlord.ask", json!({"text": "lost"}));
+    let q1 = phone.send("overlord.new_session", json!({"description": "lost"}));
     let t = Instant::now();
     while !dropped.load(Ordering::SeqCst) {
         assert!(t.elapsed() < WAIT);
@@ -285,7 +286,10 @@ async fn a_mailbox_frame_skipped() {
             device: None,
         }),
     );
-    let q2 = phone.send("overlord.ask", json!({"text": "after the gap"}));
+    let q2 = phone.send(
+        "overlord.new_session",
+        json!({"description": "after the gap"}),
+    );
     tokio::time::sleep(Duration::from_millis(500)).await;
     w.tamper.clear_filter();
     start_plugin(&w, &[]);
@@ -519,7 +523,10 @@ async fn a_new_boot_every_connect_and_constant_signals_stay_within_bounds() {
             _ => vec![m],
         }
     }));
-    let q = phone.send("overlord.ask", json!({"text": "once per link"}));
+    let q = phone.send(
+        "overlord.new_session",
+        json!({"description": "once per link"}),
+    );
     let n = w.tamper.connections(Role::Device).len();
     for _ in 0..6 {
         for _ in 0..50 {
@@ -574,7 +581,7 @@ async fn a_relay_that_never_answers_queued_is_given_up() {
     }));
     let n = w.tamper.connections(Role::Device).len();
     let t = Instant::now();
-    phone.send("overlord.ask", json!({"text": "hello?"}));
+    phone.send("overlord.new_session", json!({"description": "hello?"}));
     device_conns(&w, n + 1).await;
     silent.store(false, Ordering::SeqCst);
     let waited = w.tamper.connections(Role::Device)[n] - t;
@@ -673,7 +680,10 @@ async fn old_mailbox_frames_replayed_to_the_device() {
         }
         vec![m]
     }));
-    let q = phone.send("overlord.ask", json!({"text": "answer by mailbox"}));
+    let q = phone.send(
+        "overlord.new_session",
+        json!({"description": "answer by mailbox"}),
+    );
     let t = Instant::now();
     while phone.outbox().first().map(|i| i["state"].clone()) != Some(json!("sent")) {
         assert!(t.elapsed() < WAIT, "{:?}", phone.outbox());
