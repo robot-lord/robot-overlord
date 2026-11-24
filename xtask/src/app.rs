@@ -317,7 +317,9 @@ fn xcodebuild(root: &Path, action: &[&str], destination: &str, signing: bool) ->
     c.arg(format!("MARKETING_VERSION={marketing}"));
     c.arg(format!("CURRENT_PROJECT_VERSION={build}"));
     if signing {
-        c.arg("-allowProvisioningUpdates");
+        // Lets Xcode create the team's development certificate and
+        // profile, and register a new phone (the first install).
+        c.args(["-allowProvisioningUpdates", "-allowProvisioningDeviceRegistration"]);
     } else {
         // The simulator needs no team's certificate.
         c.args(["CODE_SIGN_IDENTITY=-", "CODE_SIGNING_REQUIRED=NO"]);
