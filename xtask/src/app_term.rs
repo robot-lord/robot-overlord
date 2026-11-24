@@ -253,6 +253,12 @@ impl Drop for Demo {
             .arg("--stop")
             .arg(&self.dir)
             .status();
+        // (Claude Code's processes may write its home once more on the
+        // way out: remove again after a moment.)
+        for _ in 0..3 {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            std::thread::sleep(Duration::from_millis(500));
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
