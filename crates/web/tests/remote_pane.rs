@@ -272,8 +272,10 @@ async fn resize_reaches_the_agent_and_close_leaves_no_view() {
     l.pane_event(&mut c, 1, "resize", json!({"cols": 60, "rows": 30}))
         .await
         .unwrap();
-    see(&mut c, &mut l, 1, "size:30 60").await;
     wait_for("pinned again", || window_size("rp_alpha") == "60x30").await;
+    // The agent got SIGWINCH (bash runs the trap once its read returns).
+    l.pane_send(&mut c, 1, b"after the resize\r").await.unwrap();
+    see(&mut c, &mut l, 1, "size:30 60").await;
     l.pane_event(&mut c, 1, "close", json!({})).await.unwrap();
     let ev = l.event(&mut c, "pane", WAIT).await.unwrap();
     assert_eq!(ev["type"], "closed");
@@ -282,7 +284,7 @@ async fn resize_reaches_the_agent_and_close_leaves_no_view() {
     // Its id may be used again once closed.
     let a = open(&mut c, &mut l, 1, "alpha", 54, 20).await;
     assert_eq!(a["ok"]["stream"], 1, "{a}");
-    assert!(audit().contains(&format!("{} pane close alpha in=0 out=", dev.id())));
+    assert!(audit().contains(&format!("{} pane close alpha in=17 out=", dev.id())));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -322,6 +324,7 @@ async fn a_flood_never_drops_the_link_nor_delays_control() {
     open(&mut c, &mut l, 1, "alpha", 54, 20).await;
     see(&mut c, &mut l, 1, "agent-ready").await;
     // 50 MB through the pane, and the device stops acknowledging.
+    let base = l.panes.get(&1).map_or(0, |p| p.bytes);
     l.pane_send(&mut c, 1, b"flood 50000000\r").await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     // Control is answered promptly on the flooded link ...
@@ -335,7 +338,7 @@ async fn a_flood_never_drops_the_link_nor_delays_control() {
     assert!(s["ok"]["rows"].is_array(), "{s}");
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     // Unacknowledged, the host stopped at the window.
-    let got = l.panes.get(&1).map_or(0, |p| p.bytes);
+    let got = l.panes.get(&1).map_or(0, |p| p.bytes) - base;
     assert!(got <= 64 * 1024, "{got}");
     // The tmux server stays small while the device sleeps (gate 1a).
     let pid = tx(&["display-message", "-p", "#{pid}"]);
@@ -458,7 +461,13 @@ async fn a_view_only_device_cannot_type_or_take() {
         .await
         .ok();
     assert!(!text(&l_data(&l, 1)).contains("got:typed anyway"));
-    assert!(audit().contains(&format!("{} pane open alpha 54x20 ro", dev.id())));
+    // Attached at the window's size (it doesn't hold the pane), read-only.
+    let log = audit();
+    let line = log
+        .lines()
+        .find(|l| l.contains(&format!("{} pane open alpha ", dev.id())))
+        .unwrap_or_else(|| panic!("{log}"));
+    assert!(line.ends_with(" ro"), "{line}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
