@@ -50,8 +50,11 @@ enum Keys {
         return key
     }
 
-    /// The private key under `label`, if there is one.
-    static func find(_ label: String) -> SecKey? {
+    /// The private key under `label`; nil only when there is none. Any
+    /// other keychain failure throws (before the first unlock after a
+    /// reboot the key exists but can't be read: a caller that made a new
+    /// one would destroy the old).
+    static func find(_ label: String) throws -> SecKey? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: tag(label),
@@ -59,8 +62,10 @@ enum Keys {
             kSecReturnRef as String: true,
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let item else {
-            return nil
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let item else {
+            throw FfiError.Failed(message: "key \(label): keychain status \(status)")
         }
         return (item as! SecKey)
     }
@@ -95,7 +100,7 @@ final class EnclaveSigners: Signers, @unchecked Sendable {
     }
 
     func publicKey(label: String) throws -> Data {
-        guard let key = Keys.find("signer." + label) else {
+        guard let key = try Keys.find("signer." + label) else {
             throw FfiError.Failed(message: "no key \(label)")
         }
         return try Keys.publicKey(key)
@@ -103,7 +108,7 @@ final class EnclaveSigners: Signers, @unchecked Sendable {
 
     /// ECDSA P-256 with SHA-256, as ASN.1 DER: the engine converts it.
     func sign(label: String, msg: Data) throws -> Data {
-        guard let key = Keys.find("signer." + label) else {
+        guard let key = try Keys.find("signer." + label) else {
             throw FfiError.Failed(message: "no key \(label)")
         }
         var error: Unmanaged<CFError>?
@@ -130,7 +135,7 @@ final class EnclaveVault: Vault, @unchecked Sendable {
     private func key() throws -> SecKey {
         lock.lock()
         defer { lock.unlock() }
-        if let key = Keys.find(Self.label) { return key }
+        if let key = try Keys.find(Self.label) { return key }
         return try Keys.create(Self.label)
     }
 

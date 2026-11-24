@@ -80,6 +80,7 @@ final class Shell: ObservableObject {
     private let monitor = NWPathMonitor()
     private var lastPath: String?
     private var leftAt: Date?
+    private var launched = false
 
     init() {
         UserDefaults.standard.register(defaults: [Setting.appLock: true, Setting.notifications: false])
@@ -216,8 +217,13 @@ final class Shell: ObservableObject {
             {
                 locked = true
             }
+            // Prompt by itself only at launch and back from the background:
+            // a cancelled prompt's own sheet also ends in `.active`, and the
+            // Unlock button is there for another try.
+            let arriving = leftAt != nil || !launched
+            launched = true
             leftAt = nil
-            if locked { unlock() }
+            if locked && arriving { unlock() }
             engine?.lifecycle(foreground: true)
         case .inactive:
             // Covered in the app switcher too.
@@ -250,7 +256,12 @@ final class Shell: ObservableObject {
 
     // MARK: App lock
 
+    /// The unlock sheet itself makes the scene inactive and active again:
+    /// don't prompt a second time while one is up.
+    private var unlocking = false
+
     func unlock() {
+        guard !unlocking else { return }
         let context = LAContext()
         var error: NSError?
         guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
@@ -259,8 +270,12 @@ final class Shell: ObservableObject {
             return
         }
         needsPasscode = false
+        unlocking = true
         context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Unlock rlord") { ok, _ in
-            Task { @MainActor in if ok { self.locked = false } }
+            Task { @MainActor in
+                if ok { self.locked = false }
+                self.unlocking = false
+            }
         }
     }
 
