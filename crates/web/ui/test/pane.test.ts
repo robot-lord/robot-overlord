@@ -18,7 +18,7 @@ class FakeScreen implements Screen {
   }
 }
 
-function harness(target = "overlord") {
+function harness(target = "overlord", page: string | null = null) {
   const socks: FakeSock[] = [];
   const states: PaneState["kind"][] = [];
   const screen = new FakeScreen();
@@ -26,6 +26,7 @@ function harness(target = "overlord") {
     url: "ws://127.0.0.1:47811/pane",
     token: "t".repeat(64),
     target,
+    page: () => page,
     screen,
     onState: (s) => states.push(s.kind),
     open: (url) => {
@@ -39,9 +40,9 @@ function harness(target = "overlord") {
     if (!s) throw new Error("no socket");
     return s;
   };
-  const opened = (id = "o1") => {
+  const opened = (id = "o1", more: object = {}) => {
     last().accept();
-    last().push({ type: "opened", target, id, name: "overlord-1" });
+    last().push({ type: "opened", target, id, name: "overlord-1", ...more });
   };
   return { p, socks, states, screen, last, opened };
 }
@@ -56,13 +57,40 @@ afterEach(() => {
 });
 
 describe("pane socket", () => {
-  it("sends the token, then what to open at the screen's size", () => {
-    const h = harness("01SESSION");
+  it("sends the token, then what to open at the screen's size, naming the page", () => {
+    const h = harness("01SESSION", "pg1");
     h.p.connect();
     h.last().accept();
     expect(h.last().binaryType).toBe("arraybuffer");
     expect(h.last().json(0)).toEqual({ auth: "t".repeat(64) });
-    expect(h.last().json(1)).toEqual({ type: "open", target: "01SESSION", cols: 100, rows: 30 });
+    expect(h.last().json(1)).toEqual({
+      type: "open",
+      target: "01SESSION",
+      cols: 100,
+      rows: 30,
+      page: "pg1",
+    });
+    // Before the control socket's hello there is no page id to name.
+    const n = harness("01SESSION");
+    n.p.connect();
+    n.last().accept();
+    expect(n.last().json(1)).toEqual({ type: "open", target: "01SESSION", cols: 100, rows: 30 });
+  });
+
+  it("takes control, the attached size and the window's from opened", () => {
+    const h = harness();
+    h.p.connect();
+    h.opened("o1", { control: false, cols: 120, rows: 40, window: { cols: 120, rows: 40 } });
+    expect(h.p.state).toEqual({
+      kind: "open",
+      id: "o1",
+      name: "overlord-1",
+      control: false,
+      input: true,
+      cols: 120,
+      rows: 40,
+      window: { cols: 120, rows: 40 },
+    });
   });
 
   it("resets the screen at opened, then writes output and sends input", () => {
@@ -71,7 +99,17 @@ describe("pane socket", () => {
     h.p.input("ignored before opened");
     h.opened();
     expect(h.screen.resets).toBe(1);
-    expect(h.p.state).toEqual({ kind: "open", id: "o1", name: "overlord-1" });
+    // (A plugin that doesn't say who controls: this page does.)
+    expect(h.p.state).toEqual({
+      kind: "open",
+      id: "o1",
+      name: "overlord-1",
+      control: null,
+      input: true,
+      cols: null,
+      rows: null,
+      window: null,
+    });
     h.last().push(bytes("hi"));
     expect(new TextDecoder().decode(new Uint8Array(h.screen.out))).toBe("hi");
     h.p.input("ls\r");

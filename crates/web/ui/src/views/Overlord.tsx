@@ -1,6 +1,6 @@
 // The overlord (`#/overlord`): its status, its agents and its buttons,
 // then what the entry puts below them: the local page's pane
-// (views/panes.tsx), the phone's chat (views/Chat.tsx).
+// (views/panes.tsx on the local page, views/phonePanes.tsx on the phone).
 
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
@@ -35,7 +35,7 @@ export function Overlord({
   body,
 }: {
   store: Store;
-  /** Below the buttons: the pane or the chat. */
+  /** Below the buttons: the pane (and on the phone the transcript). */
   body: (o: OverlordRow) => ComponentChildren;
 }) {
   const o = store.snapshot.value?.overlord ?? null;

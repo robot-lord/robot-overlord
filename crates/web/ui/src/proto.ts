@@ -18,6 +18,20 @@ export interface Hello {
   api?: number;
   /** The device's id (a device's hello only). */
   device?: string;
+  /** Pane streams' limits (a device's hello only). */
+  panes?: PaneLimits;
+  /** This device may type into panes (false: view only; a device's hello only). */
+  input?: boolean;
+}
+
+/** What a device's hello says of pane streams (credit is the host's to keep). */
+export interface PaneLimits {
+  /** Open panes per device. */
+  max: number;
+  /** Bytes the host sends on a stream before the device acknowledges them. */
+  window: number;
+  /** Frames, likewise. */
+  frames: number;
 }
 
 /** Something in the daemon changed: ask for a new snapshot. */
@@ -50,7 +64,13 @@ export type RemoteErrorCode =
   /** This id was running when the host stopped: it may or may not have happened. */
   | "interrupted"
   /** Done, but the answer was too large to keep or to send by mailbox. */
-  | "too_large";
+  | "too_large"
+  /** `pane.open`: the target isn't running (opening never starts it). */
+  | "not_running"
+  /** `pane.open`: no such session (or no overlord yet). */
+  | "not_found"
+  /** `pane.open`: this device, or the host, has as many panes open as it may. */
+  | "too_many";
 
 export interface RemoteReply {
   id: string | number;
@@ -98,7 +118,6 @@ export const OPS = [
   "overlord.setup_request",
   "session.new",
   "session.fork",
-  "overlord.messages",
   "device.list",
   "device.pair",
   "device.pair_cancel",
@@ -107,6 +126,9 @@ export const OPS = [
   "device.revoke",
   "session.messages",
   "device.leave",
+  "pane.open",
+  "pane.take",
+  "device.input",
 ] as const;
 
 export type Op = (typeof OPS)[number];
@@ -174,6 +196,25 @@ export interface SessionBase {
   async_shells: { count: number; tasks: BackgroundTask[] } | null;
   /** What the list shows: a usage limit, then background work, else the status. */
   shown_status: Status | "limited" | "background";
+  /**
+   * Which screen holds its pane: null when none does. (Optional until the
+   * snapshot fixture carries it.)
+   */
+  control?: Control | null;
+}
+
+/** The screen that holds a pane (decision 3 of slice 5): only its keys reach it. */
+export interface Control {
+  /** `terminal`, `page:<id>` or `device:<id>`: compare with this page's surface. */
+  holder: string;
+  by: "terminal" | "web" | "phone";
+  /** How other screens name it ("laptop's terminal", "a browser on laptop", the phone's name). */
+  name: string;
+  /** It left; it keeps control a while (30 s) before passing it on. */
+  away: boolean;
+  /** The holder's size: the window's. */
+  cols: number;
+  rows: number;
 }
 
 /** One piece of background work. */
@@ -501,20 +542,13 @@ export interface PairOffer {
   qr_rows: string[];
 }
 
-/** One message of the overlord's conversation (op `overlord.messages`). */
-export interface OverlordMessage {
+/** One message of a session's conversation (op `session.messages`). */
+export interface TranscriptMessage {
   /** Its place in the transcript: pass as `before` for the ones before it. */
   line: number;
   who: "you" | "agent" | "tool";
   at: string | null;
   text: string;
-}
-
-export interface OverlordMessages {
-  overlord: { id: string; agent: string; conversation: string | null } | null;
-  messages: OverlordMessage[];
-  /** Earlier ones are left. */
-  more: boolean;
 }
 
 // ---------------------------------------------------------------------
@@ -525,10 +559,10 @@ export interface OverlordMessages {
 /** Every op the page may send (`session.messages` is in `OPS` now). */
 export type PageOp = Op;
 
-/** A session's recent conversation (op `session.messages {ref, before, limit}`), read as `overlord.messages`. */
+/** A session's recent conversation (op `session.messages {ref, before, limit}`); the overlord's by its id. */
 export interface SessionMessages {
   session: { id: string; name: string; agent: string; conversation: string | null };
-  messages: OverlordMessage[];
+  messages: TranscriptMessage[];
   /** Earlier ones are left. */
   more: boolean;
 }
@@ -553,12 +587,12 @@ export type PairingKind = "scanned" | "connecting" | "waiting" | "done" | "rejec
 
 export type OutboxState = "waiting" | "sent" | "running" | "failed" | "interrupted";
 
-/** A request the engine keeps until it is answered (asks only, as the page sees them). */
+/** A request the engine keeps until it is answered (a described new session, as the page sees it). */
 export interface OutboxItem {
   /** The engine's id for it (pass to `cancel`). */
   id: string;
   op: string;
-  /** An ask's text. */
+  /** Its text, when the engine names one (`args.text`). */
   text?: string;
   /** When it was asked (Unix ms). */
   at: number;
@@ -612,10 +646,68 @@ export interface SettingsEvent {
   notifications: boolean;
   /** (`bridge`: `rlord-device bridge`, the desktop stand-in for development.) */
   platform: "ios" | "android" | "bridge";
+  /** A debug build: the page mirrors a terminal's text into a hidden element (UI tests read it). */
+  debug?: boolean;
+}
+
+/** The shell's answer to `{"app":"paste"}`: the pasteboard's text ("" when it has none). */
+export interface PasteEvent {
+  event: "paste";
+  text: string;
 }
 
 /** What the native side sends the page beyond the control socket's messages. */
-export type AppEvent = ConnEvent | PairingEvent | OutboxEvent | StatusEvent | SettingsEvent;
+export type AppEvent =
+  | ConnEvent
+  | PairingEvent
+  | OutboxEvent
+  | StatusEvent
+  | SettingsEvent
+  | PasteEvent;
+
+// Panes over the bridge (docs/working/web-ui-remote.md, "Slice 5 build",
+// "Engine and page (the bridge)"). A pane is a stream of the device's
+// session: `pane.open` (an ordinary request) opens it, these carry it.
+
+/** `pane.open {stream, target, cols, rows}`'s answer. */
+export interface PaneOpened {
+  stream: number;
+  /** The session's id (the overlord's, for `overlord`). */
+  id: string;
+  name: string;
+  overlord: boolean;
+  /** This device may type (false: view only). */
+  input: boolean;
+  /** This device holds the pane. */
+  control: boolean;
+  /** The size the view is attached at: this device's when it holds the pane, else the window's. */
+  cols: number;
+  rows: number;
+  window: { cols: number; rows: number };
+}
+
+/** `pane.take {target, cols, rows}`'s answer. */
+export interface PaneTaken {
+  control: boolean;
+  cols: number;
+  rows: number;
+}
+
+/** Why a stream closed: the host's reasons, and `link` (the engine's: the session ended). */
+export type PaneCloseReason = "ended" | "closed" | "revoked" | "overflow" | "failed" | "link";
+
+/** The engine to the page, for one stream. */
+export type PaneEvent =
+  | { event: "pane"; stream: number; type: "data"; b: string }
+  | { event: "pane"; stream: number; type: "closed"; reason: PaneCloseReason; message?: string };
+
+/** The page to the engine, for one stream (events, not ops: no rate limit). */
+export type PaneMessage =
+  | { pane: "input"; stream: number; b: string }
+  | { pane: "resize"; stream: number; cols: number; rows: number }
+  /** Cumulative: what xterm.js has parsed of this stream. */
+  | { pane: "ack"; stream: number; bytes: number; frames: number }
+  | { pane: "close"; stream: number };
 
 /** What the page sends the native side beyond requests. */
 export type AppMessage =
@@ -628,7 +720,11 @@ export type AppMessage =
   /** The shell's: opens the native scanner. */
   | { app: "scan" }
   /** The shell's: sets what is given, answers `settings` either way. */
-  | { app: "settings"; app_lock?: boolean; notifications?: boolean };
+  | { app: "settings"; app_lock?: boolean; notifications?: boolean }
+  /** The shell's: answered `paste` with the pasteboard's text (iOS shows its paste notice). */
+  | { app: "paste" }
+  /** The shell's: puts `text` on the pasteboard. */
+  | { app: "copy"; text: string };
 
 /** Everything the native side sends the page. */
-export type BridgeMessage = ControlMessage | RemoteReply | AppEvent;
+export type BridgeMessage = ControlMessage | RemoteReply | AppEvent | PaneEvent;

@@ -7,10 +7,11 @@
 //! The page runs in the app's WebView with no network: its only way out is
 //! the shell's message bridge to the native engine. The checks hold the
 //! built files to that: every file local, no URL with a network scheme
-//! anywhere, no network API in its scripts, the CSP `<meta>` with
-//! `connect-src 'none'` and `trusted-types 'none'`, and neither xterm.js nor
-//! the local page's transport bundled. And the local page's bundle holds
-//! none of the phone's bridge code.
+//! anywhere (but the licenses notice, which names its authors' sites and is
+//! never loaded as code), no network API in its scripts, the CSP `<meta>`
+//! with `connect-src 'none'` and `trusted-types 'none'`, xterm.js bundled
+//! (the phone's terminal, slice 5) and the local page's transport not. And
+//! the local page's bundle holds none of the phone's bridge code.
 //!
 //! Neither bundle holds the dev bridge (`src/devBridge.ts`, the shell
 //! played over `rlord-device bridge`'s loopback websocket): it is built
@@ -45,10 +46,15 @@ const NETWORK_APIS: &[&str] = &[
     "sendBeacon",
     "RTCPeerConnection",
     "WebTransport",
-    "importScripts",
+    // (A call: xterm.js feature-detects it with `typeof …importScripts`,
+    // and it exists only in a worker, which `Worker(` keeps out.)
+    "importScripts(",
     "fetch(",
     "Worker(",
 ];
+
+/// The bundled licenses notice: its authors' sites are names, not loads.
+const LICENSES: &str = "/THIRD-PARTY-LICENSES.md";
 
 /// Each transport carries one of these (`static marker`), so a bundle
 /// shows which it has even minified.
@@ -357,16 +363,19 @@ pub fn problems(files: &[(String, Vec<u8>)]) -> Vec<String> {
         }
     }
     let mut remote = false;
+    let mut xterm = false;
     for (path, bytes) in files {
         let text = String::from_utf8_lossy(bytes);
         if content_type(path) == "application/octet-stream" {
             out.push(format!("{path}: a file of unknown type"));
         }
-        for url in network_urls(&text) {
-            out.push(format!("{path} names a URL: {url}"));
+        if path != LICENSES {
+            for url in network_urls(&text) {
+                out.push(format!("{path} names a URL: {url}"));
+            }
         }
-        if text.to_ascii_lowercase().contains("xterm") {
-            out.push(format!("{path} carries xterm.js"));
+        if path.ends_with(".js") && text.contains("xterm-helper-textarea") {
+            xterm = true;
         }
         if text.contains(LOCAL_MARKER) {
             out.push(format!("{path} carries LocalTransport"));
@@ -385,6 +394,9 @@ pub fn problems(files: &[(String, Vec<u8>)]) -> Vec<String> {
     }
     if !remote {
         out.push("no file carries RemoteTransport: is this the phone page?".into());
+    }
+    if !xterm {
+        out.push("no script carries xterm.js: the phone page has a terminal".into());
     }
     out
 }
@@ -451,7 +463,8 @@ mod tests {
             (
                 "/assets/app-1.js".into(),
                 b"var n=\"http://www.w3.org/2000/svg\";class R{static marker=\"rlord-remote-transport\"};\
-                  window.webkit.messageHandlers.rlord.postMessage(x);e.innerHTML"
+                  window.webkit.messageHandlers.rlord.postMessage(x);e.innerHTML;\
+                  t.className=\"xterm-helper-textarea\""
                     .to_vec(),
             ),
             ("/index.html".into(), page(META, head).into_bytes()),
@@ -485,13 +498,16 @@ mod tests {
                 "{planted}: {got:?}"
             );
         }
-        // In a stylesheet, and in the licenses file too: every file.
+        // In any other file, a stylesheet or a notice of another name.
+        let got = problems(&with(&good(), "/NOTICE.md", b"see https://example.com"));
+        assert!(got.iter().any(|p| p.contains("NOTICE.md names a URL")));
+        // The licenses notice names its authors' sites (xterm.js's do).
         let got = problems(&with(
             &good(),
             "/THIRD-PARTY-LICENSES.md",
-            b"see https://example.com",
+            b"Copyright (c) 2017-2019, The xterm.js authors (https://github.com/xtermjs/xterm.js)",
         ));
-        assert!(got.iter().any(|p| p.contains("LICENSES.md names a URL")));
+        assert_eq!(got, Vec::<String>::new());
         // A namespace name is not a URL to anything.
         assert!(network_urls("a=\"http://www.w3.org/1999/xhtml\"").is_empty());
         assert_eq!(
@@ -501,27 +517,50 @@ mod tests {
     }
 
     #[test]
-    fn network_apis_xterm_and_the_local_transport_fail() {
+    fn network_apis_and_the_local_transport_fail() {
         for (planted, want) in [
             ("new WebSocket(u)", "uses WebSocket"),
             ("fetch(u)", "uses fetch("),
             ("new XMLHttpRequest", "uses XMLHttpRequest"),
             ("navigator.sendBeacon(u)", "uses sendBeacon"),
             ("new Worker(u)", "uses Worker("),
-            ("class X{}/* xterm-helper-textarea */", "carries xterm.js"),
+            ("self.importScripts(u)", "uses importScripts("),
             (
                 "static marker=\"rlord-local-transport\"",
                 "carries LocalTransport",
             ),
             ("const D=\"rlord-dev-bridge\"", "carries the dev bridge"),
         ] {
-            let js = format!("class R{{static marker=\"rlord-remote-transport\"}};{planted}");
+            let js = format!(
+                "class R{{static marker=\"rlord-remote-transport\"}};\"xterm-helper-textarea\";{planted}"
+            );
             let got = problems(&with(&good(), "/assets/app-1.js", js.as_bytes()));
             assert!(got.iter().any(|p| p.contains(want)), "{planted}: {got:?}");
         }
+        // xterm.js's feature test isn't a use.
+        let js = "class R{static marker=\"rlord-remote-transport\"};\"xterm-helper-textarea\";\
+                  typeof g.importScripts==`function`";
+        assert_eq!(
+            problems(&with(&good(), "/assets/app-1.js", js.as_bytes())),
+            Vec::<String>::new()
+        );
         // Not the phone page at all.
         let got = problems(&with(&good(), "/assets/app-1.js", b"var a=1"));
         assert!(got.iter().any(|p| p.contains("RemoteTransport")), "{got:?}");
+    }
+
+    #[test]
+    fn the_phone_page_carries_its_terminal() {
+        let js = b"class R{static marker=\"rlord-remote-transport\"}";
+        let got = problems(&with(&good(), "/assets/app-1.js", js));
+        assert!(got.iter().any(|p| p.contains("xterm.js")), "{got:?}");
+        // (Its stylesheet alone isn't the terminal.)
+        let got = problems(&with(
+            &with(&good(), "/assets/app-1.js", js),
+            "/assets/app-1.css",
+            b".xterm-helper-textarea{}",
+        ));
+        assert!(got.iter().any(|p| p.contains("xterm.js")), "{got:?}");
     }
 
     #[test]

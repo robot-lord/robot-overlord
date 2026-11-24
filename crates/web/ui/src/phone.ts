@@ -133,7 +133,7 @@ export function keysWords(k: StatusEvent["keys"]): string {
 
 /**
  * The page's box, from the visual viewport: the part of the screen the
- * keyboard leaves. phone.css lays the app over it, so the composer stays
+ * keyboard leaves. phone.css lays the app over it, so the key row stays
  * above the keyboard.
  */
 export function viewportVars(vv: { height: number; offsetTop: number }): Record<string, string> {
@@ -141,6 +141,29 @@ export function viewportVars(vv: { height: number; offsetTop: number }): Record<
     "--vvh": `${Math.max(0, Math.round(vv.height))}px`,
     "--vvtop": `${Math.max(0, Math.round(vv.offsetTop))}px`,
   };
+}
+
+/** A request waiting in the outbox, as the list's line says it. */
+export function waitingWords(i: OutboxItem): string {
+  const what = i.op === "overlord.new_session" ? "New session" : i.op;
+  const text = i.text ? `: ${i.text}` : "";
+  switch (i.state) {
+    case "waiting":
+      return `${what}${text} · waiting to be sent`;
+    case "sent":
+      return `${what}${text} · sent, waiting for your computer`;
+    case "running":
+      return `${what}${text} · your computer has it`;
+    case "interrupted":
+      return `${what}${text} · may not have reached your computer`;
+    case "failed":
+      return `${what}${text} · ${i.error?.message ?? "failed"}`;
+  }
+}
+
+/** A debug build of the app (or the desktop bridge): panes mirror their text for UI tests. */
+export function debugBuild(s: SettingsEvent | null): boolean {
+  return s?.debug === true || s?.platform === "bridge";
 }
 
 /** The phone's own state, as signals. */
@@ -180,6 +203,9 @@ export class Phone {
         return;
       case "settings":
         this.settings.value = ev;
+        return;
+      case "paste":
+        // (RemoteTransport answers its `paste()` with it.)
         return;
     }
   }

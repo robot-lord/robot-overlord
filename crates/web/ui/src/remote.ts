@@ -16,8 +16,11 @@ import type {
   BridgeMessage,
   ConnKind,
   PageOp,
+  PaneEvent,
+  PaneMessage,
   RemoteErrorCode,
 } from "./proto";
+import { type PaneBridge, StreamIds } from "./remotePane";
 import {
   ApiError,
   type Caps,
@@ -105,6 +108,9 @@ export interface RemoteEvents extends TransportEvents {
   app(ev: AppEvent): void;
 }
 
+/** How long the page waits for the shell's `paste` answer. */
+export const PASTE_WAIT_MS = 30_000;
+
 interface Pending {
   resolve(v: unknown): void;
   reject(e: ApiError): void;
@@ -115,7 +121,7 @@ interface Pending {
  * engine replays what the page needs after a (re)load: the connection,
  * a pairing in progress, the outbox and the last hello.
  */
-export class RemoteTransport implements Transport {
+export class RemoteTransport implements Transport, PaneBridge {
   /** (The local page's bundle check fails if this string is in it.) */
   static readonly marker = "rlord-remote-transport";
   readonly caps: Caps = REMOTE_CAPS;
@@ -124,6 +130,11 @@ export class RemoteTransport implements Transport {
   private stopped = false;
   private live = false;
   private shown: ConnState | null = null;
+  /** Pane streams: the ids in use and who hears each. */
+  private readonly ids = new StreamIds();
+  private readonly panes = new Map<number, (ev: PaneEvent) => void>();
+  private readonly hellos = new Set<() => void>();
+  private pasteWaiters: ((text: string | null) => void)[] = [];
   private readonly bridge: Bridge;
   private readonly on: RemoteEvents;
 
@@ -163,6 +174,68 @@ export class RemoteTransport implements Transport {
     this.stopped = true;
     for (const p of this.pending.values()) p.reject(new ApiError("disconnected", "stopped"));
     this.pending.clear();
+    this.panes.clear();
+    this.hellos.clear();
+    this.answerPaste(null);
+  }
+
+  // Panes (remotePane.ts): the transport keeps the session's stream ids,
+  // since one is free again only at its `closed`, whichever pane had it.
+
+  sendPane(m: PaneMessage): void {
+    if (!this.stopped) this.bridge.send(JSON.stringify(m));
+  }
+
+  claim(on: (ev: PaneEvent) => void): number | null {
+    const id = this.ids.take();
+    if (id !== null) this.panes.set(id, on);
+    return id;
+  }
+
+  unclaim(stream: number): void {
+    this.ids.free(stream);
+    this.panes.delete(stream);
+  }
+
+  mute(stream: number): void {
+    this.panes.delete(stream);
+  }
+
+  onHello(f: () => void): () => void {
+    this.hellos.add(f);
+    return () => this.hellos.delete(f);
+  }
+
+  /**
+   * The pasteboard's text, from the shell (`{"app":"paste"}`, answered
+   * `{"event":"paste","text"}`; iOS shows its own paste notice). Null when
+   * the shell didn't answer.
+   */
+  paste(): Promise<string | null> {
+    if (this.stopped) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pasteWaiters = this.pasteWaiters.filter((w) => w !== done);
+        resolve(null);
+      }, PASTE_WAIT_MS);
+      const done = (t: string | null) => {
+        clearTimeout(timer);
+        resolve(t);
+      };
+      this.pasteWaiters.push(done);
+      this.send({ app: "paste" });
+    });
+  }
+
+  /** `text` onto the pasteboard, by the shell. */
+  copy(text: string): void {
+    this.send({ app: "copy", text });
+  }
+
+  private answerPaste(text: string | null): void {
+    const w = this.pasteWaiters;
+    this.pasteWaiters = [];
+    for (const f of w) f(text);
   }
 
   private state(s: ConnState): void {
@@ -184,8 +257,24 @@ export class RemoteTransport implements Transport {
       switch (m.event) {
         case "hello":
           this.live = true;
+          // A new session: no stream of the old one is open.
+          this.ids.clear();
+          this.panes.clear();
           this.state("open");
           this.on.hello(m);
+          for (const f of this.hellos) f();
+          return;
+        case "pane": {
+          const on = this.panes.get(m.stream);
+          if (m.type === "closed") {
+            this.ids.free(m.stream);
+            this.panes.delete(m.stream);
+          }
+          on?.(m);
+          return;
+        }
+        case "paste":
+          this.answerPaste(typeof m.text === "string" ? m.text : "");
           return;
         case "changed":
           this.on.changed(m.rev);

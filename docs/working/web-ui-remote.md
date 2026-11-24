@@ -5690,3 +5690,77 @@ Built on `s5/engine` (Opus, 2026-11-24), against the contract above.
   marks `pane.open`/`pane.take` idempotent and drops `overlord.messages`.
 - Owed: `e2e-protocol.md` §3 "Requests by mailbox" still names
   `overlord.ask` (host part); the general answer watchdog stays owed.
+
+#### Step 6 (page)
+
+Built on `s5/page` (Opus, 2026-11-24), against a fake bridge; not run
+against a host or the engine yet.
+
+- **Links.** `paneLink.ts` holds `PaneLink` (`connect`, `input`,
+  `resize`, `visible`, `stop`, `state`), `PaneState` and `Screen`
+  (`write(bytes, parsed)`: xterm.js's write callback). `pane.ts` keeps
+  `PaneSocket` (local only): `open` gains `page`, `opened`'s `control`,
+  `cols`, `rows`, `window` land in the open state (absent: `control:
+  null`, read as "this page holds it", the old behaviour).
+  `remotePane.ts` is `RemotePaneLink`: `pane.open {stream, target, cols,
+  rows}` as a request; the stream id is the lowest free of 1 to 250,
+  freed at its `closed` (or when the open is refused, or at a new
+  session's `hello`, where nothing of the old one lives); the screen is
+  reset at the answer; `data` is base64-decoded into xterm.js and
+  acknowledged (cumulative `bytes` and `frames`) once parsed, at 16 KiB
+  at once, else 50 ms after; `closed` `link` waits for the next `hello`,
+  `ended` and `failed`/`overflow` retry with backoff, `revoked` stops;
+  every `hello` reopens. `RemoteTransport` routes `{"event":"pane"}` by
+  stream and owns the ids (`claim`, `unclaim`, `mute`, `onHello`), and
+  `paste()`/`copy()` for the shell's messages.
+- **Terminal.** `term.ts` mounts xterm.js on any link: WebGL only, a new
+  `WebglAddon` per lost context (at most 5 in a row); holder fit to the
+  box, viewer resized to the window's size and CSS-scaled down; on the
+  phone the rows are laid out for the box plus what the keyboard takes
+  (`innerHeight - visualViewport.height`), the terminal anchored at the
+  bottom and slid by a drag, the rest of the drag one SGR wheel report
+  per row when the pane asked for the mouse; a new size only after a
+  width change or a font step, 200 ms after. `term/keys.ts` and
+  `term/layout.ts` are the pure parts. 12 px `ui-monospace` by default,
+  10 to 16 kept in `localStorage`.
+- **Control.** `control.ts`: `surfaceOf(hello)`, `controlView` (the
+  snapshot's `control` against this surface; the open's `control` while
+  the snapshot is behind or says nobody; a take counts until the
+  snapshot's `control` changes; view-only is always a viewer with no
+  Take over). The bar is in `components/Pane.tsx`, so the local page's
+  panes have it too; a key typed as a viewer marks Take over.
+- **Phone views.** `#/overlord`: Terminal and Transcript tabs; a session:
+  Terminal (while running) / Transcript / Details (a compact `Session`
+  hands its facts and buttons to the tab); not running: Transcript (with
+  Resume) and Details. The header has an `overlord` link marked while it
+  waits for input. The key row (and compose line, Paste, Copy screen,
+  font steps, the key-to-echo read-out) is there from the first render
+  so the terminal is laid out above it. `views/Chat.tsx` became
+  `views/Transcript.tsx`, `chat.ts` `transcript.ts`; the outbox shows as
+  lines under the overlord's row with Cancel. `caps.tell` keeps the
+  "tell the overlord" box to the local page.
+- **Proved** (Vitest, 149 tests, no jsdom): the key bytes, the sizing
+  maths, the control bar's states from the snapshot fixture, the pane
+  link against `RemoteTransport` on a fake bridge (open, bytes, acks at
+  16 KiB and 50 ms, `closed`, reopen at `hello`, id reuse only after
+  `closed`, hidden, revoked, view only), the transport's stream routing
+  and paste. `web build --app` passes with xterm.js in the bundle.
+- **Deviations.** (1) The phone bundle's checks: xterm.js is now
+  required (`xterm-helper-textarea` in a script); the licenses notice is
+  exempt from the URL check (xterm.js's copyright lines name its
+  authors' sites; it is never loaded as code); `importScripts` is matched
+  as a call (`importScripts(`), since xterm.js feature-tests it with
+  `typeof`. (2) `SettingsEvent` gains `debug` (the shell's debug build),
+  which turns on the screen mirror; `platform: "bridge"` does too.
+  (3) `SessionBase.control` is optional until the snapshot fixture
+  carries it. (4) The overlord view has a Transcript tab too
+  (`session.messages` with its id, as decision 8 says it can).
+- **Owed.** Make `control` required in `proto.ts` once the daemon's
+  fixture has it (`fixture.test.ts` fails on the key check until then).
+  The shell sends `"debug": true` in `settings` in debug builds, and
+  answers `paste` and `copy` (step 8). The engine could name a new
+  session's description as an outbox item's `text` (the line shows only
+  "New session" without it). `apps/ios`'s UI test still asks through the
+  chat (step 8). Not seen in a browser or on a phone yet: the layout,
+  the slide, the scale and the key row are by-hand items for step 9.
+  `app test-e2e` updated, not run (needs the host's panes).

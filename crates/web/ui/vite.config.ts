@@ -6,7 +6,7 @@
 // `--mode app` builds the phone app's page instead (app.html, src/app.tsx)
 // into dist-app/, which the app bundles and serves itself: `cargo xtask
 // web build --app` names it index.html, writes its asset table and runs
-// the checks on it (no network, no xterm.js, no LocalTransport).
+// the checks on it (no network, xterm.js for its terminal, no LocalTransport).
 //
 // `--mode app-dev` builds the same page for a desktop browser
 // (app-dev.html, src/appDev.ts) into dist-app-dev/, with the dev bridge

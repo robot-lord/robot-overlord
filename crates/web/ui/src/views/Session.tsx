@@ -1,6 +1,7 @@
 // A session (`#/s/<id>`): its header and its buttons, then what the entry
-// puts below them: the local page's pane (views/panes.tsx), the phone's
-// notes and recent messages (views/Chat.tsx).
+// puts below them: the local page's pane (views/panes.tsx). The phone's
+// view is compact (views/phonePanes.tsx): a short header, then tabs, its
+// details and buttons in one of them.
 
 import type { ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
@@ -28,11 +29,17 @@ export function Session({
   store,
   id,
   body,
+  compact = false,
 }: {
   store: Store;
   id: string;
-  /** Below the buttons: the pane, or the session's text. */
-  body: (s: SessionBase, act: Runner) => ComponentChildren;
+  /**
+   * Below the buttons: the pane. `details` is the session's facts and
+   * buttons, for a compact view to place (else they are above).
+   */
+  body: (s: SessionBase, act: Runner, details: ComponentChildren) => ComponentChildren;
+  /** Only the name and status on top. */
+  compact?: boolean;
 }) {
   const listed: SessionBase | undefined = store.row(id);
   // Not in the list's view (archived, filtered out): asked for once.
@@ -67,23 +74,48 @@ export function Session({
       </section>
     );
   }
+  const facts = (
+    <>
+      <span class="dim">{store.agentLabel(s.agent)}</span>
+      {s.model && <span class="dim">{s.model}</span>}
+      {s.branch && <span class="dim">⎇ {s.branch}</span>}
+      {s.tags.map((t) => (
+        <span class="tag">#{t}</span>
+      ))}
+      {s.description && <p class="desc-line">{s.description}</p>}
+      <Work s={s} />
+    </>
+  );
+  const actions = <SessionActions s={s} r={act} onFork={() => openFork(store, s)} />;
+  if (compact) {
+    const details = (
+      <div class="details">
+        <div class="view-head">{facts}</div>
+        {s.notes && <p class="notes">{s.notes}</p>}
+        {actions}
+      </div>
+    );
+    return (
+      <section class="view">
+        <header class="view-head">
+          <Back />
+          <h1>{s.name}</h1>
+          <Status s={s} full />
+        </header>
+        {body(s, act, details)}
+      </section>
+    );
+  }
   return (
     <section class="view">
       <header class="view-head">
         <Back />
         <h1>{s.name}</h1>
         <Status s={s} full />
-        <span class="dim">{store.agentLabel(s.agent)}</span>
-        {s.model && <span class="dim">{s.model}</span>}
-        {s.branch && <span class="dim">⎇ {s.branch}</span>}
-        {s.tags.map((t) => (
-          <span class="tag">#{t}</span>
-        ))}
-        {s.description && <p class="desc-line">{s.description}</p>}
-        <Work s={s} />
+        {facts}
       </header>
-      <SessionActions s={s} r={act} onFork={() => openFork(store, s)} />
-      {body(s, act)}
+      {actions}
+      {body(s, act, null)}
     </section>
   );
 }
