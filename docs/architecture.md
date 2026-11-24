@@ -1181,8 +1181,9 @@ config and each agent's subagent files (`overlord::write_files`; every
 agent's are written, whichever runs it). These are project files, so each
 agent still loads the user's own global instructions too. Its adapter flags
 ride in `launch_spec.extra_args`, so resume reuses them; they are rewritten
-on every `ensure` and fresh restart, so a config change reaches it at its
-next start.
+on every `ensure`, fresh restart and plain restart (the list, the CLI, MCP,
+a Remote Control toggle: `overlord::refresh_if_overlord`, best effort), so a
+config change (effort included) reaches it at its next start.
 
 Any agent can run it (`write_files` matches on `Agent` with no wildcard
 arm, so a new agent doesn't build until it is wired). The surface is the same for

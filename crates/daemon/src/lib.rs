@@ -652,7 +652,12 @@ impl Daemon {
                 methods::session_defaults(&cfg, needed)
             }
             "session.get" => methods::session_get(&db, &params),
-            "session.restart" => methods::session_restart(&db, &params),
+            "session.restart" => {
+                // An overlord restarts with its folder and flags current.
+                let id = params["ref"].as_str().unwrap_or("");
+                overlord::refresh_if_overlord(&db, &self.config(), id);
+                methods::session_restart(&db, &params)
+            }
             "session.stop" => methods::session_stop(&db, &params),
             "session.archive" => methods::session_archive(&db, &params),
             "session.unarchive" => methods::session_unarchive(&db, &params),
