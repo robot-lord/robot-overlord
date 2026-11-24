@@ -1314,7 +1314,10 @@ fragmented up to 1 MiB. The mailbox (for `overlord.ask` and
 `overlord.new_session` while the host is away) is its own saveable
 cipher state over the kind-3 handshake's raw keys, rekeyed after every
 message; its receiver skips up to 64 lost messages (counters only move
-forward), since the relay's queue can lose some.
+forward), since the relay's queue can lose some. The host's `hello` on each live
+session names the mailbox it holds for the device (or null), so a
+device whose mailbox the host has lost keys a new one rather than
+sending into one nobody can open.
 
 **Delivery and recovery: one rule.** One websocket link carries one Noise
 session per device link, with implicit nonces (no counter on the wire),
@@ -1475,6 +1478,25 @@ it dials, and only if the relay says something waits does it make a
 session, take the state and call `notify` with the count of sessions
 newly waiting. The notification is a count, made on the phone. No push
 yet: a refresh is the OS's choice of time.
+
+**Without a phone.** `rlord-device bridge` runs the same engine (software
+keys) behind a websocket on 127.0.0.1 that plays the shell: it serves
+`scan` and `settings`, passes everything else to the engine, and refuses
+a connection whose `Origin` it wasn't given. The dev build of the phone
+page (`app-dev.html`, `vite build --mode app-dev`, `dist-app-dev/`) adds
+a shim that makes `webkit.messageHandlers.rlord` that websocket, under a
+CSP whose only change is `connect-src ws://127.0.0.1:<port>`; the phone
+bundle can't carry it (`web check-app` fails on its marker, on
+`WebSocket` and on `ws://`). `crates/web/examples/remote_stack.rs` is a
+loopback host for both: an in-memory daemon with fixture sessions, the
+real plugin and relay, and a fake overlord (the example itself in a pane
+of a scratch tmux server, answering in a Claude-format transcript; the
+agents' names on its PATH are the example too, so no real agent runs).
+`cargo xtask app dev` opens the page in a desktop browser over it;
+`cargo xtask app test-e2e` runs the page's own store and
+`RemoteTransport` in Node over it (CI's `web` job); `cargo xtask app
+test-ios` drives the simulator against it (pair, list, background and
+back, relay restart, an ask answered) through its control folder.
 
 ## rlord's private tmux server (2026-11-10)
 

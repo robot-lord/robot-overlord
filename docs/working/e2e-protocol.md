@@ -1,4 +1,4 @@
-**Status:** in progress (slice 3 of `web-ui-remote.md`; written while building, to be read by a reviewer, then promoted)
+**Status:** in progress (slices 3 and 4 of `web-ui-remote.md`; written while building, the device side as built by the engine in slice 4; to be read by a reviewer, then promoted)
 
 # rlord remote protocol, v1
 
@@ -393,14 +393,53 @@ never outlives a lost frame, so nothing may be lost quietly.
   it came on if still the same, and the mailbox if a resend came that
   way). A request still running when the plugin stopped is answered
   `interrupted`.
-- **Device** (the phone slice; `rlord-device` does the protocol parts):
-  reconnect on 4205, on a network change and on coming to the
-  foreground; run `KKpsk2` each time its host comes online; compare the
-  snapshot's `rev` and fetch on a difference; resend unanswered requests
-  by id; key a new mailbox when the `hello`'s `mailbox` isn't the one it
-  holds (§3, step 4); when the relay's `boot` changes, resend every mailbox request it
-  has no answer to (the queue is gone); drop mailbox frames by `(boot,
-  seq)` and answers by request id it already has.
+- **Device** (the device engine, `crates/e2e-client`: `machine` holds
+  every rule below, each with a unit test on a scripted link and a fake
+  clock; the phone app and `rlord-device` both run it).
+  - *Dialling.* One URL, built from the pin; no other address is ever
+    tried. Backoff 250 ms doubling to 30 s with up to 20% jitter, reset by
+    a link `ready` for 10 s. The first 4205 redials at once, another
+    within 60 s takes the backoff. A network change (`network(up)` or a
+    changed path) redials at once; `network(down)` stops dialling. Coming
+    to the foreground dials at once; going to the background sends what
+    is queued and closes (1000). The final codes (4401, 4402, 4403, 4426)
+    and a wrong relay stop the loop until the user acts. `bye
+    {retry_after}` is honoured with jitter; 4429 and 4503 take the
+    backoff; 4409 (replaced by a newer connection of this identity)
+    waits and doesn't fight; `enroll` is shown and waited on.
+  - *Silence.* Pings every 15 s; a link silent 45 s is gone; a 10 s jump
+    between the wall and monotonic clocks redials at once (as the host).
+  - *Sessions.* `KKpsk2` each time the host comes online, never reusing
+    a session. No message 2 within 10 s, or `undeliverable`, retries the
+    handshake on the same link (1 s doubling to 30 s). Any decrypt
+    failure ends the session and the link; an unknown text message is
+    skipped, a binary frame it can't parse closes the link.
+  - *State.* The last `rev` is kept; `hello.rev` and `changed` go to the
+    page, whose store asks `snapshot {rev}`.
+  - *The outbox.* Each request gets 16 random bytes as its id, saved
+    before it is sent. Only `overlord.ask` and `overlord.new_session` may
+    wait without a live session (they go by mailbox); any other op needs
+    one. After any reconnect every unanswered entry goes again, same id,
+    oldest first, once per link; an op that changes something is resent
+    for 2 minutes, then ends `interrupted`; an ask waits up to 24 hours.
+    At most 16 entries (`outbox_full`). `in_progress` waits;
+    `interrupted` ends the entry. Look-ups (the daemon's idempotent ops,
+    `page.report` among them) are never kept: one in flight when the
+    link dies fails `disconnected`.
+  - *The mailbox.* Keyed on the first live session and whenever there is
+    none, and again when the `hello`'s `mailbox` isn't the one it holds
+    (§3, step 4). One frame out at a time, sealed and saved before it
+    leaves; the next after `queued`; `refused full` is sent again first
+    on the next link and every 30 s; `no_queue` fails the request
+    `host_offline`; `unknown` or `bad` discards the mailbox. When the
+    relay's `boot` changes, every mailbox request without an answer goes
+    again (the queue is gone). Frames are dropped by `(boot, seq)` and by
+    mailbox id, answers by request id it already has.
+  - *In the background* (`background_check`, the OS's refresh): one
+    dial, the cheap check (`ready`'s `signal`, `boot`); only if something
+    waits a session, a snapshot and a count of sessions newly waiting.
+  - Owed: no watchdog for an answer on a live session (a request whose
+    frame the host never got waits until the next reconnect).
 
 ## 5. Host and daemon
 
