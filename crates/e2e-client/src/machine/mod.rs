@@ -10,10 +10,17 @@
 //! `pair` link while pairing. A link carries at most one Noise session
 //! (never reused after a reconnect); requests that change something live
 //! in the [`Outbox`] until answered.
+//!
+//! Panes (slice 5, "Engine and page (the bridge)" in the plan's contract)
+//! are passed through: the page's `{"pane": …}` messages become data
+//! frames and `pane` events, the host's pane frames become `data`
+//! messages, one per frame. A pane lives in one session: when it ends,
+//! the page hears `closed` (`link`) for each and opens them anew.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 use rlord_e2e::stream::{self, Reassembler, CONTROL};
@@ -41,6 +48,10 @@ pub const RESET_REPEAT_MS: u64 = 60_000;
 /// Ping the relay this often; give a link up after this much silence.
 pub const PING_MS: u64 = 15_000;
 pub const SILENCE_MS: u64 = 45_000;
+/// The page sent input and the link heard nothing for this long: ping at
+/// once; nothing heard for this long again, redial (a terminal makes a
+/// silently dead link painful).
+pub const STALL_MS: u64 = 5_000;
 /// A wall or monotonic clock jump of this much between ticks redials.
 pub const JUMP_MS: u64 = 10_000;
 /// Message 2 (and then the host's hello) is due within this.
@@ -68,6 +79,8 @@ pub const NAME_MAX: usize = 40;
 pub struct Tuning {
     pub ping_ms: u64,
     pub silence_ms: u64,
+    /// The input-stall rule's wait ([`STALL_MS`]).
+    pub stall_ms: u64,
 }
 
 impl Default for Tuning {
@@ -75,6 +88,7 @@ impl Default for Tuning {
         Tuning {
             ping_ms: PING_MS,
             silence_ms: SILENCE_MS,
+            stall_ms: STALL_MS,
         }
     }
 }
@@ -291,6 +305,19 @@ struct Up {
     bye_retry: Option<u64>,
     /// Mailbox frames the relay said wait for us, not yet taken.
     queued_left: u64,
+    /// The page sent pane input at this time and nothing was heard since.
+    input_at: Option<u64>,
+    /// The input-stall rule's ping went at this time.
+    stall_ping: Option<u64>,
+}
+
+impl Up {
+    /// Anything arrived on the link.
+    fn heard(&mut self, mono: u64) {
+        self.last_rx = mono;
+        self.input_at = None;
+        self.stall_ping = None;
+    }
 }
 
 enum Link {
@@ -306,6 +333,25 @@ struct Pairing {
     label: String,
     public: Vec<u8>,
     until: u64,
+}
+
+/// A pane stream the engine saw opened on the live session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pane {
+    /// Open: the host's frames go to the page.
+    Open,
+    /// The engine asked the host to close it; its frames are discarded
+    /// until the host's `closed`. `tell_page`: the page asked (it waits
+    /// for `closed` to reuse the id); otherwise the page that opened it
+    /// is gone (a reload) and the new one never knew it.
+    Closing { tell_page: bool },
+}
+
+/// A message on the live session, opened.
+enum Opened {
+    Control(Value),
+    /// A pane frame: its stream and bytes.
+    Pane(u8, Vec<u8>),
 }
 
 /// Where a host's answer goes.
@@ -363,6 +409,15 @@ pub struct Machine {
     refused: Option<(String, Vec<u8>, u64)>,
     bg: Option<Bg>,
     bg_result: Option<BackgroundOutcome>,
+
+    /// Pane streams of the live session (from `pane.open`'s answers), until
+    /// the host says `closed` or the session ends.
+    panes: BTreeMap<u8, Pane>,
+    /// `pane.open` requests in flight: request id to stream.
+    pane_opening: HashMap<String, u8>,
+    /// The page's `pane.open`s for a stream still closing after a reload:
+    /// sent once the host's `closed` for it arrives.
+    pane_held: Vec<(Value, Value, u8)>,
 }
 
 fn page_error(id: &Value, code: &str, message: &str) -> Value {
@@ -414,6 +469,9 @@ impl Machine {
             refused: None,
             bg: None,
             bg_result: None,
+            panes: BTreeMap::new(),
+            pane_opening: HashMap::new(),
+            pane_held: Vec::new(),
         };
         // One host in this slice: the first record that opens.
         for r in saved {
@@ -470,6 +528,11 @@ impl Machine {
             if matches!(up.sess, Sess::None) && up.host_online {
                 at(up.hs_retry_at);
             }
+            match (up.input_at, up.stall_ping) {
+                (_, Some(p)) => at(p + self.tuning.stall_ms),
+                (Some(t), None) => at(t + self.tuning.stall_ms),
+                _ => {}
+            }
         }
         if let Some(bg) = &self.bg {
             at(bg.until);
@@ -508,19 +571,19 @@ impl Machine {
             }
             Input::Text { link, text } => {
                 if let Some(up) = self.up_mut(link) {
-                    up.last_rx = now.mono;
+                    up.heard(now.mono);
                     self.text(&text);
                 }
             }
             Input::Binary { link, bytes } => {
                 if let Some(up) = self.up_mut(link) {
-                    up.last_rx = now.mono;
+                    up.heard(now.mono);
                     self.binary(&bytes);
                 }
             }
             Input::Heard { link } => {
                 if let Some(up) = self.up_mut(link) {
-                    up.last_rx = now.mono;
+                    up.heard(now.mono);
                 }
             }
             Input::Closed { link, code } => {
@@ -728,7 +791,7 @@ impl Machine {
     fn link_lost(&mut self, up: &Up) {
         let had_session = matches!(up.sess, Sess::Live { .. });
         if had_session {
-            self.fail_lookups();
+            self.session_ended();
         }
         if let Some((id, _, _)) = &up.mb_inflight {
             if let Some(e) = self.rec.as_mut().and_then(|r| r.outbox.get_mut(id)) {
@@ -747,6 +810,35 @@ impl Machine {
         }
         if up.role == Role::Pair && self.pairing.is_some() {
             self.fail_pairing("failed", "the connection ended before the pairing finished");
+        }
+    }
+
+    /// What ends with a live session: its look-ups and its panes.
+    fn session_ended(&mut self) {
+        self.fail_lookups();
+        self.end_panes();
+    }
+
+    /// Every pane of the session ends with it: `closed` (`link`) for each
+    /// the page still knows; a `pane.open` held for one fails. The page
+    /// opens them anew on the next `hello` (reopen, never resume).
+    fn end_panes(&mut self) {
+        self.pane_opening.clear();
+        let panes = std::mem::take(&mut self.panes);
+        for (stream, p) in panes {
+            if matches!(p, Pane::Open | Pane::Closing { tell_page: true }) {
+                self.send_page(json!({
+                    "event": "pane", "stream": stream, "type": "closed", "reason": "link",
+                    "message": "the connection to the computer ended",
+                }));
+            }
+        }
+        for (pid, _, _) in std::mem::take(&mut self.pane_held) {
+            self.send_page(page_error(
+                &pid,
+                "disconnected",
+                "the connection to the computer ended; ask again",
+            ));
         }
     }
 
@@ -851,6 +943,8 @@ impl Machine {
             refused_tried: false,
             bye_retry: None,
             queued_left: ready.queued.unwrap_or(0),
+            input_at: None,
+            stall_ping: None,
         }));
         if role == Role::Pair {
             return self.pair_start();
@@ -1024,9 +1118,13 @@ impl Machine {
                     // have lost meanwhile goes again on the next session.
                     up.resent = false;
                 } else if !matches!(up.sess, Sess::PairHs(_) | Sess::Pair { .. }) {
+                    let was_live = matches!(up.sess, Sess::Live { .. });
                     up.sess = Sess::None;
                     up.mb_keying = None;
                     self.fail_lookups();
+                    if was_live {
+                        self.end_panes();
+                    }
                 }
             }
             FromRelay::Signal => self.signal_pending = true,
@@ -1089,7 +1187,7 @@ impl Machine {
                 } else if matches!(up.sess, Sess::Live { .. }) {
                     // Our frame found no host: the session is gone.
                     up.sess = Sess::None;
-                    self.fail_lookups();
+                    self.session_ended();
                     self.handshake_failed();
                 }
             }
@@ -1152,7 +1250,10 @@ impl Machine {
     }
 
     /// Any decrypt or encrypt failure ends the session: close and redial.
+    /// (The session may be taken out of the link already, so what ends
+    /// with it is ended here.)
     fn poisoned(&mut self) {
+        self.session_ended();
         self.drop_link(1000);
         self.schedule_backoff();
     }
@@ -1181,18 +1282,21 @@ impl Machine {
             } => match open(&mut s, &mut reasm, p) {
                 Err(()) => self.poisoned(),
                 Ok(None) => up.sess = Sess::Hello { s, reasm, until },
-                Ok(Some(v)) if v["event"] == "hello" => {
+                Ok(Some(Opened::Control(v))) if v["event"] == "hello" => {
                     up.sess = Sess::Live { s, reasm };
                     self.hello(v);
                 }
+                // Anything before the host's hello (a pane frame included).
                 Ok(Some(_)) => self.poisoned(),
             },
             Sess::Live { mut s, mut reasm } => match open(&mut s, &mut reasm, p) {
                 Err(()) => self.poisoned(),
                 Ok(m) => {
                     up.sess = Sess::Live { s, reasm };
-                    if let Some(v) = m {
-                        self.control(v);
+                    match m {
+                        Some(Opened::Control(v)) => self.control(v),
+                        Some(Opened::Pane(stream, bytes)) => self.pane_data(stream, &bytes),
+                        None => {}
                     }
                 }
             },
@@ -1202,9 +1306,11 @@ impl Machine {
                 mut reasm,
                 code,
             } => match open(&mut s, &mut reasm, p) {
-                Err(()) => self.fail_pairing("failed", "the pairing session failed"),
+                Err(()) | Ok(Some(Opened::Pane(..))) => {
+                    self.fail_pairing("failed", "the pairing session failed")
+                }
                 Ok(None) => up.sess = Sess::Pair { s, reasm, code },
-                Ok(Some(v)) => {
+                Ok(Some(Opened::Control(v))) => {
                     up.sess = Sess::Pair {
                         s,
                         reasm,
@@ -1337,6 +1443,7 @@ impl Machine {
             match ev {
                 "mailbox_key" => return self.mailbox_keyed(&v),
                 "hello" | "pair" => return,
+                "pane" if v["type"] == "closed" => return self.pane_closed(v),
                 "changed" => {
                     let rev = v["rev"].as_str().map(str::to_string);
                     if rev.is_some() && rev == self.last_rev {
@@ -1376,8 +1483,12 @@ impl Machine {
             .as_ref()
             .is_some_and(|r| r.outbox.get(rid).is_some());
         if !in_outbox {
+            let page = self.owed.remove(rid);
+            if let Some(stream) = self.pane_opening.remove(rid) {
+                self.pane_opened(stream, &v, page.is_some());
+            }
             // A look-up, or an answer for an id already answered (dropped).
-            if let Some(Owed::Page(pid)) = self.owed.remove(rid) {
+            if let Some(Owed::Page(pid)) = page {
                 if self.signal_pending && v.get("ok").is_some() {
                     self.signal_pending = false;
                     self.send_text(|n| ToRelay::AckSignal { n });
@@ -1598,6 +1709,9 @@ impl Machine {
         let Ok(v) = serde_json::from_str::<Value>(text) else {
             return;
         };
+        if v["pane"].is_string() {
+            return self.pane_message(&v);
+        }
         if let Some(app) = v["app"].as_str() {
             return match app {
                 "ready" => self.page_ready(),
@@ -1637,6 +1751,19 @@ impl Machine {
     fn page_ready(&mut self) {
         // A new page: its numbers mean nothing to the old one's requests.
         self.owed.clear();
+        // Nor its panes: the old page's streams are closed (a `pane.open`
+        // of the same stream waits for the host's `closed`).
+        self.pane_held.clear();
+        let mut open = Vec::new();
+        for (stream, p) in self.panes.iter_mut() {
+            if *p == Pane::Open {
+                open.push(*stream);
+            }
+            *p = Pane::Closing { tell_page: false };
+        }
+        for stream in open {
+            self.send_json(&json!({"event": "pane", "stream": stream, "type": "close"}));
+        }
         self.emit_conn(true);
         if let Some(p) = self.pairing_event.clone() {
             self.send_page(p);
@@ -1668,8 +1795,18 @@ impl Machine {
                 let (c, m) = self.no_session_error();
                 return self.send_page(page_error(&pid, c, m));
             }
+            let pane = (op == "pane.open").then(|| pane_stream(&args)).flatten();
+            if let Some(stream) = pane {
+                if self.panes.get(&stream) == Some(&Pane::Closing { tell_page: false }) {
+                    // The old page's stream: opened once the host closed it.
+                    return self.pane_held.push((pid, args, stream));
+                }
+            }
             let rid = random_id();
             self.owed.insert(rid.clone(), Owed::Page(pid));
+            if let Some(stream) = pane {
+                self.pane_opening.insert(rid.clone(), stream);
+            }
             return self.send_json(&json!({"id": rid, "op": op, "args": args}));
         }
         if !live && !outbox::may_wait(op) {
@@ -1710,6 +1847,140 @@ impl Machine {
             self.send_page(page_error(&pid, "cancelled", "cancelled"));
         }
         self.emit_outbox();
+    }
+
+    // ---- panes ----
+
+    /// The answer to a `pane.open` the engine sent (`page`: the page that
+    /// asked is still there to hear it).
+    fn pane_opened(&mut self, stream: u8, v: &Value, page: bool) {
+        if v.get("ok").is_none() {
+            return;
+        }
+        let stream = v["ok"]["stream"]
+            .as_u64()
+            .and_then(|s| u8::try_from(s).ok())
+            .filter(|s| stream::is_pane(*s))
+            .unwrap_or(stream);
+        if page {
+            self.panes.insert(stream, Pane::Open);
+        } else {
+            // Opened for a page that has gone since: nobody shows it.
+            self.panes
+                .insert(stream, Pane::Closing { tell_page: false });
+            self.send_json(&json!({"event": "pane", "stream": stream, "type": "close"}));
+        }
+    }
+
+    /// A pane frame from the host: one `data` message per frame, so the
+    /// page counts frames by messages. A frame for a stream that isn't
+    /// open (output after the device closed it) is discarded.
+    fn pane_data(&mut self, stream: u8, bytes: &[u8]) {
+        if self.panes.get(&stream) != Some(&Pane::Open) {
+            return;
+        }
+        self.send_page(json!({
+            "event": "pane", "stream": stream, "type": "data",
+            "b": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }));
+    }
+
+    /// The host's `closed` for a stream: to the page (unless the page that
+    /// knew it is gone), and a held `pane.open` of that stream goes now.
+    fn pane_closed(&mut self, v: Value) {
+        let Some(stream) = pane_stream(&v) else {
+            return;
+        };
+        let was = self.panes.remove(&stream);
+        if was != Some(Pane::Closing { tell_page: false }) {
+            self.send_page(v);
+        }
+        let held: Vec<(Value, Value, u8)> = std::mem::take(&mut self.pane_held);
+        for (pid, args, s) in held {
+            if s == stream {
+                self.request(pid, "pane.open", args);
+            } else {
+                self.pane_held.push((pid, args, s));
+            }
+        }
+    }
+
+    /// `{"pane": "input"|"resize"|"ack"|"close", "stream", …}` from the
+    /// page: data frames (input) or events on the control stream (no op,
+    /// so no rate limit). Dropped without a live session or for a stream
+    /// that isn't open: the page hears `closed` for every stream it had.
+    fn pane_message(&mut self, v: &Value) {
+        let Some(stream) = pane_stream(v) else { return };
+        if !self.live() || self.panes.get(&stream) != Some(&Pane::Open) {
+            return;
+        }
+        let ev = |t: &str| json!({"event": "pane", "stream": stream, "type": t});
+        match v["pane"].as_str().unwrap_or("") {
+            "input" => {
+                let Some(bytes) = v["b"]
+                    .as_str()
+                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                else {
+                    return;
+                };
+                self.pane_input(stream, &bytes);
+            }
+            "resize" => {
+                let (Some(cols), Some(rows)) = (v["cols"].as_u64(), v["rows"].as_u64()) else {
+                    return;
+                };
+                let mut e = ev("resize");
+                e["cols"] = json!(cols);
+                e["rows"] = json!(rows);
+                self.send_json(&e);
+            }
+            "ack" => {
+                let (Some(bytes), Some(frames)) = (v["bytes"].as_u64(), v["frames"].as_u64())
+                else {
+                    return;
+                };
+                let mut e = ev("ack");
+                e["bytes"] = json!(bytes);
+                e["frames"] = json!(frames);
+                self.send_json(&e);
+            }
+            "close" => {
+                self.panes.insert(stream, Pane::Closing { tell_page: true });
+                self.send_json(&ev("close"));
+            }
+            _ => {}
+        }
+    }
+
+    /// Input as data frames of at most [`stream::CHUNK`] bytes each; the
+    /// input-stall rule starts watching the link.
+    fn pane_input(&mut self, stream: u8, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut sealed = Vec::new();
+        {
+            let Some(up) = self.up() else { return };
+            let Sess::Live { s, .. } = &mut up.sess else {
+                return;
+            };
+            for chunk in bytes.chunks(stream::CHUNK) {
+                let Ok(f) = stream::pane_frame(stream, chunk) else {
+                    return;
+                };
+                match s.encrypt(&f) {
+                    Ok(w) => sealed.push(w),
+                    Err(_) => return self.poisoned(),
+                }
+            }
+        }
+        let mono = self.now.mono;
+        if let Some(up) = self.up() {
+            up.input_at.get_or_insert(mono);
+        }
+        for w in sealed {
+            self.send_live_raw(w);
+        }
     }
 
     // ---- pairing ----
@@ -2169,6 +2440,7 @@ impl Machine {
 
     fn tick(&mut self) {
         let now = self.now;
+        let stall = self.tuning.stall_ms;
         if let Some(prev) = self.last_tick {
             let dm = now.mono.saturating_sub(prev.mono);
             let dw = now.wall as i128 - prev.wall as i128;
@@ -2200,12 +2472,21 @@ impl Machine {
             }
         }
         let mut give_up = false;
+        let mut stalled = false;
         let mut hs_failed = false;
         let mut ping = None;
         if let Link::Up(up) = &mut self.link {
             if mono.saturating_sub(up.last_rx) >= self.tuning.silence_ms {
                 give_up = true;
+            } else if up.stall_ping.is_some_and(|p| mono >= p + stall) {
+                // Input, a ping, and nothing heard: the link is dead.
+                stalled = true;
             } else {
+                if up.stall_ping.is_none() && up.input_at.is_some_and(|t| mono >= t + stall) {
+                    up.stall_ping = Some(mono);
+                    up.last_ping = mono;
+                    ping = Some(up.id);
+                }
                 if mono.saturating_sub(up.since) >= STABLE_MS && !self.replaced {
                     self.attempt = 0;
                 }
@@ -2233,6 +2514,9 @@ impl Machine {
         if give_up {
             self.drop_link(1000);
             self.schedule_backoff();
+        } else if stalled {
+            self.drop_link(1000);
+            self.dial_now();
         } else if hs_failed {
             self.handshake_failed();
         }
@@ -2307,15 +2591,27 @@ impl Machine {
     }
 }
 
-/// Decrypt a live frame and reassemble: a whole control message, nothing
-/// yet, or an error (a decrypt failure, a non-control stream, not JSON).
-fn open(s: &mut Session, reasm: &mut Reassembler, p: &[u8]) -> Result<Option<Value>, ()> {
+/// Decrypt a live frame and reassemble: a whole control message, a pane
+/// frame, nothing yet, or an error (a decrypt failure, a reserved stream,
+/// "more" on a pane stream, not JSON).
+fn open(s: &mut Session, reasm: &mut Reassembler, p: &[u8]) -> Result<Option<Opened>, ()> {
     let plain = s.decrypt(p).map_err(|_| ())?;
     match reasm.push(&plain).map_err(|_| ())? {
         None => Ok(None),
+        Some(m) if stream::is_pane(m.stream) => Ok(Some(Opened::Pane(m.stream, m.body))),
         Some(m) if m.stream != CONTROL => Err(()),
-        Some(m) => serde_json::from_slice(&m.body).map(Some).map_err(|_| ()),
+        Some(m) => serde_json::from_slice(&m.body)
+            .map(|v| Some(Opened::Control(v)))
+            .map_err(|_| ()),
     }
+}
+
+/// A message's `stream`, when it is a pane stream.
+fn pane_stream(v: &Value) -> Option<u8> {
+    v["stream"]
+        .as_u64()
+        .and_then(|s| u8::try_from(s).ok())
+        .filter(|s| stream::is_pane(*s))
 }
 
 fn clip(name: &str) -> String {

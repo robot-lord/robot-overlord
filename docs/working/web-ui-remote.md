@@ -5648,3 +5648,45 @@ this fills in what they left open.
 - `tmux::view_command(target, view, read_only)` attaches with `-f
   ignore-size` (and `read-only` for a view-only device).
 - `plugin::WEB_PROTOCOL` 5; `web::API` 2.
+
+#### Step 5 (engine)
+
+Built on `s5/engine` (Opus, 2026-11-24), against the contract above.
+
+- **Machine** (`crates/e2e-client/src/machine`): pane passthrough as
+  the contract says (page `{"pane":…}` to data frames and `pane` events,
+  input split at 16 382 bytes; host frames to one `data` message each,
+  standard base64; the host's `closed` passed on; `closed` `link` for
+  every open stream when the session ends, on every path that ends it).
+  A stream is open from `pane.open`'s `ok`; frames and input for any
+  other stream are dropped. The input-stall rule (`Tuning::stall_ms`,
+  5 s). API 2 only. `pane.open` and `pane.take` are look-ups (never kept;
+  `disconnected`/`host_offline` without a session); `overlord.messages`
+  left the look-ups; only `overlord.new_session` may wait.
+- **Device**: `Phone` pane helpers (`pane_open`, `pane_take`,
+  `pane_input`, `pane_resize`, `pane_ack`, `pane_ack_all`, `pane_close`,
+  `pane`, `pane_until`, `pane_text`, `pane_closed`; `PaneLog` per
+  stream since its last open). `rlord-device bridge` already passed
+  every message on (now tested); it also serves the shell's `copy` and
+  `paste` with an in-memory clipboard, so the page's Paste key works
+  under `app dev` and `test-e2e`.
+- Proved: 68 engine unit tests (the plan's names, but
+  `the_wanted_pane_follows_hello`, step 9's optional shortcut, not
+  built), plus `a_session_ending_any_way_closes_its_panes`,
+  `a_reloaded_page_closes_the_old_panes`,
+  `the_hello_carries_panes_and_input`. FFI and Swift unchanged.
+- Beyond the contract: a page that reloads (`ready`, e.g. WKWebView's
+  content process killed) loses its streams; the engine closes them at
+  the host and drops their output, and the new page's `pane.open` of a
+  stream id still closing waits for the host's `closed` (else
+  `bad_request` from the host). The outbox's `text` item falls back to
+  `args.description`, so a waiting new session shows its description.
+- Kept: the 24-hour expiry, now for a waiting new session (removing it
+  would leave one waiting forever or ending after 2 minutes).
+- Expected failures on this branch alone (host still at api 1): every
+  engine-driven test in `crates/web/tests/{engine,engine_surface,
+  hostile}.rs` (never `live`), and
+  `the_engines_lookups_are_the_daemons_idempotent_ops` until the daemon
+  marks `pane.open`/`pane.take` idempotent and drops `overlord.messages`.
+- Owed: `e2e-protocol.md` §3 "Requests by mailbox" still names
+  `overlord.ask` (host part); the general answer watchdog stays owed.

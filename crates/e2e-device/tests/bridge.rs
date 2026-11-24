@@ -78,6 +78,23 @@ async fn plays_the_shell_and_carries_the_engine() {
     send(&mut ws, json!({"id": 7, "op": "snapshot", "args": {}})).await;
     let r = next(&mut ws, |v| v["id"] == 7).await;
     assert!(r["error"].is_object(), "{r}");
+    // A pane's open reaches the engine too (no host: refused at once).
+    send(
+        &mut ws,
+        json!({"id": 8, "op": "pane.open",
+               "args": {"stream": 1, "target": "overlord", "cols": 54, "rows": 20}}),
+    )
+    .await;
+    let r = next(&mut ws, |v| v["id"] == 8).await;
+    assert_eq!(r["error"]["code"], "disconnected", "{r}");
+    // The pasteboard: what the page copied, pasted back.
+    send(&mut ws, json!({"app": "paste"})).await;
+    let p = next(&mut ws, |v| v["event"] == "paste").await;
+    assert_eq!(p["text"], "");
+    send(&mut ws, json!({"app": "copy", "text": "a line"})).await;
+    send(&mut ws, json!({"app": "paste"})).await;
+    let p = next(&mut ws, |v| v["event"] == "paste").await;
+    assert_eq!(p["text"], "a line");
     // Scan: the bridge asks whoever runs it.
     send(&mut ws, json!({"app": "scan"})).await;
     let ev = loop {
