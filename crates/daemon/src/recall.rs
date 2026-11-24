@@ -595,6 +595,7 @@ fn restore(
         // and the DB agree. (With no old conversation to go back to, a
         // restart would only start another new one: the pane is left
         // as it is.)
+        overlord::refresh_if_overlord(db, cfg, &o.id)?;
         crate::methods::session_restart(db, &json!({"ref": o.id}))?;
     } else if !was_running && up {
         crate::methods::session_stop(db, &json!({"ref": o.id}))?;

@@ -781,6 +781,17 @@ fn ensure_running(db: &Db, cfg: &Config, cur: Option<Session>, params: &Value) -
     }
 }
 
+/// Before any restart of session `id`: if it is an overlord, rewrite its
+/// folder and launch flags (`refresh_launch`), so a restart from the list,
+/// the CLI or a Remote Control toggle starts it with the current MCP
+/// server and instructions, as `ensure` does. Other sessions: nothing.
+pub fn refresh_if_overlord(db: &Db, cfg: &Config, id: &str) -> Result<()> {
+    match db.resolve_ref(id) {
+        Ok(s) if is_overlord_role(&s.role) => refresh_launch(db, cfg, &s),
+        _ => Ok(()),
+    }
+}
+
 /// Rewrite the overlord's folder and put the current adapter flags in its
 /// launch spec: its next start (a restart, a fresh conversation) has them.
 fn refresh_launch(db: &Db, cfg: &Config, s: &Session) -> Result<()> {
@@ -1619,6 +1630,33 @@ mod tests {
             role: ROLE,
         })
         .unwrap();
+    }
+
+    /// A restart from outside `ensure` (the list, the CLI, a Remote Control
+    /// toggle) still starts an overlord with its folder rewritten: a stale
+    /// `mcp.json` without `--overlord` would leave it read-only.
+    #[test]
+    fn a_restart_refreshes_an_overlords_folder_only() {
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let od = tmp.path().join("o");
+        let wd = tmp.path().join("w");
+        std::fs::create_dir_all(&od).unwrap();
+        std::fs::create_dir_all(&wd).unwrap();
+        let stale = r#"{"mcpServers":{"rlord":{"command":"rlord","args":["mcp"]}}}"#;
+        std::fs::write(od.join("mcp.json"), stale).unwrap();
+        std::fs::write(wd.join("mcp.json"), stale).unwrap();
+        overlord_row(&db, "01o", "claude", TMUX_NAME, &od.to_string_lossy(), 10);
+        row(&db, "01w", "worker", "w", &wd.to_string_lossy());
+        let cfg = Config::default();
+        refresh_if_overlord(&db, &cfg, "01o").unwrap();
+        refresh_if_overlord(&db, &cfg, "01w").unwrap();
+        let mcp: Value =
+            serde_json::from_str(&std::fs::read_to_string(od.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(mcp["mcpServers"]["rlord"]["args"][1], "--overlord");
+        let spec: Value = serde_json::from_str(&db.launch_spec("01o").unwrap()).unwrap();
+        assert!(spec["extra_args"].is_array());
+        assert_eq!(std::fs::read_to_string(wd.join("mcp.json")).unwrap(), stale);
     }
 
     /// One overlord per agent, exactly one active: the one row of an older

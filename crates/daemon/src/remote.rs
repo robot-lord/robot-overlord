@@ -404,7 +404,10 @@ fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
     // (Where the agent's command is: asked before the DB lock is taken.)
     rlord_core::agents::install::warm();
     let hooks = d.restart_hooks(id);
-    methods::session_restart(&d.db(), &json!({"ref": id, "hooks_work": hooks}))?;
+    let db = d.db();
+    overlord::refresh_if_overlord(&db, &d.config(), id)?;
+    methods::session_restart(&db, &json!({"ref": id, "hooks_work": hooks}))?;
+    drop(db);
     d.changed();
     Ok(true)
 }
