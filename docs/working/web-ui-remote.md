@@ -1406,6 +1406,104 @@ Decided 2026-11-17 (user):
       them, timed out at the pairing step; the bridge's messages were
       lost and it didn't happen again under CPU load. The step now fails
       at once with the pairing's reason, so the next one says why.
+  - Steps 2 and 3 done (the engine; agent branch `slice4-engine`, merged
+    here): `crates/e2e-client` (`machine`, `driver`, `outbox`, `store`,
+    `link`, `soft`, `Engine`), `rlord-device` on it
+    (`crates/e2e-device/src/phone.rs` wraps it for tests),
+    `testing::Tamper` (a relay that holds the pinned key and forwards to
+    the real one) and `Flaky`, `crates/web/tests/engine.rs` and
+    `hostile.rs` (the owed hostile cases end to end). `check-deps`: the
+    engine's tree names no rlord and no relay, and rlord never names the
+    engine.
+  - Finishing pass (lead, 2026-11-23; `feature/web` with main 1.15.3
+    merged in, version 1.16.0-dev.2, local commits only, nothing pushed
+    or released):
+    - `crates/e2e-ffi` wraps the real engine (the stand-in is gone):
+      adapters for `Signers`, `Vault` (`unseal` is the engine's `open`)
+      and `Listener`; `BackgroundResult` names its outcome
+      (`not_paired`, `nothing_new`, `host_offline`, `refreshed`,
+      `failed`). The shell's scene-phase handler runs for the initial
+      phase too, so the engine (which starts as if in the background)
+      hears `lifecycle(true)` at launch.
+    - The phone-surface tests through the engine (agent branch
+      `s4-enginetests`): `crates/web/tests/engine_surface.rs` (a phone
+      leaves by itself, a `ui` command live, parked then pulled with the
+      relay's signal, the phone the target after it sent a form, the
+      engine's look-ups are the daemon's idempotent ops); the low-level
+      `remote_surface.rs` is gone. Found: the engine kept `page.report`
+      in its outbox (saved, resent for 2 minutes, which could resend a
+      stale `input: true`); it is a look-up now.
+    - Supervisor bug (agent branch `s4-supervisor`): after `web().stop()`
+      the dead plugin's `web.subscribe` stream still counted, because the
+      daemon only noticed a closed stream on its next write, so a relay
+      command right after a stop or restart went to the dead stream
+      ("rlord-web didn't answer within 10 s", from `relay.rs`). The push
+      loop now reads the client's end and ends at EOF; the stream count
+      lives in the supervisor; `stop()` returns once the plugin is reaped
+      and its stream closed (at most 1 s more), and its SIGKILL path
+      loops until reaped. Tests in `web_supervise.rs` and `remote.rs`;
+      the 500 ms sleep in `engine.rs` is gone.
+    - `hostile.rs` `two_devices_frames_swapped` was flaky (about half the
+      runs): passed on as they came, the host could drop the second link
+      for the first swapped frame before the relay forwarded the second.
+      The filter now holds the first until the other's arrives.
+    - iOS tests (`cargo xtask app test-ios`, simulator): XCTest
+      `LivePageTests` loads the real phone page through the scheme
+      handler and content rules and checks from inside that `fetch` (off
+      and on the page's scheme), a websocket and `innerHTML` are refused;
+      `BackgroundTests` (an unpaired engine's check through the FFI, the
+      notification's text); XCUITest `PairAndAskUITests` against the
+      loopback stack (debug launch arguments `-rlordReset YES -rlordQR
+      … -appLock NO`): pair, the fixture list, home and back, the relay
+      restarted through the stack's control folder, then an ask answered
+      by the fake overlord in the chat. The simulator's test runner
+      writes the Mac's control folder directly.
+    - Step 11: the shell is one shared instance (`Shell.shared`), so the
+      OS's background launch runs the same engine as the window; the
+      `.appRefresh` task calls `background_check` (20 s budget), logs the
+      outcome and asks for the next refresh, as does every trip to the
+      background; `notify` posts a count, never names, only when the
+      user turned notifications on. A real refresh can only be checked
+      on a phone (by hand).
+    - Docs: `docs/architecture.md` "The phone app" (and the hello's
+      mailbox), `docs/guide.md` "The phone app" (with the by-hand
+      install), `SECURITY.md`, `CONTRIBUTING.md` "The phone app",
+      `CLAUDE.md` (the app's network rule, how a page feature reaches the
+      phone, the `api` level), `docs/relay.md` (public certificates
+      only), `e2e-protocol.md` §4's device side as built,
+      `e2e-crypto.md`'s phone row and answer 3.
+- Owed after slice 4 (the branch stays dark: local builds only):
+  - **Android** (steps 12 and 13): the SDK and NDK, `install-tools
+    --app`, `app core-android`, the Gradle project, the asset loader and
+    WebView settings, the message listener, Keystore `Signer` and
+    `Vault`, CameraX with ZXing, lifecycle and the network callback, app
+    lock, WorkManager, `app android`, `app test-android`, the Android
+    gates of step 1 (a)–(e). Kotlin bindings are generated only once
+    `apps/android` exists.
+  - **No answer watchdog on a live session** (engine-agent finding): a
+    request whose frame the host never got (a link dropped under it,
+    say) waits until the next reconnect; the engine doesn't time it out
+    or resend on the same session. Recorded, not built.
+  - **By hand on the user's iPhone** (the install is in the guide):
+    enclave key creation and signing accepted by a real relay; wifi to
+    cellular and back; airplane mode; a long lock; the app killed
+    mid-ask; a background refresh producing a notification (and a
+    background launch with the app not running); app lock; revoke from
+    the host while the app is open and while it is closed; the
+    handshake's and first snapshot's time on cellular, with real
+    snapshot sizes (owed to the compression question); the phone CSS in
+    WKWebView (keyboard, viewport, scrolling).
+  - `app test-e2e`: 2 of about 25 runs in the agent's worktree timed out
+    at pairing while other builds ran beside it, cause not found; the
+    step now fails at once with the pairing's reason. Its first run
+    under xtask on Linux is CI's first `web` job on this branch.
+  - The page: no DOM tests (no jsdom dependency was added); the
+    pairing, status and chat views are tested through their state and
+    event sequences only.
+  - Relays behind a private CA can't be reached from the phone (open
+    question 15, deferred).
+  - The protocol review before the final merge to `main` (slice 3
+    answer 8), and the push slice with the hosted relay.
 - Owed from merging main 1.15.3 into `feature/web` (1.16.0-dev.1):
   - The attention queue (main's `attention.rs`) counts only terminals as
     "looking": `tmux::list_clients` leaves web views out, so a session
