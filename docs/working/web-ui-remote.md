@@ -1339,6 +1339,73 @@ Decided 2026-11-17 (user):
     refused frame, or marks one `queued`, that was sealed under a
     mailbox it has since discarded: the request goes again under the
     new one.
+  - Step 7 done (agent branch `s4-bridge`): the phone page without a
+    phone.
+    - `rlord-device bridge --state DIR [--port N] [--ca FILE] [--qr
+      RLORD1:…] [--name NAME] [--origin ORIGIN]…`
+      (`crates/e2e-device/src/bridge.rs`): the engine with software keys
+      behind a websocket on 127.0.0.1 that plays the shell. Each text
+      message from the page goes to `Engine::page_message`, but `scan`
+      and `settings`, which the bridge serves as the shell does
+      (`settings` answers `{"event":"settings","app_lock","notifications",
+      "platform":"bridge"}`, kept in memory; `scan` says `{"event":"scan"}`
+      on stdout for whoever runs it to answer with `qr …` on stdin); each
+      `to_page` goes back as a text message. Foreground while a page is
+      connected; one page at a time (a new one replaces the last). A
+      connection naming an `Origin` is refused unless given with
+      `--origin` (another site open in the same browser can't reach the
+      engine); Node sends none. Stdout: `ready` (URL, port), `page`,
+      `scan`, `notify`; stdin `qr …`, `network up|down`, `quit` (and its
+      end).
+    - The dev page: `app-dev.html` + `src/appDev.ts` + `src/devBridge.ts`
+      (`installDevBridge`: `webkit.messageHandlers.rlord.postMessage` is
+      `ws.send`, each message calls `__rlord_recv`, so `findBridge` and
+      `RemoteTransport` run unchanged), built by `vite build --mode
+      app-dev` into `dist-app-dev/` (git-ignored) with
+      `VITE_RLORD_BRIDGE_PORT`. Its CSP is the phone page's but
+      `connect-src ws://127.0.0.1:<port>` (`web_app::check_dev`). The
+      phone bundle can't carry it: `app.tsx` never imports it, and
+      `check-app` fails on its marker (`rlord-dev-bridge`), `WebSocket`
+      or any `ws://`; the local page's check fails on the marker too.
+    - `remote_stack` gains a fake overlord (tmux needed): the overlord row
+      is the example itself in a pane of the scratch tmux server, so
+      `overlord.ask` types into it as into a real one, and it writes each
+      line and an answer into a Claude transcript `overlord.messages`
+      reads. `claude`, `codex` and `opencode` on its PATH are the
+      example too (with `RLORD_NO_LOGIN_SHELL`), so a restart from the
+      page can't start a real agent. `pair` hands out the code only once
+      the plugin is linked to the relay (earlier, the device's pairing
+      found the rendezvous closed). A `.cmd` file's `.done` holds the
+      event the command said. The scratch tmux server and its socket file
+      go at quit.
+    - `cargo xtask app dev [--port N]` (`xtask/src/app_dev.rs`): the
+      stack, the bridge paired by the stack's code, the dev page built and
+      checked, `vite build --watch` and `vite preview` on 127.0.0.1;
+      prints the URL; stdin takes `pair`, `restart-relay`, `stop-plugin`,
+      `start-plugin`, `status`, `network up|down`, `quit`; the page's Scan
+      gets a fresh code. Checked in a headless Chromium: pairs, lists,
+      the overlord's chat, and a `fetch` is blocked by the CSP.
+    - `cargo xtask app test-e2e`: the stack (fails without its fake
+      overlord), the bridge with the stack's code, then
+      `vitest.app-e2e.config.ts` (`test/app-e2e/phone.test.ts`, not in
+      `npm test`) with `RLORD_BRIDGE_URL` and `RLORD_STACK_CONTROL`: the
+      page's own `Store`, `Phone` and `wirePhone` in Node over the dev
+      bridge and Node's WebSocket. Steps: pair (scanned, continue, the
+      code, confirmed by the stack, live, the host lists the device);
+      list (fixture rows, no `relay` section, `session.messages`, the
+      bridge's `settings`); ask (`sent`, then the fake overlord's answer
+      in `overlord.messages`); the relay restarted (a new hello, a
+      request); the plugin stopped (`host_offline`, an ask waits in the
+      outbox) and started (a new hello, the ask answered once, the outbox
+      empty); unpair (`unpaired`, the host drops the device). After a
+      failed step the rest are skipped. No Xcode, no `DEVELOPER_DIR`.
+      CI's `web` job installs tmux and runs it. Run on macOS about 25
+      times and on Linux (Debian, Node 26, without xtask, whose build
+      needs more than Docker's 2 GB here) twice.
+    - Owed: 2 of those macOS runs, both while other builds ran beside
+      them, timed out at the pairing step; the bridge's messages were
+      lost and it didn't happen again under CPU load. The step now fails
+      at once with the pairing's reason, so the next one says why.
 - Owed from merging main 1.15.3 into `feature/web` (1.16.0-dev.1):
   - The attention queue (main's `attention.rs`) counts only terminals as
     "looking": `tmux::list_clients` leaves web views out, so a session

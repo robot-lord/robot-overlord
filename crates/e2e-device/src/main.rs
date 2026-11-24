@@ -8,6 +8,11 @@
 //!   for me?": no handshake when nothing waits)
 //! - `rlord-device snapshot --state DIR`
 //! - `rlord-device ask <text> --state DIR`
+//! - `rlord-device bridge --state DIR [--port N] [--ca FILE] [--qr RLORD1:…]
+//!   [--name NAME] [--origin ORIGIN]…`: the engine behind a loopback
+//!   websocket that plays the phone shell's message bridge, for the phone
+//!   page in a desktop browser or in Node (`cargo xtask app dev`, `app
+//!   test-e2e`; see `bridge.rs`)
 //! - `rlord-device interop-host`: a native host core on stdin/stdout, one
 //!   JSON object per line, for the WASM interop test (`cargo xtask e2e
 //!   test-wasm`): it prints a QR, answers a pairing and a reconnect, and
@@ -24,7 +29,8 @@ use rlord_e2e_device::{b64, unb64, Phone};
 
 const USAGE: &str = "usage: rlord-device pair <RLORD1:…> --state DIR [--name NAME]
        rlord-device check|snapshot --state DIR
-       rlord-device ask <text> --state DIR";
+       rlord-device ask <text> --state DIR
+       rlord-device bridge --state DIR [--port N] [--ca FILE] [--qr RLORD1:…] [--name NAME] [--origin ORIGIN]…";
 
 fn main() {
     let rt = tokio::runtime::Runtime::new().expect("a runtime");
@@ -86,6 +92,9 @@ fn interop_host() -> Result<()> {
 async fn run(args: Vec<String>) -> Result<()> {
     if args.first().map(String::as_str) == Some("interop-host") {
         return interop_host();
+    }
+    if args.first().map(String::as_str) == Some("bridge") {
+        return rlord_e2e_device::bridge::run(&args[1..]).await;
     }
     let state = PathBuf::from(flag(&args, "--state").context(USAGE)?);
     let mut phone = Phone::open(&state)?;

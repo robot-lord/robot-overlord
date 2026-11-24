@@ -610,7 +610,8 @@ export interface SettingsEvent {
   event: "settings";
   app_lock: boolean;
   notifications: boolean;
-  platform: "ios" | "android";
+  /** (`bridge`: `rlord-device bridge`, the desktop stand-in for development.) */
+  platform: "ios" | "android" | "bridge";
 }
 
 /** What the native side sends the page beyond the control socket's messages. */
