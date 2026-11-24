@@ -93,12 +93,35 @@ pub async fn world(n: usize) -> World {
 }
 
 pub async fn world_with(n: usize, f: impl FnOnce(&mut rlord_relay::Config)) -> World {
+    world_inner(n, false, f).await
+}
+
+/// The tmux session of `world_panes`'s session `alpha`.
+pub const PANE_TMUX: &str = "wp_alpha";
+
+/// The "agent" in `alpha`'s pane: echoes each line, floods on `flood N`.
+pub const PANE_AGENT: &str = r#"exec bash -c 'echo agent-ready; while :; do IFS= read -r l || continue; case $l in flood*) yes "flood line 0123456789 abcdefghijklmnopqrstuvwxyz" | head -c ${l#flood } ; echo FLOOD-DONE;; *) echo "got:$l";; esac; done'"#;
+
+/// `world(1)` plus a session `alpha` running `PANE_AGENT` on this test
+/// binary's scratch tmux server (gated: `RLORD_TMUX_TESTS=1`).
+pub async fn world_panes() -> World {
+    world_inner(1, true, |_| {}).await
+}
+
+async fn world_inner(n: usize, panes: bool, f: impl FnOnce(&mut rlord_relay::Config)) -> World {
     let name = env!("CARGO_CRATE_NAME");
     env_once(name, &format!("rlord-test-{name}"));
+    if panes {
+        let _ = rlord_core::tmux::command().arg("kill-server").output();
+        rlord_core::tmux::new_session(PANE_TMUX, "/tmp", PANE_AGENT).unwrap();
+    }
     let rig = tokio::task::spawn_blocking(move || {
         Rig::start(move |db| {
             for i in 0..n {
                 add(db, &format!("session-{i:04}"), None);
+            }
+            if panes {
+                add(db, "alpha", Some(PANE_TMUX));
             }
         })
     })

@@ -713,3 +713,191 @@ async fn old_mailbox_frames_replayed_to_the_device() {
     phone.engine.network(true);
     keyed(&id, 2).await;
 }
+
+// ---- panes (gated: RLORD_TMUX_TESTS=1; the agent is `world::PANE_AGENT`) ----
+
+fn tmux_gated() -> bool {
+    std::env::var("RLORD_TMUX_TESTS").as_deref() == Ok("1")
+}
+
+/// What `alpha`'s pane shows now, by tmux (not through the device).
+fn alpha_screen() -> String {
+    let out = rlord_core::tmux::command()
+        .args([
+            "capture-pane",
+            "-p",
+            "-S",
+            "-200",
+            "-t",
+            &format!("={PANE_TMUX}:"),
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A phone with `alpha`'s pane open on stream 1 (it holds it).
+async fn pane_phone(name: &str) -> (rlord_e2e_device::Phone, tempfile::TempDir) {
+    let (mut phone, dir) = pair(name).await;
+    let a = phone.pane_open(1, "alpha", 54, 20, WAIT).await.unwrap();
+    assert_eq!(a["ok"]["control"], true, "{a}");
+    phone.pane_text(1, "agent-ready", WAIT).await.unwrap();
+    phone.pane_ack_all(1);
+    (phone, dir)
+}
+
+/// A filter that does `f` once to the next live frame a device sends.
+fn next_device_live(
+    f: impl Fn(Message) -> Vec<Message> + Send + 'static,
+) -> (rlord_e2e_device::testing::Filter, Arc<AtomicBool>) {
+    let done = Arc::new(AtomicBool::new(false));
+    let d2 = done.clone();
+    let filter: rlord_e2e_device::testing::Filter = Box::new(move |p, dir, m| {
+        if p.role == Role::Device && dir == Dir::Up && !d2.load(Ordering::SeqCst) {
+            if let Message::Binary(b) = &m {
+                if matches!(FromDevice::decode(b), Ok(FromDevice::Live(_))) {
+                    d2.store(true, Ordering::SeqCst);
+                    return f(m);
+                }
+            }
+        }
+        vec![m]
+    });
+    (filter, done)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replayed_pane_frame_ends_the_session_and_types_nothing_twice() {
+    if !tmux_gated() {
+        return;
+    }
+    let _g = LOCK.lock().await;
+    let w = world_panes().await;
+    let (mut phone, _dir) = pane_phone("replay").await;
+    let (f, done) = next_device_live(|m| vec![m.clone(), m]);
+    w.tamper.set_filter(f);
+    phone.pane_input(1, b"only-once\r");
+    let t = Instant::now();
+    while !done.load(Ordering::SeqCst) {
+        assert!(t.elapsed() < WAIT);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The replay is a decrypt failure: the link is dropped, the pane with it.
+    phone.pane_closed(1, LONG).await.unwrap();
+    w.tamper.clear_filter();
+    phone.conn("live", LONG).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        alpha_screen().matches("got:only-once").count() <= 1,
+        "{}",
+        alpha_screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_or_reordered_pane_frame_never_reaches_the_pty_out_of_order() {
+    if !tmux_gated() {
+        return;
+    }
+    let _g = LOCK.lock().await;
+    let w = world_panes().await;
+    // Dropped: the frame after it can't be opened.
+    let (mut phone, _dir) = pane_phone("dropped").await;
+    let (f, _) = next_device_live(|_| vec![]);
+    w.tamper.set_filter(f);
+    phone.pane_input(1, b"lost-one\r");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    phone.pane_input(1, b"after-the-gap\r");
+    phone.pane_closed(1, LONG).await.unwrap();
+    w.tamper.clear_filter();
+    phone.conn("live", LONG).await.unwrap();
+    assert!(
+        !alpha_screen().contains("got:after-the-gap"),
+        "{}",
+        alpha_screen()
+    );
+    // Reordered: the second frame arrives first.
+    let a = phone.pane_open(1, "alpha", 54, 20, WAIT).await.unwrap();
+    assert!(a["ok"].is_object(), "{a}");
+    phone.pane_text(1, "agent-ready", WAIT).await.unwrap();
+    let held: Arc<Mutex<Option<Message>>> = Arc::default();
+    let h2 = held.clone();
+    let swapped = Arc::new(AtomicBool::new(false));
+    let s2 = swapped.clone();
+    w.tamper.set_filter(Box::new(move |p, dir, m| {
+        if p.role == Role::Device && dir == Dir::Up && !s2.load(Ordering::SeqCst) {
+            if let Message::Binary(b) = &m {
+                if matches!(FromDevice::decode(b), Ok(FromDevice::Live(_))) {
+                    let mut h = h2.lock().unwrap();
+                    return match h.take() {
+                        None => {
+                            *h = Some(m);
+                            vec![]
+                        }
+                        Some(first) => {
+                            s2.store(true, Ordering::SeqCst);
+                            vec![m, first]
+                        }
+                    };
+                }
+            }
+        }
+        vec![m]
+    }));
+    phone.pane_input(1, b"first\r");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    phone.pane_input(1, b"second\r");
+    phone.pane_closed(1, LONG).await.unwrap();
+    w.tamper.clear_filter();
+    let screen = alpha_screen();
+    let (first, second) = (screen.find("got:first"), screen.find("got:second"));
+    assert!(
+        second.is_none() || first.is_some_and(|f| f < second.unwrap()),
+        "{screen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_that_withholds_a_devices_acks_only_slows_that_pane() {
+    if !tmux_gated() {
+        return;
+    }
+    let _g = LOCK.lock().await;
+    let w = world_panes().await;
+    let (mut phone, _dir) = pane_phone("withheld").await;
+    // Everything the device sends is held for 2 s, then let through in
+    // order (the relay can't tell an ack from anything else).
+    let held: Arc<Mutex<(Vec<Message>, Option<Instant>)>> = Arc::default();
+    let h2 = held.clone();
+    w.tamper.set_filter(Box::new(move |p, dir, m| {
+        if p.role != Role::Device || dir != Dir::Up {
+            return vec![m];
+        }
+        let mut h = h2.lock().unwrap();
+        let since = *h.1.get_or_insert_with(Instant::now);
+        h.0.push(m);
+        if since.elapsed() > Duration::from_secs(2) {
+            h.1 = None;
+            return std::mem::take(&mut h.0);
+        }
+        vec![]
+    }));
+    phone.pane_input(1, b"flood 3000000\r");
+    // Ack as a page would; the acks arrive late, but the pane goes on.
+    let t = Instant::now();
+    loop {
+        phone.pane_ack_all(1);
+        let log = phone.pane(1);
+        if String::from_utf8_lossy(&log.bytes).contains("FLOOD-DONE") {
+            break;
+        }
+        assert!(log.closed.is_none(), "{:?}", log.closed);
+        assert!(
+            t.elapsed() < Duration::from_secs(90),
+            "the flood never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    w.tamper.clear_filter();
+    assert_eq!(phone.conn_state(), "live");
+}
