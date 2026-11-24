@@ -9,8 +9,10 @@ members = [
     "crates/e2e",
     "crates/e2e-wasm",
     "crates/relay-proto",
+    "crates/e2e-client",
     "crates/e2e-device",
     "crates/relay",
+    "crates/e2e-ffi",
     "xtask",
 ]
 # Plain `cargo build`/`cargo run`/`cargo test` at the root leave xtask and
@@ -19,7 +21,7 @@ members = [
 default-members = ["crates/core", "crates/daemon", "crates/tui", "crates/rlord"]
 
 [workspace.package]
-version = "1.16.0-dev.1"
+version = "1.16.0-dev.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/robot-lord/robot-overlord"

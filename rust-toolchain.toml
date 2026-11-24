@@ -8,5 +8,7 @@ profile = "minimal"
 components = ["rustfmt", "clippy"]
 # The release targets (xtask/src/version.rs): macOS on Apple Silicon, and
 # the static Linux builds cross-compiled with cargo-zigbuild; and wasm32 for
-# the end-to-end crypto core's WASM build (`cargo xtask e2e wasm`).
-targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "wasm32-unknown-unknown"]
+# the end-to-end crypto core's WASM build (`cargo xtask e2e wasm`); and the
+# phone app's device engine (`cargo xtask app core-ios`): iOS devices and
+# the Apple Silicon simulator. Android's target comes with its task.
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "wasm32-unknown-unknown", "aarch64-apple-ios", "aarch64-apple-ios-sim"]

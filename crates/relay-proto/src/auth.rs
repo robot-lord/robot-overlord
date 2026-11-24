@@ -92,6 +92,93 @@ pub fn verify(public: &[u8], msg: &[u8], sig: &[u8]) -> bool {
     vk.verify(msg, &sig).is_ok()
 }
 
+/// Something that signs as a relay identity: a software [`Identity`], or a
+/// platform key that never leaves its keystore (the phone's Secure Enclave
+/// or Android Keystore). ECDSA P-256 over SHA-256 of the message.
+pub trait TranscriptSigner {
+    /// SEC1 uncompressed public key.
+    fn public_key(&self) -> Vec<u8>;
+    /// A signature over `msg`: 64 bytes `r || s`, or ASN.1 DER (what a
+    /// platform keystore returns). High S is fine: the verifier takes it.
+    fn sign_message(&self, msg: &[u8]) -> std::result::Result<Vec<u8>, String>;
+}
+
+impl TranscriptSigner for Identity {
+    fn public_key(&self) -> Vec<u8> {
+        self.public().to_vec()
+    }
+
+    fn sign_message(&self, msg: &[u8]) -> std::result::Result<Vec<u8>, String> {
+        Ok(self.sign(msg).to_vec())
+    }
+}
+
+/// Signs `msg` with `signer` and returns the wire form (64 bytes `r || s`),
+/// converting DER and checking that the signature verifies under the
+/// signer's own public key (a keystore that signed with another key, or
+/// garbage, is an error here rather than a refusal at the relay).
+pub fn sign_with(signer: &dyn TranscriptSigner, msg: &[u8]) -> Result<[u8; SIG_LEN]> {
+    let raw = signer.sign_message(msg).map_err(|_| Error::Key)?;
+    let sig = raw_signature(&raw)?;
+    if !verify(&signer.public_key(), msg, &sig) {
+        return Err(Error::Key);
+    }
+    Ok(sig)
+}
+
+/// A P-256 signature as 64 bytes `r || s`: taken as is when it is 64
+/// bytes, else parsed as ASN.1 DER (`SEQUENCE { INTEGER r, INTEGER s }`).
+/// No low-S normalising.
+pub fn raw_signature(sig: &[u8]) -> Result<[u8; SIG_LEN]> {
+    if sig.len() == SIG_LEN {
+        return Ok(sig.try_into().expect("64 bytes"));
+    }
+    der_signature(sig).ok_or(Error::Key)
+}
+
+fn der_signature(der: &[u8]) -> Option<[u8; SIG_LEN]> {
+    // SEQUENCE, short-form length covering the rest exactly.
+    let (&tag, rest) = der.split_first()?;
+    let (&len, body) = rest.split_first()?;
+    if tag != 0x30 || len & 0x80 != 0 || len as usize != body.len() {
+        return None;
+    }
+    let (r, body) = der_integer(body)?;
+    let (s, body) = der_integer(body)?;
+    if !body.is_empty() {
+        return None;
+    }
+    let mut out = [0u8; SIG_LEN];
+    out[32 - r.len()..32].copy_from_slice(r);
+    out[64 - s.len()..].copy_from_slice(s);
+    Some(out)
+}
+
+/// One positive DER INTEGER of at most 32 bytes (its leading zero, if
+/// any, dropped); the rest of the input.
+fn der_integer(b: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (&tag, rest) = b.split_first()?;
+    let (&len, rest) = rest.split_first()?;
+    let len = len as usize;
+    if tag != 0x02 || len == 0 || len > 33 || rest.len() < len {
+        return None;
+    }
+    let (mut v, rest) = rest.split_at(len);
+    if v[0] & 0x80 != 0 {
+        return None; // negative
+    }
+    if v.len() > 1 && v[0] == 0 {
+        if v[1] & 0x80 == 0 {
+            return None; // not minimal
+        }
+        v = &v[1..];
+    }
+    if v.len() > 32 {
+        return None;
+    }
+    Some((v, rest))
+}
+
 fn transcript(label: &[u8], fields: &[&[u8]]) -> Vec<u8> {
     let mut t = Vec::with_capacity(label.len() + fields.iter().map(|f| 2 + f.len()).sum::<usize>());
     t.extend_from_slice(label);
@@ -173,6 +260,87 @@ mod tests {
         assert!(!verify(&[4; 65], b"hi", &sig));
         assert!(Identity::from_seed([0; 32]).is_none());
         assert!(Identity::from_bytes(&[1; 31]).is_err());
+    }
+
+    /// DER of `r || s` the way a keystore writes it.
+    fn to_der(sig: &[u8; 64]) -> Vec<u8> {
+        let int = |v: &[u8]| {
+            let mut v: Vec<u8> = v.iter().copied().skip_while(|&b| b == 0).collect();
+            if v.is_empty() || v[0] & 0x80 != 0 {
+                v.insert(0, 0);
+            }
+            let mut out = vec![0x02, v.len() as u8];
+            out.extend(v);
+            out
+        };
+        let mut body = int(&sig[..32]);
+        body.extend(int(&sig[32..]));
+        let mut out = vec![0x30, body.len() as u8];
+        out.extend(body);
+        out
+    }
+
+    struct Der(Identity);
+    impl TranscriptSigner for Der {
+        fn public_key(&self) -> Vec<u8> {
+            self.0.public().to_vec()
+        }
+        fn sign_message(&self, msg: &[u8]) -> std::result::Result<Vec<u8>, String> {
+            Ok(to_der(&self.0.sign(msg)))
+        }
+    }
+
+    struct Wrong(Identity, Identity);
+    impl TranscriptSigner for Wrong {
+        fn public_key(&self) -> Vec<u8> {
+            self.0.public().to_vec()
+        }
+        fn sign_message(&self, msg: &[u8]) -> std::result::Result<Vec<u8>, String> {
+            Ok(self.1.sign(msg).to_vec())
+        }
+    }
+
+    #[test]
+    fn a_signer_may_answer_in_der() {
+        let a = id(1);
+        let raw = sign_with(&a, b"t").unwrap();
+        assert!(verify(&a.public(), b"t", &raw));
+        let d = Der(id(1));
+        let s = sign_with(&d, b"t").unwrap();
+        assert!(verify(&a.public(), b"t", &s));
+        // Small r and s (leading zeros) round-trip.
+        let mut small = [0u8; 64];
+        small[31] = 5;
+        small[63] = 0x80;
+        assert_eq!(raw_signature(&to_der(&small)).unwrap(), small);
+        // A signature by another key, garbage, and non-minimal DER fail.
+        assert!(sign_with(&Wrong(id(1), id(2)), b"t").is_err());
+        assert!(raw_signature(&[1, 2, 3]).is_err());
+        assert!(raw_signature(&[0x30, 6, 2, 2, 0, 1, 2, 1, 1]).is_err());
+        assert!(raw_signature(&[0x30, 6, 2, 1, 0x80, 2, 1, 1]).is_err());
+    }
+
+    #[test]
+    fn a_high_s_signature_verifies_unchanged() {
+        // n - s for a valid signature is the other valid one (high S when
+        // s was low); the verifier takes both, and nothing normalises.
+        const N: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ];
+        let a = id(7);
+        let sig = a.sign(b"m");
+        let mut flipped = sig;
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let v = N[i] as i16 - sig[32 + i] as i16 - borrow;
+            borrow = (v < 0) as i16;
+            flipped[32 + i] = v.rem_euclid(256) as u8;
+        }
+        assert_ne!(flipped, sig);
+        assert!(verify(&a.public(), b"m", &flipped));
+        assert_eq!(raw_signature(&to_der(&flipped)).unwrap(), flipped);
     }
 
     #[test]

@@ -45,6 +45,10 @@ pub(crate) enum Next {
 /// Running requests' waiters, per (device, request id).
 pub(crate) type Waiting = HashMap<(String, String), Vec<Waiter>>;
 
+/// How long a device that asked to leave keeps its link for the answer
+/// to reach it (it closes the link itself once it has it).
+const LEAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl Actor {
     /// Look a request up in the device's store and say what to do. Records
     /// a new non-idempotent request as running; the caller saves the store
@@ -123,6 +127,9 @@ impl Actor {
                 let (d, tx) = (self.d.clone(), self.tx_clone());
                 let device = device.to_string();
                 tokio::spawn(async move {
+                    if let Some(ms) = slow_op(&op) {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
                     let r = d
                         .call(
                             "web.call",
@@ -135,6 +142,7 @@ impl Actor {
                     };
                     let _ = tx.send(Input::Done {
                         device,
+                        op,
                         key,
                         from,
                         answer,
@@ -145,11 +153,50 @@ impl Actor {
     }
 
     /// A daemon call finished: store the answer, and send it to everyone
-    /// waiting for it.
-    pub(crate) fn done(&mut self, device: &str, key: Option<String>, from: Waiter, answer: Value) {
+    /// waiting for it. A `device.leave` the daemon allowed then has the
+    /// device removed as `revoke` removes one, once its answer has had
+    /// time to reach it (`leave_due`): closing its link at once could lose
+    /// the answer at the relay.
+    pub(crate) fn done(
+        &mut self,
+        device: &str,
+        op: &str,
+        key: Option<String>,
+        from: Waiter,
+        answer: Value,
+    ) {
+        self.answer_waiters(device, key, from, &answer);
+        if op == "device.leave" && answer.get("ok").is_some() {
+            self.leaving
+                .entry(device.to_string())
+                .or_insert_with(std::time::Instant::now);
+        }
+    }
+
+    /// Remove the devices that asked to leave: `gone` (its link just
+    /// closed: it had the answer, or never will), and any whose answer has
+    /// had `LEAVE_GRACE`.
+    pub(crate) fn leave_due(&mut self, gone: Option<&str>) {
+        let now = std::time::Instant::now();
+        let due: Vec<String> = self
+            .leaving
+            .iter()
+            .filter(|(id, at)| Some(id.as_str()) == gone || now.duration_since(**at) >= LEAVE_GRACE)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            self.leaving.remove(&id);
+            if let Err(e) = self.revoke(&id, "left: unpaired on the device") {
+                eprintln!("rlord-web: device.leave: {e}");
+            }
+        }
+    }
+
+    /// Store a finished request's answer and send it to its waiters.
+    fn answer_waiters(&mut self, device: &str, key: Option<String>, from: Waiter, answer: &Value) {
         let waiters = match key {
             Some(k) => {
-                self.mailboxes.finish(device, &k, &answer);
+                self.mailboxes.finish(device, &k, answer);
                 if let Err(e) = self.mailboxes.save(device) {
                     eprintln!("rlord-web: saving a request store: {e:#}");
                 }
@@ -180,4 +227,16 @@ impl Actor {
             Waiter::Mailbox => self.mailbox_answer(device, answer),
         }
     }
+}
+
+/// Debug builds: `RLORD_WEB_TEST_SLOW=<op>:<ms>` makes that op take `ms`
+/// longer, so a test can act while it runs (a resend gets `in_progress`;
+/// a plugin stopped meanwhile leaves it `interrupted`).
+fn slow_op(op: &str) -> Option<u64> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let v = std::env::var("RLORD_WEB_TEST_SLOW").ok()?;
+    let (o, ms) = v.split_once(':')?;
+    (o == op).then(|| ms.parse().ok()).flatten()
 }

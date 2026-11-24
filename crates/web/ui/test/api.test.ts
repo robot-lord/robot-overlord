@@ -4,7 +4,7 @@ import {
   BACKOFF_FIRST,
   BACKOFF_LAST,
   type ConnState,
-  Control,
+  LocalTransport,
   takeToken,
   wsUrl,
 } from "../src/api";
@@ -16,12 +16,12 @@ function harness() {
   const states: ConnState[] = [];
   const changed: string[] = [];
   const hellos: string[] = [];
-  const c = new Control(
+  const c = new LocalTransport(
     "ws://127.0.0.1:47811/ws",
     "a".repeat(64),
     {
       state: (s) => states.push(s),
-      hello: (h) => hellos.push(h.build),
+      hello: (h) => hellos.push(h.build ?? ""),
       changed: (r) => changed.push(r),
     },
     (url) => {

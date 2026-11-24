@@ -122,6 +122,32 @@ pub(crate) fn status(d: &Daemon) -> Result<Value> {
     }))
 }
 
+/// A paired device, as the plugin last reported it.
+pub(crate) struct Paired {
+    pub id: String,
+    pub name: String,
+    /// It has a live session now.
+    pub linked: bool,
+}
+
+/// The paired devices, as the plugin last reported them (none when it
+/// isn't running or hasn't reported).
+pub(crate) fn paired(d: &Daemon) -> Vec<Paired> {
+    let m = d.relay.mirror();
+    m.as_ref()
+        .and_then(|m| m["devices"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            Some(Paired {
+                id: v["id"].as_str()?.to_string(),
+                name: v["name"].as_str().unwrap_or("").to_string(),
+                linked: v["linked"] == true,
+            })
+        })
+        .collect()
+}
+
 /// What a local page's `snapshot` carries: enough for the header (a count
 /// and the device waiting for confirmation), never the list.
 pub(crate) fn summary(d: &Daemon) -> Value {
@@ -332,6 +358,9 @@ pub fn remote_state(d: &Daemon, p: &Value) -> Result<Value> {
         .lock()
         .expect("relay mutex")
         .replace(new.clone());
+    // A device no longer paired is no surface any more.
+    let paired: Vec<String> = paired(d).into_iter().map(|p| p.id).collect();
+    d.web_ui().keep_devices(&paired);
     let key = |m: &Value| -> Option<(String, String)> {
         let p = &m["pending"];
         p.is_object().then(|| {

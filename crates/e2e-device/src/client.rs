@@ -55,21 +55,14 @@ impl std::fmt::Display for ConnectError {
 impl std::error::Error for ConnectError {}
 
 fn tls(ca_file: &str) -> Result<rustls::ClientConfig> {
-    use rustls::pki_types::pem::PemObject;
-    let mut roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    // The engine's TLS (ring, webpki-roots, an extra CA): the same as the
+    // phone's.
+    let pem = if ca_file.is_empty() {
+        None
+    } else {
+        Some(std::fs::read_to_string(ca_file)?)
     };
-    if !ca_file.is_empty() {
-        for c in rustls::pki_types::CertificateDer::pem_file_iter(ca_file)? {
-            roots.add(c?)?;
-        }
-    }
-    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(roots)
-    .with_no_client_auth())
+    rlord_e2e_client::link::tls_config(pem.as_deref()).map_err(|e| anyhow!(e))
 }
 
 /// A live connection to a relay, after `ready`.

@@ -222,3 +222,6 @@ pub async fn redirect(to: &str) -> Hostile {
         task,
     }
 }
+
+mod tamper;
+pub use tamper::{Dir, Filter, Flaky, Peer, Tamper};

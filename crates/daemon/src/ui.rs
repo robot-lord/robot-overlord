@@ -107,9 +107,10 @@ pub fn usage(d: &Daemon, params: &Value) -> Result<Value> {
 // ---- which screen a UI command lands on ----
 //
 // A surface is somewhere the user looks at rlord: the terminal (a tmux
-// client, with or without the TUI) or a web page. A command goes to one of
-// them: the one the user did something on last (`[web] ui_target` can
-// prefer one). The others get a one-line notice.
+// client, with or without the TUI), a web page, or a paired device (the
+// phone, through the relay). A command goes to one of them: the one the
+// user did something on last (`[web] ui_target` can prefer one). The
+// others get a one-line notice.
 
 /// Where a UI command goes, chosen once per tool call (`target`) so the
 /// command and anything that brings it to the front agree.
@@ -119,51 +120,73 @@ pub enum Target {
     Terminal(tmux::Client),
     /// The web page with this id.
     Web(String),
+    /// The paired device with this id (the phone).
+    Device(String),
     /// Nowhere to show anything.
     None,
 }
 
 impl Target {
-    /// `"terminal"`, `"web"` or `"none"`: the `on` in tool answers.
+    /// `"terminal"`, `"web"`, `"phone"` or `"none"`: the `on` in tool
+    /// answers.
     pub fn name(&self) -> &'static str {
         match self {
             Target::Terminal(_) => "terminal",
             Target::Web(_) => "web",
+            Target::Device(_) => "phone",
             Target::None => "none",
         }
     }
 }
 
-/// What `pick` chose (`Web` names an entry of its `pages`).
+/// What `pick` chose (`Web` names an entry of its `pages`, `Device` one
+/// of its `devices`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Picked<'a> {
     Terminal,
     Web(&'a str),
+    Device(&'a str),
     None,
 }
 
+/// A surface besides the terminal, for `pick`: its id, its last use in ms
+/// (None: never used) and its order of arrival.
+pub(crate) type Use = (String, Option<i64>, u64);
+
 /// The surface a command goes to. `terminal`: the user's terminal's last
-/// input, epoch seconds (None: no terminal attached). `pages`: each open
-/// page's id, its last use in ms (None: never used) and its order of
-/// arrival. With `Auto`, the later use wins, compared in whole seconds
-/// (tmux's resolution); a tie or an unknown goes to the terminal. Among
-/// pages, the latest use, then the newest. A preference (`Terminal`,
-/// `Web`) wins whenever its surface is there.
+/// input, epoch seconds (None: no terminal attached). `pages` and
+/// `devices`: each open page's and each paired device's use. With
+/// `Auto`, the later use wins, compared in whole seconds (tmux's
+/// resolution); a tie or an unknown goes to the terminal. Among pages and
+/// devices, the latest use, then the newest. A preference (`Terminal`,
+/// `Web`: the pages and devices) wins whenever its surface is there.
 pub(crate) fn pick<'a>(
     terminal: Option<i64>,
-    pages: &'a [(String, Option<i64>, u64)],
+    pages: &'a [Use],
+    devices: &'a [Use],
     pref: UiTarget,
 ) -> Picked<'a> {
-    let page = pages.iter().max_by_key(|(_, at, seq)| (*at, *seq));
-    match (terminal, page) {
+    let other = pages
+        .iter()
+        .map(|p| (p, false))
+        .chain(devices.iter().map(|p| (p, true)))
+        .max_by_key(|((_, at, seq), _)| (*at, *seq));
+    let away = |(p, device): (&'a Use, bool)| {
+        if device {
+            Picked::Device(&p.0)
+        } else {
+            Picked::Web(&p.0)
+        }
+    };
+    match (terminal, other) {
         (None, None) => Picked::None,
         (Some(_), None) => Picked::Terminal,
-        (None, Some(p)) => Picked::Web(&p.0),
-        (Some(t), Some(p)) => match pref {
+        (None, Some(o)) => away(o),
+        (Some(t), Some(o)) => match pref {
             UiTarget::Terminal => Picked::Terminal,
-            UiTarget::Web => Picked::Web(&p.0),
-            UiTarget::Auto => match p.1 {
-                Some(ms) if ms.div_euclid(1000) > t => Picked::Web(&p.0),
+            UiTarget::Web => away(o),
+            UiTarget::Auto => match o.0 .1 {
+                Some(ms) if ms.div_euclid(1000) > t => away(o),
                 _ => Picked::Terminal,
             },
         },
@@ -172,14 +195,27 @@ pub(crate) fn pick<'a>(
 
 /// The screen the overlord's next UI command lands on (see `pick`).
 pub fn target(d: &Daemon) -> Target {
+    target_among(d, true)
+}
+
+/// `target`, for a tool whose screen needs this computer (a terminal or a
+/// local page: the code-folder form, the key screen): a phone is never
+/// chosen.
+pub fn target_local(d: &Daemon) -> Target {
+    target_among(d, false)
+}
+
+fn target_among(d: &Daemon, phones: bool) -> Target {
     let clients = tmux::list_clients();
     let home = tmux::home();
     let user = tmux::user_client(&clients, home.as_deref()).cloned();
     let pages = page_uses(d);
+    let devices = if phones { device_uses(d) } else { vec![] };
     let pref = d.config().web.ui_target;
-    let picked = match pick(user.as_ref().map(|c| c.activity), &pages, pref) {
+    let picked = match pick(user.as_ref().map(|c| c.activity), &pages, &devices, pref) {
         Picked::Terminal => None,
         Picked::Web(id) => Some(Target::Web(id.to_string())),
+        Picked::Device(id) => Some(Target::Device(id.to_string())),
         Picked::None => Some(Target::None),
     };
     match (picked, user) {
@@ -196,10 +232,19 @@ fn no_screen() -> anyhow::Error {
     )
 }
 
+/// The error when `what` has no screen on this computer to open on (it
+/// never opens on a phone).
+pub(crate) fn no_local_screen(what: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{what} opens only on this computer, never on a phone, and the user has no rlord screen open here: they need to run `rlord` in a terminal, or open the web UI (`rlord web`)"
+    )
+}
+
 /// What a surface is called in notices.
 fn where_(t: &Target) -> &'static str {
     match t {
         Target::Web(_) => "in the web UI",
+        Target::Device(_) => "on the phone",
         _ => "in the terminal",
     }
 }
@@ -237,6 +282,31 @@ fn page_uses(d: &Daemon) -> Vec<(String, Option<i64>, u64)> {
         .collect()
 }
 
+/// Each paired device's last use (an op from it, a report of input). A
+/// device the plugin no longer lists as paired isn't one; one never used
+/// counts only while it has a live session.
+fn device_uses(d: &Daemon) -> Vec<Use> {
+    let paired = crate::relay::paired(d);
+    d.web_ui()
+        .devices()
+        .iter()
+        .filter(|p| {
+            paired
+                .iter()
+                .any(|q| q.id == p.id && (q.linked || p.last_input.is_some()))
+        })
+        .map(|p| (p.id.clone(), p.last_input, p.seq))
+        .collect()
+}
+
+/// The id of the most recently used paired device, if any.
+fn latest_device(d: &Daemon) -> Option<String> {
+    device_uses(d)
+        .into_iter()
+        .max_by_key(|(_, at, seq)| (*at, *seq))
+        .map(|p| p.0)
+}
+
 /// The tmux session a page's route shows, if it shows a pane.
 fn pane_of(d: &Daemon, route: &Value) -> Option<String> {
     let db = d.db();
@@ -260,14 +330,48 @@ fn web_state(d: &Daemon, target: &Target) -> Value {
     };
     let open = w.pages().len();
     drop(w);
-    let kind = p.route["kind"].as_str().unwrap_or("list");
-    let showing = match kind {
+    json!({
+        "open": open > 0,
+        "pages": open,
+        "showing": showing(d, &p.route),
+        "visible": p.visible,
+        "form": p.form,
+    })
+}
+
+/// The phone part of `ui.state`, shaped like `web`: the target device, or
+/// the most recently used one (null: no device has used rlord). `open`:
+/// it has a live session now; `devices`: how many paired devices have.
+fn phone_state(d: &Daemon, target: &Target) -> Value {
+    let id = match target {
+        Target::Device(id) => Some(id.clone()),
+        _ => latest_device(d),
+    };
+    let Some(p) = id.and_then(|id| d.web_ui().device(&id).cloned()) else {
+        return Value::Null;
+    };
+    let paired = crate::relay::paired(d);
+    let me = paired.iter().find(|q| q.id == p.id);
+    json!({
+        "open": me.is_some_and(|q| q.linked),
+        "devices": paired.iter().filter(|q| q.linked).count(),
+        "name": me.map(|q| q.name.clone()),
+        "showing": showing(d, &p.route),
+        "visible": p.visible,
+        "form": p.form,
+    })
+}
+
+/// What a page's or a device's route shows, for `ui.state`.
+fn showing(d: &Daemon, route: &Value) -> Value {
+    let kind = route["kind"].as_str().unwrap_or("list");
+    match kind {
         "session" | "overlord" => {
             let db = d.db();
             let s = if kind == "overlord" {
                 overlord::session(&db).ok().flatten()
             } else {
-                p.route["id"].as_str().and_then(|i| db.resolve_ref(i).ok())
+                route["id"].as_str().and_then(|i| db.resolve_ref(i).ok())
             };
             match s {
                 Some(s) => json!({"kind": kind, "id": s.id, "name": s.name}),
@@ -275,14 +379,7 @@ fn web_state(d: &Daemon, target: &Target) -> Value {
             }
         }
         _ => json!({"kind": "session_list"}),
-    };
-    json!({
-        "open": open > 0,
-        "pages": open,
-        "showing": showing,
-        "visible": p.visible,
-        "form": p.form,
-    })
+    }
 }
 
 /// What the user is looking at right now.
@@ -311,10 +408,12 @@ pub fn state(d: &Daemon) -> Result<Value> {
         }
     };
     let web = web_state(d, &target);
+    let phone = phone_state(d, &target);
     Ok(json!({
         "target": target.name(),
         "terminal": terminal,
         "web": web,
+        "phone": phone,
         "tui_running": d.tui_count() > 0,
         "overlord_overlay_open": d.overlay.lock().expect("ui mutex").is_some(),
         "current_view": current_view(d, &target)?,
@@ -322,11 +421,12 @@ pub fn state(d: &Daemon) -> Result<Value> {
     }))
 }
 
-/// The list view on `target`: a page's as it reported it, else the TUI's
-/// (either: the default view until one is reported).
+/// The list view on `target`: a page's or a device's as it reported it,
+/// else the TUI's (any: the default view until one is reported).
 fn current_view(d: &Daemon, target: &Target) -> Result<Value> {
     let v = match target {
         Target::Web(id) => d.web_ui().page(id).map(|p| p.view.clone()),
+        Target::Device(id) => d.web_ui().device(id).map(|p| p.view.clone()),
         _ => Some(d.ui_view.lock().expect("ui mutex").clone()),
     };
     match v.filter(|v| !v.is_null()) {
@@ -537,7 +637,7 @@ pub fn show_list(d: &Daemon) -> Result<Value> {
 }
 
 /// Show the list on `t`: the terminal goes to the TUI (hiding the
-/// overlay); a page is sent `show_list`.
+/// overlay); a page or a device is sent `show_list`.
 fn show_list_on(d: &Daemon, t: &Target) -> Result<()> {
     match t {
         Target::Terminal(c) => {
@@ -545,7 +645,7 @@ fn show_list_on(d: &Daemon, t: &Target) -> Result<()> {
             hide_overlord(d);
             switch_to(c, &home)
         }
-        Target::Web(_) => {
+        Target::Web(_) | Target::Device(_) => {
             d.ui_cmd_to(t, json!({"cmd": "show_list"}));
             Ok(())
         }
@@ -686,6 +786,10 @@ pub fn set_view(d: &Daemon, params: &Value) -> Result<Value> {
             }
             d.ui_cmd_to(&to, Value::Object(cmd));
         }
+        Target::Device(id) => {
+            d.web_ui().device_mut(id).view = view.clone();
+            d.ui_cmd_to(&to, Value::Object(cmd));
+        }
         // (No screen: kept for the next TUI, as before.)
         _ => {
             *d.ui_view.lock().expect("ui mutex") = view.clone();
@@ -756,7 +860,7 @@ pub(crate) fn show_form(d: &Daemon, to: &Target, form: &str) -> Result<()> {
     match to {
         Target::None => return Err(no_screen()),
         Target::Terminal(_) => show_list_on(d, to)?,
-        Target::Web(_) => {}
+        Target::Web(_) | Target::Device(_) => {}
     }
     d.notice_others(to, &format!("the overlord opened {form} {}", where_(to)));
     Ok(())
@@ -1082,7 +1186,7 @@ pub fn keys_list(d: &Daemon) -> Result<Value> {
 /// Open the key screen (at one key, if given) and show it. Keys are
 /// changed only in a terminal (the screen tests that a key reaches rlord
 /// there), so it goes to the terminal whenever one is attached; with only
-/// a web page, the page shows the keys read-only.
+/// a web page, the page shows the keys read-only. Never on a phone.
 pub fn keys_open(d: &Daemon, params: &Value) -> Result<Value> {
     let row = params.get("key").and_then(Value::as_str).unwrap_or("");
     if !row.is_empty() && rlord_core::keys::slot(row).is_none() {
@@ -1092,8 +1196,11 @@ pub fn keys_open(d: &Daemon, params: &Value) -> Result<Value> {
     let home = tmux::home();
     let to = match tmux::user_client(&clients, home.as_deref()) {
         Some(c) => Target::Terminal(c.clone()),
-        None => target(d),
+        None => target_local(d),
     };
+    if to == Target::None {
+        return Err(no_local_screen("the key screen"));
+    }
     open_form(d, &to, json!({"cmd": "keys", "row": row}), "the key screen")?;
     let note = match to {
         Target::Web(_) => "the web UI shows the keys read-only: changing one needs a terminal (the user runs `rlord` and opens the key screen there)",
@@ -1138,33 +1245,62 @@ mod target_tests {
     fn the_surface_used_last_wins() {
         use Picked::{Terminal, Web};
         let auto = UiTarget::Auto;
+        let no: &[Use] = &[];
         // Nothing, one surface, the other.
-        assert_eq!(pick(None, &[], auto), Picked::None);
-        assert_eq!(pick(Some(100), &[], auto), Terminal);
+        assert_eq!(pick(None, no, no, auto), Picked::None);
+        assert_eq!(pick(Some(100), no, no, auto), Terminal);
         let one = pages(&[("p1", None, 1)]);
-        assert_eq!(pick(None, &one, auto), Web("p1"));
+        assert_eq!(pick(None, &one, no, auto), Web("p1"));
         // Both: the later, in whole seconds; a tie or a page never used
         // goes to the terminal.
-        assert_eq!(pick(Some(100), &one, auto), Terminal);
+        assert_eq!(pick(Some(100), &one, no, auto), Terminal);
         let used = pages(&[("p1", Some(101_000), 1)]);
-        assert_eq!(pick(Some(100), &used, auto), Web("p1"));
+        assert_eq!(pick(Some(100), &used, no, auto), Web("p1"));
         let tie = pages(&[("p1", Some(100_900), 1)]);
-        assert_eq!(pick(Some(100), &tie, auto), Terminal);
-        assert_eq!(pick(Some(102), &used, auto), Terminal);
+        assert_eq!(pick(Some(100), &tie, no, auto), Terminal);
+        assert_eq!(pick(Some(102), &used, no, auto), Terminal);
         // Several pages: the latest use, then the newest.
         let several = pages(&[
             ("p1", Some(105_000), 1),
             ("p2", Some(103_000), 2),
             ("p3", None, 3),
         ]);
-        assert_eq!(pick(Some(100), &several, auto), Web("p1"));
+        assert_eq!(pick(Some(100), &several, no, auto), Web("p1"));
         let unused = pages(&[("p1", None, 1), ("p2", None, 2)]);
-        assert_eq!(pick(None, &unused, auto), Web("p2"));
+        assert_eq!(pick(None, &unused, no, auto), Web("p2"));
         // A preference wins while its surface is there.
-        assert_eq!(pick(Some(100), &used, UiTarget::Terminal), Terminal);
-        assert_eq!(pick(Some(200), &one, UiTarget::Web), Web("p1"));
-        assert_eq!(pick(None, &one, UiTarget::Terminal), Web("p1"));
-        assert_eq!(pick(Some(1), &[], UiTarget::Web), Terminal);
+        assert_eq!(pick(Some(100), &used, no, UiTarget::Terminal), Terminal);
+        assert_eq!(pick(Some(200), &one, no, UiTarget::Web), Web("p1"));
+        assert_eq!(pick(None, &one, no, UiTarget::Terminal), Web("p1"));
+        assert_eq!(pick(Some(1), no, no, UiTarget::Web), Terminal);
+    }
+
+    /// Devices stand beside pages by the same rule: the latest use wins,
+    /// then the newest; against the terminal, the later in whole seconds.
+    #[test]
+    fn a_device_is_picked_as_a_page_is() {
+        use Picked::{Device, Terminal, Web};
+        let auto = UiTarget::Auto;
+        let no: &[Use] = &[];
+        let phone = pages(&[("ab12", Some(110_000), 4)]);
+        assert_eq!(pick(None, no, &phone, auto), Device("ab12"));
+        assert_eq!(pick(Some(100), no, &phone, auto), Device("ab12"));
+        assert_eq!(pick(Some(110), no, &phone, auto), Terminal);
+        // A page used later wins; one used earlier doesn't.
+        let later = pages(&[("p1", Some(120_000), 1)]);
+        assert_eq!(pick(Some(100), &later, &phone, auto), Web("p1"));
+        let earlier = pages(&[("p1", Some(105_000), 1)]);
+        assert_eq!(pick(Some(100), &earlier, &phone, auto), Device("ab12"));
+        // Never used: by arrival, a device among pages too.
+        let unused = pages(&[("p1", None, 1)]);
+        let new_phone = pages(&[("cd34", None, 2)]);
+        assert_eq!(pick(None, &unused, &new_phone, auto), Device("cd34"));
+        // The `web` preference covers devices; `terminal` beats them.
+        assert_eq!(
+            pick(Some(200), &earlier, &phone, UiTarget::Web),
+            Device("ab12")
+        );
+        assert_eq!(pick(Some(1), no, &phone, UiTarget::Terminal), Terminal);
     }
 }
 

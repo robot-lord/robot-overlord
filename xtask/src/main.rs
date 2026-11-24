@@ -7,6 +7,8 @@
 //! the scripts xtask runs inside bare distro containers (`*.sh` next to
 //! the task that runs them, compiled in).
 
+mod app;
+mod app_dev;
 mod build;
 mod bump;
 mod check_deps;
@@ -25,6 +27,7 @@ mod tap;
 mod tools;
 mod version;
 mod web;
+mod web_app;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -45,10 +48,15 @@ usage: cargo xtask <task>
       the relay's container image (amd64, arm64) from a release's relay tarballs
   check-deps
       fail if the rlord binary depends on network code (the web plugin's)
-  web install|check|build|watch
-      the web plugin's page (crates/web/ui): install its pinned tools, check, build
+  web install|check|build [--app]|check-app|watch
+      the web plugin's page (crates/web/ui) and the phone app's (--app): install its
+      pinned tools, check, build
   e2e vectors [--check] | wasm | test-wasm
       the end-to-end crypto core's test vectors and WASM build (crates/e2e)
+  app bindings | core-ios | ios [--sim [NAME] | --device ID] | test-ios [--unit]
+      the phone app (apps/ios): bindings, the engine's xcframework, build and run, tests
+  app dev [--port N] | test-e2e
+      the phone page in a desktop browser on a loopback host; its end-to-end tests in Node
   check-version-bump [BASE] [REV]
       fail unless REV bumps the version above BASE's (origin/main, HEAD)
   update-tap VERSION SHA256SUMS [TAP_REPO]
@@ -107,6 +115,7 @@ fn main() -> ExitCode {
         "check-deps" => check_deps::main(rest),
         "web" => web::main(rest),
         "e2e" => e2e::main(rest),
+        "app" => app::main(rest),
         "update-tap" => tap::main(rest, &invoked_from),
         "publish-crates" => publish::main(rest),
         "release-preflight" => preflight::main(rest),

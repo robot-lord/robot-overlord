@@ -61,6 +61,65 @@ cargo build -p robot-overlord-web && rlord web   # a checkout's rlord runs the r
 beside another). `cargo xtask check-deps` keeps network crates out of
 `rlord`; see "Web UI" in docs/architecture.md.
 
+### The phone app
+
+The iOS app (`apps/ios`) is a thin SwiftUI shell around the phone build
+of the page and the device engine (`crates/e2e-client`, through UniFFI in
+`crates/e2e-ffi`); see "The phone app" in docs/architecture.md. It needs
+Xcode (selected with `xcode-select`, or the tasks set `DEVELOPER_DIR`) and
+the iOS Rust targets in `rust-toolchain.toml`. Everything is built
+locally; nothing is released from the feature branch.
+
+```sh
+cargo xtask app ios                 # build, install and launch on a simulator (--sim NAME)
+cargo xtask app ios --device ID     # on your phone (xcrun devicectl list devices); signs with the team
+cargo xtask app test-ios            # XCTest, then the XCUITest against a loopback host stack
+cargo xtask app test-ios --unit     # XCTest only
+cargo xtask app dev                 # the phone page in a desktop browser, over rlord-device bridge
+cargo xtask app test-e2e            # the page's store and RemoteTransport over the bridge (no simulator; CI)
+cargo xtask app bindings            # regenerate the Swift bindings (the build tasks do this)
+```
+
+The generated bindings, the xcframework and the copied page are
+git-ignored. `cargo xtask check-deps` fails if `apps/` names a network
+API.
+
+The first `--device` install registers the phone with the team and makes
+the development certificate and profile (Xcode signed in to the team,
+Developer Mode on in the phone's Privacy & Security settings, then trust
+the developer under General → VPN & Device Management). Later installs
+work over Wi-Fi while the phone is unlocked on the same network.
+
+#### A relay for your phone: Tailscale Serve
+
+The phone trusts public certificates only. In development, run the relay
+on your Mac and let [Tailscale Serve](https://tailscale.com/kb/1312/serve)
+give it your tailnet name and certificate. Serve is reachable from your
+tailnet only, not the internet (Funnel would publish it; don't). The
+phone needs the Tailscale app on the same tailnet. The host is a scratch
+demo rlord, never your real install.
+
+```sh
+cargo build --release -p robot-overlord-relay
+mkdir -p /tmp/rwd/relay && cat > /tmp/rwd/relay/relay.toml <<'EOF'
+origin = "https://<mac>.<tailnet>.ts.net"   # tailscale status --json | jq -r .Self.DNSName, no trailing dot
+listen = "127.0.0.1:8787"
+data_dir = "/tmp/rwd/relay"
+[tls]
+mode = "proxy"
+EOF
+target/release/rlord-relay --config /tmp/rwd/relay/relay.toml serve   # prints the address
+tailscale serve --bg --https=443 http://127.0.0.1:8787   # the first time, enable Serve at the link it prints
+target/release/rlord-relay --config /tmp/rwd/relay/relay.toml token new
+
+scripts/demo/demo.sh --web /tmp/rwd/t1 && source /tmp/rwd/t1/env.sh
+rlord relay setup '<address>' --token <token>
+rlord relay pair                    # scan with the app, check the code, confirm
+```
+
+`tailscale serve reset` takes it down. `relay.key` in `data_dir` is the
+relay's identity: keep the folder, or every host sets the relay up again.
+
 ## Demo and screenshots
 
 `scripts/demo/demo.sh` starts a throwaway rlord full of made-up sessions

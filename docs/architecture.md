@@ -1127,8 +1127,14 @@ SIGTERM then SIGKILL on `web.stop` and at daemon exit. The plugin's first
 call is `web.hello {protocol, version, pid, port}`; another
 `plugin::WEB_PROTOCOL` is refused, and the plugin exits 3 (not retried);
 a taken port is exit 4 (not retried). The plugin also exits when its
-`web.subscribe` stream ends, so a crashed daemon leaves no listener. A
-daemon restart restarts it; open pages reconnect with the same token.
+`web.subscribe` stream ends, so a crashed daemon leaves no listener. The
+daemon ends that stream as soon as the plugin's end closes (it watches
+the read side, not only failed writes), and `web.stop` returns only once
+the plugin is reaped and its stream is let go (its pages and relay state
+cleared), so a start right after it waits for the new plugin's own
+stream: a stale one would let a `relay.*` command go to a plugin that is
+gone. A daemon restart restarts it; open pages reconnect with the same
+token.
 
 **The daemon's side** (no HTTP types): `web.call {op, args}` is the only
 way a browser request reaches the daemon. `web::OPS` lists each op, the
@@ -1198,8 +1204,9 @@ ops list. The release workflow builds the page once in its own job
 **The web as a UI target.** The overlord's UI tools (`goto_session`,
 `show_list`, `set_list_view`, `propose_session`, `confirm_new_session`,
 `confirm_setup`, `open_keys`, `go` on a launch) land on one *surface*:
-the user's terminal (a tmux client) or one web page (a browser tab's
-control socket).
+the user's terminal (a tmux client), one web page (a browser tab's
+control socket), or one paired device (the phone, through the relay:
+"The phone as a surface" below).
 
 - *Which one* (`ui::target`, on the pure `ui::pick`): the surface the user
   last did something on. A terminal's last use is tmux's
@@ -1226,8 +1233,9 @@ control socket).
   `ui.state` has `target`, `web` (the most recent page) and `current_view`
   from the target. Pages go when the last `web.subscribe` stream ends.
 - *Addressed commands.* `Daemon::ui_cmd_to` sends `{"notify":"ui",
-  "to":"terminal"|"web", "page"?, "cmd"}` on the broadcast. The TUI
-  ignores `to: "web"`; `web.subscribe` passes the web's on as
+  "to":"terminal"|"web"|"device", "page"?, "device"?, "n"?, "cmd"}` on
+  the broadcast. The TUI ignores `to: "web"` and `"device"`;
+  `web.subscribe` passes the web's on as
   `{"notify":"ui","page","cmd"}`, never folded into or dropped by the
   coalescing of `changed`; the plugin sends each to its page only as
   `{"event":"ui","cmd"}`. Each surface has one parked slot (30 s): the
@@ -1285,7 +1293,7 @@ user runs it before a review); the relay itself is `docs/relay.md`.
 | Party | Crates | Holds |
 | --- | --- | --- |
 | Host (`rlord-web`, `crates/web/src/remote/`) | `rlord_e2e`, `rlord_relay_proto` | `<data dir>/remote/`: X25519 static key, P-256 relay key, the pin, `devices.json`, one mailbox state and request store per device; `remote.log` (audit) |
-| Device (the phone app, next; `rlord-device` for tests, `crates/e2e-device`) | `rlord_e2e` (natively or as WASM, `crates/e2e-wasm`), `rlord_relay_proto` | its keys, the host's static key and the pin |
+| Device (the phone app, `apps/ios`; `rlord-device` for tests and the bridge, `crates/e2e-device`), both on the device engine `rlord_e2e_client` (`crates/e2e-client`) | `rlord_e2e`, `rlord_relay_proto` (`crates/e2e-wasm` keeps a WASM build for a later browser device) | per host: its relay key (platform keystore), its X25519 key, the host's static key, the pin, the mailbox state and the outbox, sealed by the platform's vault |
 | Relay (`rlord-relay`, `crates/relay`) | `rlord_relay_proto` only | its key, registrations; queues in memory |
 
 `rlord_e2e` is sans-IO (`check-deps` holds its tree free of tokio,
@@ -1306,7 +1314,10 @@ fragmented up to 1 MiB. The mailbox (for `overlord.ask` and
 `overlord.new_session` while the host is away) is its own saveable
 cipher state over the kind-3 handshake's raw keys, rekeyed after every
 message; its receiver skips up to 64 lost messages (counters only move
-forward), since the relay's queue can lose some.
+forward), since the relay's queue can lose some. The host's `hello` on each live
+session names the mailbox it holds for the device (or null), so a
+device whose mailbox the host has lost keys a new one rather than
+sending into one nobody can open.
 
 **Delivery and recovery: one rule.** One websocket link carries one Noise
 session per device link, with implicit nonces (no counter on the wire),
@@ -1340,16 +1351,42 @@ tool, never reachable from a device.
 **How a device's request reaches the daemon.** The plugin passes the
 control stream's `{id, op, args}` on as `web.call {op, args, via:
 "remote", device}`. `web::OPS` has a `remote` column: a device may call
-what a local page may except what writes `config.toml`, the surface
-reports, the key screen and device management. A remote call has no
-`page`, never counts as use of a screen and gets no `ui` commands. To
+what a local page may except what writes `config.toml`, the key screen
+and device management (it may remove itself: `device.leave`, which a
+local page is refused as `bad_request`; the plugin removes the device as
+`revoke` does once the answer has had time to reach it). To
 make an op remote, set `remote: true` on its `Op` and test it from a
 device in `web_api.rs`; an op is local-only unless a device needs it.
 Mark it `.idempotent()` only if running it twice is the same as once (a
 look-up); anything else is deduplicated by request id.
-`overlord.messages` (both) gives the active overlord's recent
-conversation as text, read from its transcript (at most 50 messages of 4
-KiB), for a chat view.
+`overlord.messages` and `session.messages {ref}` (both) give the active
+overlord's or a session's recent conversation as text, read from its
+transcript (at most 50 messages of 4 KiB), for a chat view and a
+session's view without a pane. A device's `hello` carries `api`, the
+remote API level (`web::API`, from `web.hello`'s answer): the ops, the
+snapshot and the `ui` commands as a device sees them. Within a level
+they only grow; `web_api.rs` pins the remote ops and snapshot keys
+against `crates/daemon/tests/fixtures/remote_api.json`.
+
+**The phone as a surface.** A paired device is a third kind of surface
+beside the terminal and the pages. The daemon keeps a page's record per
+device, by the id the plugin stamps (`page.report` and `page.pending`
+are remote; the device's `hello` gives its id as `page`), at most 16,
+dropped when the plugin's `web.remote_state` no longer lists it as
+paired. Its last use is the daemon's clock at a user-driven op from it or
+a `page.report` with `input`; one never used counts only while it has a
+live session. `ui::pick` takes devices beside pages by the same rule
+(`ui_target = "web"` covers both); `target_local` leaves them out for
+what needs this computer (`confirm_setup`, `open_keys`; the overlay is
+the terminal's anyway), which then takes a terminal or page, or fails
+naming them. Answers say `"on": "phone"`; `ui.state` has `phone`, shaped
+like `web`. A device's command is the line `{"notify":"ui","to":
+"device","device","n","cmd"}`, parked in that device's one slot (10
+minutes): the plugin sends `{"event":"ui","cmd"}` on its live session
+and says `web.ui_delivered {device, n}`, which clears the slot; with no
+live session it asks the relay to `signal` the device, and the
+device's `page.pending` at its next `hello` hands the command over,
+once. A phone gets no notices of what opened elsewhere.
 
 The user's commands (`relay.*`, `daemon/src/relay.rs`) go the other
 way. They are dispatched from the socket only, never through
@@ -1366,6 +1403,100 @@ confirmation. `rlord_core::qr` draws the pairing code (the `rlord`
 binary only ever draws a string the plugin gave it). `start_if_enabled`
 also starts the plugin for `[remote] enabled`. The page's Devices view
 is a modal (form kind `devices`).
+
+### The phone app
+
+Built on the feature branch only, and dark: no release, TestFlight or
+store build until the final merge to `main`; it is built and installed
+locally (`cargo xtask app …`, CONTRIBUTING.md). iOS first; Android's shell
+is still to come and needs nothing new from the engine or the page.
+
+**Three layers, one network path.**
+
+- *The engine* (`crates/e2e-client`, `rlord_e2e_client`) is the device's
+  whole side of the protocol, natively: the relay link (tokio,
+  tokio-tungstenite, rustls with ring and `webpki-roots`), the pin check,
+  the Noise sessions, the mailbox, the outbox and the reconnect loop.
+  `machine` is sans-IO (every rule of the loop and the outbox, unit
+  tested with a scripted link and a fake clock); `driver` runs it on a
+  small runtime the engine owns; `Engine` is the facade
+  (`page_message`, `scanned`, `lifecycle`, `network`,
+  `background_check`, `wipe`, `shutdown`). The platform gives it three
+  traits: `Signers` (the relay key per host, Secure Enclave on iOS; DER
+  or `r || s`, high S accepted), `Vault` (seals every file at rest) and
+  `Listener` (`to_page`, `notify`). `check-deps` keeps rlord and the
+  relay out of its tree, and it out of `rlord`'s. It starts as if in the
+  background: the shell says `lifecycle(true)` when the app is in front.
+- *The FFI* (`crates/e2e-ffi`) is UniFFI over the engine, proc-macro
+  only. It stays small on purpose: a page feature travels as JSON
+  through `page_message` and `to_page`, so it needs no binding change.
+  The vault's `open` is `unseal` there (UniFFI 0.32.2 escapes Swift's
+  `open` into the C header).
+- *The shell* (`apps/ios`, SwiftUI) starts the engine, passes JSON
+  between it and the page, serves the scanner and its own settings,
+  reports scene phase and `NWPathMonitor` changes, locks the app after 5
+  minutes away, and runs the OS's background refresh. It has no logic
+  the engine or the page can hold.
+- *The page* is the phone build of the local page (`cargo xtask web
+  build --app`, `dist-app/`): the same store and views behind
+  `RemoteTransport`, which posts to the shell
+  (`webkit.messageHandlers.rlord`) and is answered through
+  `window.__rlord_recv`. The WebView loads it from the bundle through a
+  scheme handler (`rlord-app://page/`) under `connect-src 'none'` and
+  Trusted Types, with a content rule list that blocks every other URL:
+  the page can't reach the network at all. The engine's relay link is
+  the app's only connection; `check-deps` fails if `apps/` names a
+  network API.
+
+**The bridge contract.** Page to engine: requests `{id, op, args}` as on
+a local page, and `app` messages (`ready`, which replays `conn`,
+`pairing`, `outbox` and the last `hello` so a reload restores
+everything; `pair_continue`, `pair_cancel`, `unpair`, `cancel`,
+`status`). The shell answers `scan` and `settings` itself. Engine to
+page: answers by id and events (`conn` with its state, `pairing`,
+`outbox`, `hello`, `changed`, `ui`, `status`). A page feature that a
+phone should have is an op with `remote: true` (Remote access, above)
+and, when the page draws it, a `caps` check in `transport.ts`; nothing in
+the engine or the shell changes for it. The page reads `api` from the
+host's `hello` and says "update the app" or "update rlord" across a
+level it doesn't speak.
+
+**What the phone keeps.** Per paired host (one in this slice), in the
+app's own folder, out of backups, sealed by the vault (an enclave key,
+`AfterFirstUnlockThisDeviceOnly`): the device's X25519 key, the host's
+public key, the pin, the mailbox state, the outbox (at most 16 entries;
+an ask waits up to 24 hours) and the last `rev`. The relay key never
+leaves the enclave. Nothing of the host's but its public key and the
+pin. A debug build on a Mac without an enclave falls back to software
+keys; a release build refuses to start.
+
+**Background.** Going to the background, the engine sends what is
+queued and closes the link (no socket is held). The OS's refresh
+(`BGAppRefreshTask`, `com.robot-lord.rlord.refresh`, asked for each time
+the app leaves the front) calls `background_check` with a 20 s budget:
+it dials, and only if the relay says something waits does it make a
+session, take the state and call `notify` with the count of sessions
+newly waiting. The notification is a count, made on the phone. No push
+yet: a refresh is the OS's choice of time.
+
+**Without a phone.** `rlord-device bridge` runs the same engine (software
+keys) behind a websocket on 127.0.0.1 that plays the shell: it serves
+`scan` and `settings`, passes everything else to the engine, and refuses
+a connection whose `Origin` it wasn't given. The dev build of the phone
+page (`app-dev.html`, `vite build --mode app-dev`, `dist-app-dev/`) adds
+a shim that makes `webkit.messageHandlers.rlord` that websocket, under a
+CSP whose only change is `connect-src ws://127.0.0.1:<port>`; the phone
+bundle can't carry it (`web check-app` fails on its marker, on
+`WebSocket` and on `ws://`). `crates/web/examples/remote_stack.rs` is a
+loopback host for both: an in-memory daemon with fixture sessions, the
+real plugin and relay, and a fake overlord (the example itself in a pane
+of a scratch tmux server, answering in a Claude-format transcript; the
+agents' names on its PATH are the example too, so no real agent runs).
+`cargo xtask app dev` opens the page in a desktop browser over it;
+`cargo xtask app test-e2e` runs the page's own store and
+`RemoteTransport` in Node over it (CI's `web` job); `cargo xtask app
+test-ios` drives the simulator against it (pair, list, background and
+back, relay restart, an ask answered) through its control folder.
 
 ## rlord's private tmux server (2026-11-10)
 

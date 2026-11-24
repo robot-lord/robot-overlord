@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The keys the build settings can't set (the rest come from
+     INFOPLIST_KEY_* in project.pbxproj). No App Transport Security
+     exception: the app makes no URL loads, and the engine's relay link is
+     its own TLS (rustls), which ATS doesn't govern. -->
+<plist version="1.0">
+<dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.robot-lord.rlord.refresh</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+	</array>
+</dict>
+</plist>

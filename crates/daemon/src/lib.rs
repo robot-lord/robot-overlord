@@ -73,6 +73,8 @@ pub struct Daemon {
     /// the TUI (set_view, new_session) issued by the overlord;
     /// `{"notify":"ui","to":"web","page":"<id>","cmd":{...}}` — one for a
     /// web page (`web.subscribe` passes these on; the TUI ignores them);
+    /// `{"notify":"ui","to":"device","device":"<id>","n"?,"cmd":{...}}` —
+    /// one for a paired device (the same; `n` when it is parked);
     /// `{"notify":"remote","id","req"}` — a user's relay command for the
     /// plugin (`relay.rs`; only `web.subscribe` gets these).
     notify: tokio::sync::broadcast::Sender<String>,
@@ -129,9 +131,6 @@ pub struct Daemon {
     pub(crate) proposals: Mutex<std::collections::VecDeque<(String, Value)>>,
     /// The open web pages and what each shows (web.rs `WebUi`).
     web_ui: Mutex<web::WebUi>,
-    /// Open `web.subscribe` streams (the plugin's; a restarted plugin's
-    /// may overlap the old one's briefly). The pages go with the last.
-    web_subscribers: AtomicUsize,
     /// The attention queue's watcher (attention.rs).
     pub(crate) attention: attention::Watch,
     /// Live OpenCode sessions can't be followed (no server reached): their
@@ -172,7 +171,6 @@ impl Daemon {
             web: Default::default(),
             web_ui: Default::default(),
             proposals: Default::default(),
-            web_subscribers: AtomicUsize::new(0),
             attention: Default::default(),
             opencode_blind: Default::default(),
         })
@@ -236,7 +234,7 @@ impl Daemon {
 
     /// How many `web.subscribe` streams are open (the plugin's).
     pub(crate) fn web_subscribers(&self) -> usize {
-        self.web_subscribers.load(Ordering::SeqCst)
+        self.web.streams()
     }
 
     /// The open web pages.
@@ -304,10 +302,12 @@ impl Daemon {
             .send(json!({"notify": "ui", "to": "terminal", "cmd": cmd}).to_string());
     }
 
-    /// Push a UI command to `to` (`ui::target`): the terminal's TUIs, or
-    /// one web page. A web command is also parked, for the next page that
-    /// asks, in case it never reaches its page (`page.pending`). Nowhere:
-    /// nothing is sent.
+    /// Push a UI command to `to` (`ui::target`): the terminal's TUIs, one
+    /// web page, or one paired device. A web command is also parked, for
+    /// the next page that asks, in case it never reaches its page
+    /// (`page.pending`); a device's is parked for that device until its
+    /// live session has it (`web.ui_delivered`) or it asks at its next
+    /// hello. Nowhere: nothing is sent.
     pub(crate) fn ui_cmd_to(&self, to: &ui::Target, cmd: Value) {
         match to {
             ui::Target::Terminal(_) => self.ui_cmd(cmd),
@@ -318,6 +318,13 @@ impl Daemon {
                     json!({"notify": "ui", "to": "web", "page": page, "cmd": cmd}).to_string(),
                 );
             }
+            ui::Target::Device(device) => {
+                let n = self.web_ui().park(device, cmd.clone());
+                let _ = self.notify.send(
+                    json!({"notify": "ui", "to": "device", "device": device, "n": n, "cmd": cmd})
+                        .to_string(),
+                );
+            }
             ui::Target::None => {}
         }
     }
@@ -325,10 +332,21 @@ impl Daemon {
     /// A one-line notice (never parked) on the surfaces other than `to`
     /// that are there now: the terminal's TUI, or the most recently used
     /// web page. So a command landing on the screen the user isn't
-    /// looking at doesn't go unseen.
+    /// looking at doesn't go unseen. (A phone in a pocket gets none.)
     pub(crate) fn notice_others(&self, to: &ui::Target, text: &str) {
         let cmd = json!({"cmd": "notice", "text": text});
         match to {
+            ui::Target::Device(_) => {
+                if self.tui_count() > 0 {
+                    let _ = self
+                        .notify
+                        .send(json!({"notify": "ui", "to": "terminal", "cmd": cmd}).to_string());
+                } else if let Some(page) = ui::latest_page(self) {
+                    let _ = self.notify.send(
+                        json!({"notify": "ui", "to": "web", "page": page, "cmd": cmd}).to_string(),
+                    );
+                }
+            }
             ui::Target::Web(_) => {
                 if self.tui_count() > 0 {
                     let _ = self
@@ -563,7 +581,7 @@ impl Daemon {
                     let mut out = serde_json::to_vec(&Response::ok(req.id, ack))?;
                     out.push(b'\n');
                     write_half.write_all(&out).await?;
-                    return self.push_loop(write_half, kind).await;
+                    return self.push_loop(lines, write_half, kind).await;
                 }
             }
             let resp = match serde_json::from_str::<Request>(&line) {
@@ -582,15 +600,22 @@ impl Daemon {
         Ok(())
     }
 
-    /// A subscription's push stream, until the client hangs up or the
-    /// daemon goes. `events.subscribe` gets every notify line as sent;
+    /// A subscription's push stream, until the client hangs up (`from`,
+    /// its end, reads EOF: a plugin that exited is let go of at once, not
+    /// on the next line that fails to write) or the daemon goes.
+    /// `events.subscribe` gets every notify line as sent;
     /// `web.subscribe` gets `{"notify":"changed","rev"}`, at most one per
     /// 100 ms (the changes in between folded into it; `"relay": true` when
     /// all of them were `changed_relay`), and the UI commands
     /// addressed to web pages (`{"notify":"ui","page","cmd"}`), never
     /// folded or dropped by the folding. A lagged receiver counts as a
     /// change (and may lose a command: `page.pending` has the last one).
-    async fn push_loop(&self, mut w: tokio::net::unix::OwnedWriteHalf, kind: Push) -> Result<()> {
+    async fn push_loop(
+        &self,
+        mut from: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+        mut w: tokio::net::unix::OwnedWriteHalf,
+        kind: Push,
+    ) -> Result<()> {
         use tokio::sync::broadcast::error::{RecvError, TryRecvError};
         const WEB_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
         let mut rx = self.notify.subscribe();
@@ -599,11 +624,19 @@ impl Daemon {
             self.tui_subscribers.fetch_add(1, Ordering::SeqCst);
         }
         if let Push::Web = kind {
-            self.web_subscribers.fetch_add(1, Ordering::SeqCst);
+            self.web.stream_opened();
         }
         let mut last_web: Option<std::time::Instant> = None;
         let r = loop {
-            let line = match rx.recv().await {
+            let got = tokio::select! {
+                got = rx.recv() => got,
+                read = from.next_line() => match read {
+                    // (Nothing is expected after the subscribe.)
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => break Ok(()), // client gone
+                },
+            };
+            let line = match got {
                 Ok(line) => line,
                 Err(RecvError::Lagged(_)) => CHANGED.to_string(),
                 Err(RecvError::Closed) => break Ok(()),
@@ -668,12 +701,12 @@ impl Daemon {
         // The plugin is gone, and its pages and relay state with it (unless
         // a restarted plugin's stream is already up: it reports its own).
         if let Push::Web = kind {
-            if self.web_subscribers.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.web.stream_closed(|| {
                 self.web_ui().clear();
                 if self.relay.plugin_gone() {
                     self.changed();
                 }
-            }
+            });
         }
         r
     }
@@ -699,6 +732,8 @@ impl Daemon {
                     rlord_core::plugin::RPC_ERR_INCOMPATIBLE
                 } else if e.downcast_ref::<web::NotAllowed>().is_some() {
                     rlord_core::plugin::RPC_ERR_NOT_ALLOWED
+                } else if e.downcast_ref::<web::BadRequest>().is_some() {
+                    rlord_core::plugin::RPC_ERR_BAD_REQUEST
                 } else {
                     rpc::ERR_INTERNAL
                 };
@@ -1273,6 +1308,7 @@ impl Daemon {
             "web.call" => web::call(self, params),
             "web.pane_target" => web::pane_target(self, params),
             "web.pages" => web::pages(self, params),
+            "web.ui_delivered" => web::ui_delivered(self, params),
             "web.status" => web::status(self),
             "web.start" => web::start(self),
             "web.stop" => web::stop(self),
@@ -1307,15 +1343,30 @@ const CHANGED: &str = r#"{"notify":"changed"}"#;
 const CHANGED_RELAY: &str = r#"{"notify":"changed","relay":true}"#;
 
 /// A broadcast line as `web.subscribe` passes it on: a UI command for a
-/// web page (`{"notify":"ui","page","cmd"}`), or a relay command for the
+/// web page (`{"notify":"ui","page","cmd"}`) or for a paired device
+/// (`{"notify":"ui","device","n"?,"cmd"}`), or a relay command for the
 /// plugin (`{"notify":"remote","id","req"}`, as is).
 fn web_line(line: &str) -> Option<String> {
     let v: Value = serde_json::from_str(line).ok()?;
     if v["notify"] == "remote" {
         return Some(line.to_string());
     }
-    (v["notify"] == "ui" && v["to"] == "web")
-        .then(|| json!({"notify": "ui", "page": v["page"], "cmd": v["cmd"]}).to_string())
+    if v["notify"] != "ui" {
+        return None;
+    }
+    match v["to"].as_str() {
+        Some("web") => {
+            Some(json!({"notify": "ui", "page": v["page"], "cmd": v["cmd"]}).to_string())
+        }
+        Some("device") => {
+            let mut l = json!({"notify": "ui", "device": v["device"], "cmd": v["cmd"]});
+            if let Some(n) = v["n"].as_u64() {
+                l["n"] = json!(n);
+            }
+            Some(l.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// A relay command (`relay.rs`), which only the plugin's stream carries.
@@ -1790,18 +1841,18 @@ mod tests {
     fn web_stream(
         d: &Arc<Daemon>,
         rt: &tokio::runtime::Runtime,
-    ) -> tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>> {
+    ) -> tokio::io::Lines<BufReader<UnixStream>> {
         rt.block_on(async {
             let (a, b) = UnixStream::pair().unwrap();
-            let (_, w) = a.into_split();
+            let (r, w) = a.into_split();
             let d = Arc::clone(d);
             tokio::spawn(async move {
-                let _ = d.push_loop(w, Push::Web).await;
+                let _ = d.push_loop(BufReader::new(r).lines(), w, Push::Web).await;
             });
-            let (r, _) = b.into_split();
-            // (Subscribed once the loop runs.)
+            // (Subscribed once the loop runs. `b` stays whole: a closed
+            // end is a client gone.)
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            BufReader::new(r).lines()
+            BufReader::new(b).lines()
         })
     }
 
@@ -1899,6 +1950,22 @@ mod tests {
         assert!(!is_remote_line(
             r#"{"notify":"ui","to":"web","page":"p","cmd":{"cmd":"notice","text":"\"notify\":\"remote\""}}"#
         ));
+    }
+
+    /// A device's UI command reaches the plugin's stream with its device
+    /// and number (and no `to`); the TUI's never.
+    #[test]
+    fn device_lines_are_the_plugins() {
+        let line = json!({"notify": "ui", "to": "device", "device": "ab12", "n": 4,
+                          "cmd": {"cmd": "show_list"}})
+        .to_string();
+        let got: Value = serde_json::from_str(&web_line(&line).unwrap()).unwrap();
+        assert_eq!(
+            got,
+            json!({"notify": "ui", "device": "ab12", "n": 4, "cmd": {"cmd": "show_list"}})
+        );
+        let term = json!({"notify": "ui", "to": "terminal", "cmd": {"cmd": "show_list"}});
+        assert_eq!(web_line(&term.to_string()), None);
     }
 
     /// A command for a page that closed before it arrived is handed to the

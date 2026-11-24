@@ -18,7 +18,16 @@ function agentLabels(s: Snapshot | null): Map<string, string> {
   return new Map((s?.overlord?.overlords ?? []).map((o) => [o.agent, o.label]));
 }
 
-export function List({ store, route }: { store: Store; route: Route }) {
+export function List({
+  store,
+  route,
+  oneNew = false,
+}: {
+  store: Store;
+  route: Route;
+  /** One New button (describe; manual from inside it): no keyboard for `n` / `N`. */
+  oneNew?: boolean;
+}) {
   const snap = store.snapshot.value;
   const view = store.view.value;
   const labels = agentLabels(snap);
@@ -27,21 +36,29 @@ export function List({ store, route }: { store: Store; route: Route }) {
   return (
     <div class="list">
       <div class="new">
-        <button
-          type="button"
-          title="describe it; the overlord sets it up (n)"
-          onClick={() => open(store, "describe")}
-        >
-          + New session
-        </button>
-        <button
-          type="button"
-          class="dim"
-          title="pick every field yourself (N)"
-          onClick={() => open(store, "manual")}
-        >
-          Manual
-        </button>
+        {oneNew ? (
+          <button type="button" onClick={() => open(store, "describe")}>
+            + New session
+          </button>
+        ) : (
+          <>
+            <button
+              type="button"
+              title="describe it; the overlord sets it up (n)"
+              onClick={() => open(store, "describe")}
+            >
+              + New session
+            </button>
+            <button
+              type="button"
+              class="dim"
+              title="pick every field yourself (N)"
+              onClick={() => open(store, "manual")}
+            >
+              Manual
+            </button>
+          </>
+        )}
       </div>
       <Controls store={store} view={view} />
       {snap && <OverlordRow o={snap.overlord} labels={labels} active={route.kind === "overlord"} />}

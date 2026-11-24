@@ -13,7 +13,7 @@ use crate::paths;
 
 /// Bumped whenever a `web.*` daemon method the plugin uses changes shape.
 /// The plugin's `web.hello` carries it; the daemon refuses another one.
-pub const WEB_PROTOCOL: u32 = 3;
+pub const WEB_PROTOCOL: u32 = 4;
 
 /// The plugin's executable name.
 pub const BIN_NAME: &str = "rlord-web";
@@ -28,6 +28,10 @@ pub const EXIT_PORT_IN_USE: i32 = 4;
 pub const RPC_ERR_INCOMPATIBLE: i32 = -32010;
 /// The daemon's RPC error code for a `web.call` op that isn't on its list.
 pub const RPC_ERR_NOT_ALLOWED: i32 = -32011;
+/// The daemon's RPC error code for a `web.call` that is allowed but asked
+/// wrongly (an op a local page has no business calling, such as
+/// `device.leave`). The page and the device see `bad_request`.
+pub const RPC_ERR_BAD_REQUEST: i32 = -32012;
 
 /// The SHA-256 (hex) of the plugin this `rlord` was released with, set by
 /// the release build (`RLORD_WEB_SHA256`). None in a checkout's build or a

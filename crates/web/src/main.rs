@@ -90,6 +90,8 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
                 .collect()
         })
         .unwrap_or_default();
+    // The remote API level each device's hello carries.
+    let api = hello["api"].as_u64().unwrap_or(0);
     let (rev, mut sub) = d.subscribe().await.context("subscribing to the daemon")?;
     // View sessions a bridge left behind (it died between making one and
     // attaching, or with the last plugin).
@@ -100,7 +102,13 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
             swept.len()
         );
     }
-    let remote = remote::start(d.clone(), Config::load()?.remote, rev.clone(), idempotent);
+    let remote = remote::start(
+        d.clone(),
+        Config::load()?.remote,
+        rev.clone(),
+        idempotent,
+        api,
+    );
     let app = http::App::new(token, port, d, rev);
     // No page is open yet (a plugin before this one may have left some).
     app.report_pages().await;
@@ -115,6 +123,8 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
                     pump.changed(rev)
                 }
                 daemon::Event::Ui { page, cmd } => pump.ui(&page, cmd).await,
+                // A paired device's: on its live session, or a signal.
+                daemon::Event::DeviceUi { device, n, cmd } => remote.ui(device, n, cmd),
                 // The user's relay commands (`relay.*`), for the remote
                 // task, which answers each with `web.remote_reply`.
                 daemon::Event::Remote { id, req } => remote.command(id, req),

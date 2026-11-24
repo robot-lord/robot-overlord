@@ -1,0 +1,9 @@
+# Made by `cargo xtask app …`, never committed: the UniFFI bindings, the
+# engine's xcframework and the phone page.
+/Generated/
+/Frameworks/
+/build/
+# Personal signing settings (see Local.xcconfig.example).
+/Local.xcconfig
+xcuserdata/
+*.xcuserstate

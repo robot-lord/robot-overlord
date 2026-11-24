@@ -140,11 +140,11 @@ enum Push {
 
 /// A line of the daemon's push stream as the TUI takes it: a UI command
 /// for the terminal (a line with no `to` is one too), or a change. A
-/// command for a web page isn't this terminal's: None.
+/// command for a web page or a paired device isn't this terminal's: None.
 fn push_of(line: &str) -> Option<Push> {
     let v: Value = serde_json::from_str(line).unwrap_or(Value::Null);
     match v["notify"].as_str() {
-        Some("ui") if v["to"] == "web" => None,
+        Some("ui") if v["to"] == "web" || v["to"] == "device" => None,
         Some("ui") => Some(Push::Ui(v["cmd"].clone())),
         _ => Some(Push::Changed),
     }
@@ -3578,6 +3578,9 @@ mod tests {
     fn commands_for_the_web_are_not_the_terminals() {
         let web = r#"{"notify":"ui","to":"web","page":"p1-ab","cmd":{"cmd":"show_list"}}"#;
         assert!(push_of(web).is_none());
+        let phone =
+            r#"{"notify":"ui","to":"device","device":"ab12","n":1,"cmd":{"cmd":"show_list"}}"#;
+        assert!(push_of(phone).is_none());
         let term = r#"{"notify":"ui","to":"terminal","cmd":{"cmd":"show_list"}}"#;
         assert!(matches!(push_of(term), Some(Push::Ui(c)) if c["cmd"] == "show_list"));
         let old = r#"{"notify":"ui","cmd":{"cmd":"keys"}}"#;

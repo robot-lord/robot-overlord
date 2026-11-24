@@ -1,4 +1,4 @@
-**Status:** in progress (slices 1 and 2, the local web UI and the web as a UI target, are built; slice 3, the e2e core and the relay, is built on `feat/web-ui-3` and not yet reviewed or merged; then the phone app)
+**Status:** in progress (slices 1 to 3, the local web UI, the web as a UI target, and the e2e core and the relay, are built and merged into `feature/web`; slice 4, the phone app, is built for iOS on `feat/web-ui-4` (local commits) with Android deferred. The feature branch stays dark: no releases, TestFlight or store builds until the final merge to `main`; the app is built and installed locally only)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -1137,6 +1137,371 @@ Decided 2026-11-17 (user):
   - The CLI's pairing flow against a live daemon has no end-to-end test
     (the CLI autostarts a real daemon); its logic is unit-tested and the
     same daemon commands are exercised by `web/tests/remote.rs`.
+- Slice 3 merged into `feature/web` (#77).
+- **The feature branch stays dark** (user, 2026-11-18): no releases, no
+  `release.yml` runs and no app-store submission from `feature/web` or
+  its branches; build locally only until the final merge to `main`.
+- Slice 4 planned ("Slice 4 plan: the phone app" at the end; Fable
+  planning agent, 2026-11-23, branch `feat/web-ui-4`): a native Rust
+  device engine (`crates/e2e-client`, UniFFI in `crates/e2e-ffi`) inside
+  thin Swift and Kotlin shells around a WebView that runs a phone build
+  of the page with no network access; `Transport` with `LocalTransport`
+  and `RemoteTransport`; QR pairing; the reconnect loop with every
+  requirement owed above; no push yet (background refresh and local
+  notifications); the phone as a third surface; local installs only.
+  Nothing built. Xcode 27.2 is installed (`xcode-select` points at the
+  command line tools, so tasks set `DEVELOPER_DIR`); no Android SDK yet.
+  Sixteen open questions wait for the user; the first
+  (engine in the shell, not WASM in the page) changes an earlier answer.
+- Slice 4 build (Opus implementer, 2026-11-23, `feat/web-ui-4`,
+  1.3.0-dev.5). Answers: native engine, iOS first, team `PL2X8AJK8A`,
+  bundle id `com.robot-lord.rlord`, defaults for the rest. iOS is built
+  in this pass; the Android shell and SDK wait for a later PR.
+  - Step 1 gates (scratch code, not kept). All iOS gates pass; Android's
+    wait for the SDK and NDK.
+    - (a) `rlord_e2e`, `relay-proto` and `rlord_e2e_device` (tokio,
+      tokio-tungstenite, rustls with ring, webpki-roots) build for
+      `aarch64-apple-ios` and `aarch64-apple-ios-sim`.
+      `aarch64-linux-android` is added to the toolchain but not built:
+      ring needs the NDK's C compiler.
+    - (b) UniFFI 0.32.2: bindgen in process (`uniffi_bindgen::bindings::
+      generate`, a library call, Swift and Kotlin from a debug dylib);
+      a Rust object made from Swift, and a foreign trait (`with_foreign`)
+      called back from a tokio worker thread, run on the iOS 27.2
+      simulator (a Swift binary linked to the static library, started by
+      `simctl spawn`). Kotlin generated, not run.
+    - (c) Signatures from `SecKeyCreateSignature` with
+      `ecdsaSignatureMessageX962SHA256` (software key) and from the
+      Mac's own Secure Enclave (CryptoKit `SecureEnclave.P256`), DER
+      converted to `r || s`, all pass `relay_proto::auth::verify`,
+      including the high-S ones (20 and 23 of 40): p256's verifier
+      takes high S, so the engine converts DER and does not normalise.
+      The phone's own enclave stays in the by-hand list.
+    - (d) A built Preact page (Vite, module script and stylesheet) loads
+      in `WKWebView` from a `WKURLSchemeHandler` on `rlord-app://page/`
+      under the planned policy as a response header and a `<meta>`:
+      `'self'` matches the custom scheme, no `'unsafe-inline'` is needed
+      (Preact's style objects go through CSSOM), Trusted Types are
+      enforced (`innerHTML` throws `TypeError`), `fetch` and `WebSocket`
+      are blocked by `connect-src 'none'`. The bridge round-trips: page
+      to shell by `messageHandlers.rlord.postMessage` (main frame,
+      `rlord-app` origin checked), shell to page by
+      `callAsyncJavaScript` with the text as an argument. Found: the iOS
+      27 SDK refuses a UIKit app without the scene life cycle; the shell
+      is a SwiftUI `App`.
+    - (e) A binary in the iOS simulator reaches a listener on the Mac's
+      `127.0.0.1`.
+  - The lead fixed one contract for the engine, the page and the shell
+    before splitting the work (it refines "The bridge and
+    RemoteTransport"): page messages `{"app":"ready"}` (the engine replays
+    `conn`, `pairing`, `outbox` and the last `hello`, so a reload
+    restores everything) and `{"app":"pair_continue","name"}` (after the
+    engine's `pairing` `scanned` event, which carries the relay origin and
+    the default name), beside the planned `status`, `pair_cancel`,
+    `unpair`, `cancel`; the shell serves `scan` and `settings` itself and
+    answers `{"event":"settings","app_lock","notifications","platform"}`;
+    the engine answers `status` with `{"event":"status","host","relay",
+    "state","device_id","device_name","keys","version","api":{min,max}}`;
+    engine error codes `disconnected`, `host_offline`, `outbox_full`,
+    `cancelled`, `expired`, `interrupted`. Steps 2 and 3, 4, and 5 and 6
+    were built in parallel by three Opus agents on their own branches,
+    merged here.
+  - Step 4 done (daemon and plugin; agent branch `slice4-daemon`):
+    `ui::Target::Device(id)`; `pick` takes devices as it takes pages
+    (latest use, then newest; `ui_target = "web"` covers devices);
+    `confirm_setup` and `open_keys` use `target_local` (never a phone;
+    with only a phone they fail naming the phone, the terminal and `rlord
+    web`); one `WebUi` record per device (at most 16, dropped when the
+    plugin no longer lists the device as paired); one parked command per
+    device for 10 minutes; `page.report` (idempotent) and `page.pending`
+    remote, the device id stamped by the plugin; `device.leave`
+    (`{"left":id}`; `bad_request` locally, new RPC code
+    `RPC_ERR_BAD_REQUEST` -32012); `session.messages {ref, before,
+    limit}` (`{"session":{id,name,agent,conversation},"messages",
+    "more"}`, 50 messages of 4 KiB); `web::API` = 1 in `web.hello` and
+    the device's hello (`{"event":"hello","version","api":1,"rev",
+    "page":id,"device":id}`, no `build`); `WEB_PROTOCOL` 4;
+    `get_ui_state` `target: "phone"` and a `phone` object (`open`,
+    `devices`, `name`, `showing`, `visible`, `form`); answers say
+    `"on":"phone"`; `overlord.md` and `mcp.rs` updated; the TUI ignores
+    `to:"device"` lines. Fixture `crates/daemon/tests/fixtures/
+    remote_api.json` pins the remote ops and snapshot keys within a
+    level. Deviations: a plugin-only method `web.ui_delivered {device,
+    n}` clears a parked command once the plugin sent it live (clearing on
+    an empty `page.report` would race: the device id is stable across
+    sessions, so its post-hello report would wipe a command it never
+    got); a leaving device is removed when its link closes or after a 3 s
+    grace (closing at once lost the answer at the relay); notices are
+    never sent to a phone (when the phone is the target they go to the
+    TUI, else the newest page); slice 3's `remote.rs` refused-op list
+    swaps `page.report` for `device.revoke`. Official docs corrected in
+    the same change (`docs/architecture.md`, `e2e-protocol.md` §3 and
+    §5). Tests: `web_api.rs` `session_messages_are_bounded`,
+    `a_paired_phone_is_a_surface`,
+    `screens_on_this_computer_never_go_to_a_phone`,
+    `device_leave_is_the_callers_own`,
+    `the_remote_api_only_grows_within_a_level`; `web/tests/
+    remote_surface.rs` (leave, a `ui` command live, parked then pulled
+    with the relay's signal, the phone the target after it sent a form;
+    later moved onto the engine as `engine_surface.rs`, below);
+    unit tests in `ui`, `lib`, the TUI and the plugin.
+  - Steps 5 and 6 done (the page; agent branch `slice4-page`):
+    `transport.ts` (`Transport`, `Caps`, `LOCAL_CAPS`, `REMOTE_CAPS`,
+    `ApiError`), `Control` became `LocalTransport`; `remote.ts`
+    `RemoteTransport` and the bridge (`window.__rlord_recv(text)`,
+    defined once, not writable; iOS `messageHandlers.rlord` first, then
+    Android's `rlord` listener object; request ids count up from
+    `Date.now()` so a reloaded page never reuses one); `phone.ts`,
+    `chat.ts`, `commands.ts` (`runUi` shared by both entries; on a phone
+    `setup` and `keys` become a notice), `phoneApp.ts`; the second entry
+    `app.html` + `src/app.tsx` + `phone.css`; `views/Chat.tsx`
+    (overlord chat with pending and failed bubbles, a session's notes and
+    `session.messages`, "The live terminal isn't available remotely
+    yet."), `views/Phone.tsx` (pairing screens, `#/status`, the
+    connection line). Views take their body and local-only forms from
+    their entry, so the bundles stay apart. `cargo xtask web build --app`
+    writes `dist-app/` (`index.html`, `assets/`, the licenses) and
+    `manifest.json` (`{"index","csp","files":[{path,type,bytes}]}`,
+    paths with a leading `/`), then checks the bundle (`xtask/src/
+    web_app.rs`, also `web check-app`): every file local, no network
+    scheme or API, the CSP exact, no inline script, no xterm, no
+    `LocalTransport` (found by a `static marker` string, since class
+    names are minified). `web build` checks the local bundle has no bridge
+    code. Lint: oxlint's `react/no-danger`. CI's `web` job builds the app
+    entry too. Tests: `transport`, `remote` (a fake bridge, a reload
+    restoring bubbles from `outbox`), `chat` (fixture
+    `overlord_messages.json`, written by the daemon test), `phone`,
+    `phoneApp`. No DOM tests (no jsdom dependency added).
+  - Step 8 (`crates/e2e-ffi`, `app bindings`, `check-deps`) and most of
+    step 9 (the iOS shell) built by the lead while the engine was built:
+    - `crates/e2e-ffi`: proc-macro UniFFI, foreign traits `Signers`,
+      `Vault`, `Listener`, object `Engine`, error `FfiError`, record
+      `BackgroundResult`. Found: UniFFI 0.32.2 escapes Swift's `open`
+      keyword with backticks into the C header, which then fails to
+      compile, so the FFI's vault method is `unseal` (the engine's
+      `open`).
+    - `cargo xtask app bindings | core-ios | ios [--sim [NAME] |
+      --device ID] | test-ios [--unit]` (`xtask/src/app.rs`, unit-tested
+      logic: developer dir, versions, simulator choice, xcframework
+      arguments). Bindgen in process (`uniffi_bindgen` =0.32.2 in xtask).
+      Swift into `apps/ios/Generated/Swift`, the header and
+      `module.modulemap` into `Generated/Headers`, the xcframework
+      `apps/ios/Frameworks/RlordCore.xcframework`, the page into
+      `Generated/page` (all git-ignored). Apple wants a numbers-only
+      `CFBundleShortVersionString`: `1.3.0-dev.5` builds as marketing
+      version `1.3.0`, build number `5`. Kotlin is generated only once
+      `apps/android` exists.
+    - `check-deps`: `rlord` denies `robot-overlord-e2e-ffi` and
+      `uniffi`; a source check fails if `apps/` names a network API
+      (`URLSession`, `NWConnection`, `CFNetwork`, `socket(`, `java.net`,
+      `okhttp`, `HttpURLConnection`, …; generated and build folders
+      skipped; `NWPathMonitor` allowed), with planted-name tests.
+    - `apps/ios`: a committed Xcode project (objectVersion 77, folders
+      synchronised, so new Swift files need no project edit), a shared
+      scheme with the unit and UI test targets, `Config/Base.xcconfig`
+      (team `PL2X8AJK8A`, `com.robot-lord.rlord`, iOS 26, arm64 only,
+      `#include? "../Local.xcconfig"`), `Local.xcconfig.example`,
+      `Config/Info.plist` (background refresh id, `fetch` mode). Sources:
+      `RlordApp.swift` (SwiftUI `App`, `.backgroundTask(.appRefresh)`),
+      `Shell.swift` (engine, bridge routing, settings, lifecycle with
+      the OS's finishing time, `NWPathMonitor` keyed by interfaces so a
+      path change redials, app lock after 5 minutes away with
+      `LocalAuthentication` and a cover in the app switcher, local
+      notifications, the debug-only `-rlordQR` launch argument),
+      `WebView.swift` (scheme handler from the manifest, CSP and
+      `nosniff` on every response, content rule list, navigation limited
+      to the first load and same-document changes, no windows, link
+      previews, data detectors, media or fraud-warning lookups,
+      non-persistent data store, inspectable in debug only),
+      `Keys.swift` (Secure Enclave signer and ECIES vault,
+      `AfterFirstUnlockThisDeviceOnly`; software keys only without an
+      enclave, in debug builds), `Scanner.swift` (AVFoundation, `RLORD1:`
+      only; a paste field in debug builds). No App Transport Security
+      exception: the app makes no URL loads, and ATS doesn't govern the
+      engine's own sockets.
+    - Found: the Apple Silicon simulator passes the Mac's Secure
+      Enclave through (`SecureEnclave.isAvailable` is true; enclave
+      signing and ECIES work there), so the simulator runs the hardware
+      key path, not the software fallback the plan expected.
+    - `crates/web/examples/remote_stack.rs`: a loopback host for the
+      app's runs (an in-memory daemon with fixture sessions, the real
+      `rlord-web`, the real relay in process; commands `pair`,
+      `restart-relay`, `stop-plugin`, `start-plugin`, `status`, by stdin
+      or `<dir>/control/*.cmd` files so the simulator's test runner can
+      drive it; `--auto-confirm`). `xtask` drives it (`app::Stack`).
+  - Gap closed (agent branch `s4-mailbox`): a device never learned that
+    its host had discarded its mailbox (a failure there, or the saved
+    state losing it), so its mailbox frames were dropped by id and
+    answers never came. The host's device `hello` now carries `mailbox`
+    (the id it holds for the device, or null); the engine discards and
+    keys a new one when it differs. Additive, `api` stays 1
+    (`e2e-protocol.md` §3, step 4). The engine also no longer offers a
+    refused frame, or marks one `queued`, that was sealed under a
+    mailbox it has since discarded: the request goes again under the
+    new one.
+  - Step 7 done (agent branch `s4-bridge`): the phone page without a
+    phone.
+    - `rlord-device bridge --state DIR [--port N] [--ca FILE] [--qr
+      RLORD1:…] [--name NAME] [--origin ORIGIN]…`
+      (`crates/e2e-device/src/bridge.rs`): the engine with software keys
+      behind a websocket on 127.0.0.1 that plays the shell. Each text
+      message from the page goes to `Engine::page_message`, but `scan`
+      and `settings`, which the bridge serves as the shell does
+      (`settings` answers `{"event":"settings","app_lock","notifications",
+      "platform":"bridge"}`, kept in memory; `scan` says `{"event":"scan"}`
+      on stdout for whoever runs it to answer with `qr …` on stdin); each
+      `to_page` goes back as a text message. Foreground while a page is
+      connected; one page at a time (a new one replaces the last). A
+      connection naming an `Origin` is refused unless given with
+      `--origin` (another site open in the same browser can't reach the
+      engine); Node sends none. Stdout: `ready` (URL, port), `page`,
+      `scan`, `notify`; stdin `qr …`, `network up|down`, `quit` (and its
+      end).
+    - The dev page: `app-dev.html` + `src/appDev.ts` + `src/devBridge.ts`
+      (`installDevBridge`: `webkit.messageHandlers.rlord.postMessage` is
+      `ws.send`, each message calls `__rlord_recv`, so `findBridge` and
+      `RemoteTransport` run unchanged), built by `vite build --mode
+      app-dev` into `dist-app-dev/` (git-ignored) with
+      `VITE_RLORD_BRIDGE_PORT`. Its CSP is the phone page's but
+      `connect-src ws://127.0.0.1:<port>` (`web_app::check_dev`). The
+      phone bundle can't carry it: `app.tsx` never imports it, and
+      `check-app` fails on its marker (`rlord-dev-bridge`), `WebSocket`
+      or any `ws://`; the local page's check fails on the marker too.
+    - `remote_stack` gains a fake overlord (tmux needed): the overlord row
+      is the example itself in a pane of the scratch tmux server, so
+      `overlord.ask` types into it as into a real one, and it writes each
+      line and an answer into a Claude transcript `overlord.messages`
+      reads. `claude`, `codex` and `opencode` on its PATH are the
+      example too (with `RLORD_NO_LOGIN_SHELL`), so a restart from the
+      page can't start a real agent. `pair` hands out the code only once
+      the plugin is linked to the relay (earlier, the device's pairing
+      found the rendezvous closed). A `.cmd` file's `.done` holds the
+      event the command said. The scratch tmux server and its socket file
+      go at quit.
+    - `cargo xtask app dev [--port N]` (`xtask/src/app_dev.rs`): the
+      stack, the bridge paired by the stack's code, the dev page built and
+      checked, `vite build --watch` and `vite preview` on 127.0.0.1;
+      prints the URL; stdin takes `pair`, `restart-relay`, `stop-plugin`,
+      `start-plugin`, `status`, `network up|down`, `quit`; the page's Scan
+      gets a fresh code. Checked in a headless Chromium: pairs, lists,
+      the overlord's chat, and a `fetch` is blocked by the CSP.
+    - `cargo xtask app test-e2e`: the stack (fails without its fake
+      overlord), the bridge with the stack's code, then
+      `vitest.app-e2e.config.ts` (`test/app-e2e/phone.test.ts`, not in
+      `npm test`) with `RLORD_BRIDGE_URL` and `RLORD_STACK_CONTROL`: the
+      page's own `Store`, `Phone` and `wirePhone` in Node over the dev
+      bridge and Node's WebSocket. Steps: pair (scanned, continue, the
+      code, confirmed by the stack, live, the host lists the device);
+      list (fixture rows, no `relay` section, `session.messages`, the
+      bridge's `settings`); ask (`sent`, then the fake overlord's answer
+      in `overlord.messages`); the relay restarted (a new hello, a
+      request); the plugin stopped (`host_offline`, an ask waits in the
+      outbox) and started (a new hello, the ask answered once, the outbox
+      empty); unpair (`unpaired`, the host drops the device). After a
+      failed step the rest are skipped. No Xcode, no `DEVELOPER_DIR`.
+      CI's `web` job installs tmux and runs it. Run on macOS about 25
+      times and on Linux (Debian, Node 26, without xtask, whose build
+      needs more than Docker's 2 GB here) twice.
+    - 2 of those macOS runs timed out at pairing. Found in the finishing
+      pass: the stack confirms at once, so the six-digit screen could
+      last less than the test's 50 ms poll; the test now watches every
+      screen the pairing signal shows.
+  - Steps 2 and 3 done (the engine; agent branch `slice4-engine`, merged
+    here): `crates/e2e-client` (`machine`, `driver`, `outbox`, `store`,
+    `link`, `soft`, `Engine`), `rlord-device` on it
+    (`crates/e2e-device/src/phone.rs` wraps it for tests),
+    `testing::Tamper` (a relay that holds the pinned key and forwards to
+    the real one) and `Flaky`, `crates/web/tests/engine.rs` and
+    `hostile.rs` (the owed hostile cases end to end). `check-deps`: the
+    engine's tree names no rlord and no relay, and rlord never names the
+    engine.
+  - Finishing pass (lead, 2026-11-23; `feature/web` with main 1.15.3
+    merged in, version 1.16.0-dev.2, local commits only, nothing pushed
+    or released):
+    - `crates/e2e-ffi` wraps the real engine (the stand-in is gone):
+      adapters for `Signers`, `Vault` (`unseal` is the engine's `open`)
+      and `Listener`; `BackgroundResult` names its outcome
+      (`not_paired`, `nothing_new`, `host_offline`, `refreshed`,
+      `failed`). The shell's scene-phase handler runs for the initial
+      phase too, so the engine (which starts as if in the background)
+      hears `lifecycle(true)` at launch.
+    - The phone-surface tests through the engine (agent branch
+      `s4-enginetests`): `crates/web/tests/engine_surface.rs` (a phone
+      leaves by itself, a `ui` command live, parked then pulled with the
+      relay's signal, the phone the target after it sent a form, the
+      engine's look-ups are the daemon's idempotent ops); the low-level
+      `remote_surface.rs` is gone. Found: the engine kept `page.report`
+      in its outbox (saved, resent for 2 minutes, which could resend a
+      stale `input: true`); it is a look-up now.
+    - Supervisor bug (agent branch `s4-supervisor`): after `web().stop()`
+      the dead plugin's `web.subscribe` stream still counted, because the
+      daemon only noticed a closed stream on its next write, so a relay
+      command right after a stop or restart went to the dead stream
+      ("rlord-web didn't answer within 10 s", from `relay.rs`). The push
+      loop now reads the client's end and ends at EOF; the stream count
+      lives in the supervisor; `stop()` returns once the plugin is reaped
+      and its stream closed (at most 1 s more), and its SIGKILL path
+      loops until reaped. Tests in `web_supervise.rs` and `remote.rs`;
+      the 500 ms sleep in `engine.rs` is gone.
+    - `hostile.rs` `two_devices_frames_swapped` was flaky (about half the
+      runs): passed on as they came, the host could drop the second link
+      for the first swapped frame before the relay forwarded the second.
+      The filter now holds the first until the other's arrives.
+    - iOS tests (`cargo xtask app test-ios`, simulator): XCTest
+      `LivePageTests` loads the real phone page through the scheme
+      handler and content rules and checks from inside that `fetch` (off
+      and on the page's scheme), a websocket and `innerHTML` are refused;
+      `BackgroundTests` (an unpaired engine's check through the FFI, the
+      notification's text); XCUITest `PairAndAskUITests` against the
+      loopback stack (debug launch arguments `-rlordReset YES -rlordQR
+      … -appLock NO`): pair, the fixture list, home and back, the relay
+      restarted through the stack's control folder, then an ask answered
+      by the fake overlord in the chat. The simulator's test runner
+      writes the Mac's control folder directly.
+    - Step 11: the shell is one shared instance (`Shell.shared`), so the
+      OS's background launch runs the same engine as the window; the
+      `.appRefresh` task calls `background_check` (20 s budget), logs the
+      outcome and asks for the next refresh, as does every trip to the
+      background; `notify` posts a count, never names, only when the
+      user turned notifications on. A real refresh can only be checked
+      on a phone (by hand).
+    - Docs: `docs/architecture.md` "The phone app" (and the hello's
+      mailbox), `docs/guide.md` "The phone app" (with the by-hand
+      install), `SECURITY.md`, `CONTRIBUTING.md` "The phone app",
+      `CLAUDE.md` (the app's network rule, how a page feature reaches the
+      phone, the `api` level), `docs/relay.md` (public certificates
+      only), `e2e-protocol.md` §4's device side as built,
+      `e2e-crypto.md`'s phone row and answer 3.
+- Owed after slice 4 (the branch stays dark: local builds only):
+  - **Android** (steps 12 and 13): the SDK and NDK, `install-tools
+    --app`, `app core-android`, the Gradle project, the asset loader and
+    WebView settings, the message listener, Keystore `Signer` and
+    `Vault`, CameraX with ZXing, lifecycle and the network callback, app
+    lock, WorkManager, `app android`, `app test-android`, the Android
+    gates of step 1 (a)–(e). Kotlin bindings are generated only once
+    `apps/android` exists.
+  - **No answer watchdog on a live session** (engine-agent finding): a
+    request whose frame the host never got (a link dropped under it,
+    say) waits until the next reconnect; the engine doesn't time it out
+    or resend on the same session. Recorded, not built.
+  - **By hand on the user's iPhone** (the install is in the guide):
+    enclave key creation and signing accepted by a real relay; wifi to
+    cellular and back; airplane mode; a long lock; the app killed
+    mid-ask; a background refresh producing a notification (and a
+    background launch with the app not running); app lock; revoke from
+    the host while the app is open and while it is closed; the
+    handshake's and first snapshot's time on cellular, with real
+    snapshot sizes (owed to the compression question); the phone CSS in
+    WKWebView (keyboard, viewport, scrolling).
+  - `app test-e2e`'s first run under xtask on Linux is CI's first `web`
+    job on this branch (it ran on Linux by hand, without xtask).
+  - The page: no DOM tests (no jsdom dependency was added); the
+    pairing, status and chat views are tested through their state and
+    event sequences only.
+  - Relays behind a private CA can't be reached from the phone (open
+    question 15, deferred).
+  - The protocol review before the final merge to `main` (slice 3
+    answer 8), and the push slice with the hosted relay.
 - Owed from merging main 1.15.3 into `feature/web` (1.16.0-dev.1):
   - The attention queue (main's `attention.rs`) counts only terminals as
     "looking": `tmux::list_clients` leaves web views out, so a session
@@ -3374,3 +3739,928 @@ it; 10 to 12 need 2, 3, 5, 7 and 9; 13 needs 12; 14 to 16 need 9 and 11;
 
 All 18 open questions: the recommended defaults, "for now". Questions 12–18
 (the production relay) stay revisitable when the hosted relay is planned.
+
+## Slice 4 plan: the phone app
+
+Planned 2026-11-23 (Fable planning agent), on `feat/web-ui-4` from
+`feature/web` (slice 3 merged there as #77). Nothing below is built. Goal:
+the user pairs their own phone by QR, sees the session list and talks to
+the overlord of a host behind NAT through their own relay, and the app
+recovers by itself from every kind of lost connection. Chat and state
+only: no live panes (the stream ids still leave room), no remote browser
+client, no network code in `rlord`.
+
+The user's decisions this plan takes as fixed: a native shell around a
+WebView running the same Preact page; crypto in Rust; chat and state
+first, panes later; per-device keys, pairing by QR with the host's
+confirmation; one pinned relay per host, no redirects or fallbacks; the
+host never accepts an incoming connection; the phone gets the same direct
+launches as a local page; post-quantum hybrid; **compression stays
+provisional and is not built**.
+
+**The feature branch stays dark (user, 2026-11-18).** No release of any
+kind is cut from `feature/web` or a branch off it: no stable release, no
+dev build, no `release.yml` run, no TestFlight, no Play track, no
+app-store submission. Everything in this slice is built and installed
+locally until the final merge to `main`. A PR into `feature/web` still
+bumps the `-dev.N` version (CI's `version-bump` checks it); nothing is
+published for it. `release.yml`, `version::CRATES` and the release asset
+lists are not touched by this slice.
+
+Versions read from crates.io on 2026-11-23: `uniffi` 0.32.2, `tauri`
+2.12.7, `rustls-platform-verifier` 0.7.1, `tokio-tungstenite` 0.30.0,
+`cargo-ndk` 4.1.2 (not used, below).
+
+What exists today (read from the code and this machine, for the
+implementer):
+
+- `crates/e2e-device` (`rlord_e2e_device`, bin `rlord-device`): `Device`
+  (`start_pairing`, `connect`, `live`, `key_mailbox`, `mailbox_request`,
+  `mailbox_receive`, `mailbox_open`), `Live` (`request`, `answer`,
+  `event`), `client::connect` (tokio-tungstenite 0.29, rustls with ring,
+  `webpki-roots`, `ca_file`; the pin check; `ConnectError`), and the
+  hostile relays in `testing.rs`. It does the protocol steps a test asks
+  for; it has **no reconnect loop, no outbox, nothing saved to disk**.
+- `crates/e2e-wasm`: the `wasm-bindgen` surface, kept alive by `cargo
+  xtask e2e test-wasm`. Nothing loads it in a page.
+- The page (`crates/web/ui/src/`): there is no `Transport` type yet.
+  `api.ts` has the concrete `Control` (token, websocket, backoff 250 ms
+  to 5 s, requests by number); `store.ts` depends only on `Requester`
+  (`request(op, args)`); `main.tsx` wires `Control` to the store, the
+  `Reporter` and the `ui` commands. `views/Overlord.tsx` and
+  `views/Session.tsx` are a header, buttons and a `Pane` (tmux bytes): a
+  device has no pane. `app.css` already shows one column under 900 px.
+- The plugin's CSP (`http.rs`): `default-src 'none'; script-src 'self';
+  style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src
+  'self'; connect-src 'self' ws://127.0.0.1:<port>`. No Trusted Types.
+- Remote ops: `web::OPS` with `remote` and `idempotent`; a remote call
+  has no `page`, is not a surface and gets no `ui` commands (`ui::target`
+  knows the terminal and web pages only). `overlord.messages` exists for
+  a chat view.
+- **Xcode 27.2 is at `/Applications/Xcode.app`, but `xcode-select`
+  points at the command line tools.** `cargo xtask app …` sets
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` itself (or
+  the user runs `sudo xcode-select -s` once). iOS 27.2 simulator runtimes
+  are installed. No Android SDK or NDK, and no iOS or Android Rust
+  targets yet (`rustup target add` in step 1).
+
+### Decisions
+
+#### Who owns the keys, the relay link and the sessions: a native Rust engine
+
+The device's whole protocol side runs **natively, in Rust, inside the
+app**, reached from Swift and Kotlin through UniFFI. The WebView holds no
+key, opens no socket and runs no crypto; it draws the page and exchanges
+plain JSON with the engine over the shell's message bridge. The WASM
+build is not loaded by the phone page.
+
+This changes answer 3 of `e2e-crypto.md` ("crypto runs as WASM there too;
+UniFFI shrinks to what the shell needs"), so it is open question 1. Why:
+
+| Concern | Engine in the shell (UniFFI) | WASM in the page's worker |
+| --- | --- | --- |
+| Work while the app is in the background (a refresh task, later a push wake-up) | runs without a WebView | the WebView and its sockets are suspended or not loaded at all; a second native relay client would be needed anyway |
+| Relay identity key (P-256) | made and kept in the Secure Enclave / Android Keystore, never extractable: the engine asks the shell to sign | must be plain bytes in JS memory to sign in WASM |
+| Content key (X25519) and mailbox state | never enter the JS realm; script injected in the page can send ops (as the page can) but can't copy a key | plain bytes in the worker |
+| The relay link's rules (exactly one URL, no redirect, no `permessage-deflate` offered, an extra CA) | the same rustls and tungstenite code the host and the tests use | a WebView's `WebSocket` always offers `permessage-deflate`, takes no extra CA and reports little about a failed upgrade |
+| The reconnect loop and every recovery rule of `e2e-protocol.md` §4 | one Rust state machine, tested natively against the real relay, plugin and hostile relays | TypeScript in a worker, tested in Node against stand-ins |
+| Saving mailbox state before sending (the crash rule) | atomic file writes | IndexedDB transactions, from a worker the OS may kill |
+| The page's CSP | `connect-src 'none'`: the page has no network path at all | needs `connect-src wss://<relay>`, `'wasm-unsafe-eval'`, a worker and a Trusted Types policy |
+| Cost | UniFFI bindings, an xcframework and an Android library; tokio and rustls in the app | no native library; the WASM path gets real use |
+
+The WASM core stays built and tested (`cargo xtask e2e test-wasm`) for a
+later remote browser client; this slice adds nothing to it. The owed
+"phone benchmarks" of the spike measured WASM in a phone browser and no
+longer gate this slice; they stay owed to a remote browser.
+
+#### Crates
+
+| Crate | Package, output | Depends on | Notes |
+| --- | --- | --- | --- |
+| `crates/e2e-client` (new) | `robot-overlord-e2e-client`, lib `rlord_e2e_client` | `rlord_e2e`, `rlord_relay_proto`, `tokio`, `tokio-tungstenite`, `rustls` (ring), `webpki-roots`, `serde_json` | The device engine: the state machine, the link driver, the outbox, storage. Not `rlord-core`, not `rlord-daemon`. |
+| `crates/e2e-ffi` (new; named in `e2e-crypto.md`) | `robot-overlord-e2e-ffi`, `staticlib` + `cdylib`, lib `rlord_e2e_ffi` | `rlord_e2e_client`, `uniffi` =0.32.2 | The UniFFI surface. Proc-macro mode, no UDL file. |
+| `crates/e2e-device` (existing) | lib + bin `rlord-device` | `rlord_e2e_client` | Becomes a thin test client and CLI on top of the engine, so `web/tests/remote.rs` exercises the code the phone runs. Gains `rlord-device bridge` (below). Keeps `testing.rs`. |
+
+- All `publish = false`, in `members`, not in `default-members`, not in
+  `version::CRATES`.
+- `e2e-client` splits in two so the hard part is testable without
+  sockets or clocks:
+  - `machine.rs`: a **sans-IO state machine**. Inputs: the page's
+    messages, relay text and binary frames, a link opening or closing
+    (with its close code), timers firing, `foreground`, `background`,
+    `network(up|down)`, a clock reading. Outputs: dial, send, close, set
+    a timer, save state, a message for the page, a notification request.
+    No tokio, no time source of its own.
+  - `driver.rs`: tokio, the websocket, TLS and timers, feeding the
+    machine. The pin check stays `relay-proto`'s `check_challenge`.
+- Three traits the platform implements (UniFFI foreign traits):
+  `Signer` (`public_key()`, `sign(transcript) -> 64 bytes`: the relay
+  identity), `Vault` (`seal(bytes)`, `open(bytes)`: wrapping at rest),
+  `Listener` (`to_page(json)`, `notify(kind, count)`). Tests and
+  `rlord-device` use software ones.
+- The FFI surface is small on purpose: `Engine::new(dir, vault, signers,
+  listener)`, `page_message(json)`, `scanned(qr, name)`,
+  `lifecycle(foreground | background)`, `network(online)`,
+  `background_check(budget_ms)`, `wipe()`. Everything else is JSON
+  through `page_message` and `to_page`, so a new page feature needs no
+  binding change.
+- `rust-toolchain.toml` gains `aarch64-apple-ios`,
+  `aarch64-apple-ios-sim` and `aarch64-linux-android` (and their mention
+  in its comment). Apple Silicon only: no x86_64 simulator or emulator
+  target.
+- `check-deps` gains: `rlord`'s deny list names the two new crates and
+  `uniffi`; the `e2e-client` tree names no `rlord-core`, `rlord-daemon`
+  or `robot-overlord-relay`; and the app source check below.
+
+#### Platforms, toolchain, minimum OS
+
+- **iOS first, Android second, both in this slice** (open question 2).
+  The engine, the bridge and the page are platform-neutral and built
+  first; the iOS shell is built and used before the Android one starts,
+  and the Android steps can be cut into a later PR without touching the
+  rest. iOS first because it is the stricter platform (background work,
+  the enclave's P-256 limit, WKWebView) and the build machine is a Mac.
+- **iOS:** Swift, SwiftUI app shell, `WKWebView`. Full Xcode (the
+  current release, with the iOS SDK it ships). Minimum **iOS 26**: the
+  first with Trusted Types in WebKit, and everything else used
+  (`WKURLSchemeHandler`, `WKScriptMessageHandlerWithReply`,
+  `BGAppRefreshTask`, `NWPathMonitor`, the Secure Enclave) is older.
+- **Android:** Kotlin, one activity, `android.webkit.WebView`
+  (`androidx.webkit`). Android SDK and NDK installed by `cargo xtask
+  install-tools --app` (versions and checksums of the command line
+  tools in `xtask/src/tools.rs`), the Gradle wrapper committed with
+  `distributionSha256Sum`, dependency verification on
+  (`gradle/verification-metadata.xml`). `minSdk` 31 (Android 12),
+  `targetSdk` the current level when built. The app refuses to start the
+  page on a System WebView older than a floor checked at launch (the
+  first with Trusted Types and `WebMessageListener`: 83; take 120) and
+  says to update it.
+- **Layout:** `apps/ios/` (a committed Xcode project, sources under
+  `apps/ios/rlord/`, signing settings in a git-ignored
+  `Local.xcconfig`), `apps/android/` (Gradle project). Neither is in
+  the Cargo workspace. Generated files (bindings, the xcframework, the
+  `.so`, the page) are not committed.
+- **No third-party SDK** in either app: no analytics, crash reporter,
+  ad or push library, no Firebase, no Play Services dependency.
+  Android: ZXing `core` (pure Java) for QR decoding, CameraX,
+  `androidx.webkit`, JNA (UniFFI's Kotlin needs it). iOS: Apple
+  frameworks only.
+
+#### The shell: hand-written Swift and Kotlin, not Tauri mobile
+
+| | Thin native shells + UniFFI (chosen) | Tauri 2 mobile | Capacitor / React Native |
+| --- | --- | --- | --- |
+| Rust in the app | through UniFFI bindings | in process, no bindings | none; a native module would still wrap the core |
+| WebView control (scheme handler, CSP headers, content rules, navigation, Safe Browsing off) | all of it, in a few hundred lines per platform | through Tauri's own asset protocol and IPC, which inject scripts and rewrite the CSP; Trusted Types with it is unverified | their own bridge and runtime |
+| Enclave / Keystore signing and wrapping | native code, called directly | a Swift and a Kotlin plugin anyway | a native plugin anyway |
+| Dependencies in a security-critical app | UniFFI, tokio, rustls | plus tauri, wry, tao and their trees; `tauri-cli` downloaded as a tool | an npm tree in the app |
+| Project files | ours | generated and owned by `tauri ios/android init` | generated |
+
+The shell's whole job is: load the bundled page, pass JSON between the
+page and the engine, scan a QR, sign and wrap with the platform
+keystore, report lifecycle and network changes, and post a local
+notification. That is small enough to own, and owning it is what lets
+the WebView be locked down exactly. Tauri would save the UniFFI layer
+and cost the control.
+
+#### Key storage
+
+Per paired host the device has its own key set (a second host never
+sees the same device keys; the UI shows one host in this slice, open
+question 10).
+
+| Thing | iOS | Android |
+| --- | --- | --- |
+| Relay identity (P-256 ECDSA) | Secure Enclave key (`kSecAttrTokenIDSecureEnclave`, private, non-extractable), `AfterFirstUnlockThisDeviceOnly`; signs the peer transcript with `ecdsaSignatureMessageX962SHA256` | Android Keystore EC key (`secp256r1`, `SHA256withECDSA`), StrongBox when the phone has one, else the TEE |
+| Vault key (wraps everything below) | a second Secure Enclave P-256 key used for ECIES (`eciesEncryptionCofactorVariableIVX963SHA256AESGCM`) | Keystore AES-256-GCM key, StrongBox when present |
+| Content key (X25519 static), the host's static key and pin, the mailbox state (89 bytes), `(boot, seq)` last opened, the outbox | one sealed file per host in the app's support directory, excluded from backup, written atomically (temp file, fsync, rename) by the engine | the same, in `noBackupFilesDir`; `allowBackup="false"` |
+
+- X25519 can't live in the enclave (P-256 only) and StrongBox has no
+  Curve25519, as `e2e-crypto.md` found: the content key is software,
+  wrapped by a hardware key, in memory only while the engine runs. P-256
+  as the Noise curve stays rejected.
+- The enclave and Keystore return ASN.1 DER signatures with a random
+  nonce; the link wants 64 bytes `r || s`. The engine converts (and
+  normalises `s` if the relay's verifier wants low-S). Verification
+  doesn't depend on RFC 6979, which stays what software signers do.
+  Checked in step 1.
+- `AfterFirstUnlock`, not `WhenUnlocked`: a background check runs while
+  the phone is locked. The keys never leave the device and are not in
+  any backup; a restored or new phone pairs again.
+- Simulators and emulators have no enclave: debug builds fall back to
+  software keys in the Keychain / Keystore, and say so on the status
+  screen. A release build refuses to run without hardware keys.
+- **Nothing of the host's content is stored on the phone.** The last
+  snapshot and the chat live in the engine's memory. The only user
+  content at rest is the outbox (the user's own unsent or unanswered
+  requests), sealed with the rest.
+- **App lock** (open question 9): on by default, the device's
+  biometrics or passcode (`LocalAuthentication`, `BiometricPrompt`)
+  when the app opens after more than 5 minutes away; the app requires a
+  passcode to be set on the phone. While locked the WebView is covered
+  (also in the app switcher; Android `FLAG_SECURE`). Pairing a phone is
+  granting it a shell: an unlocked stolen phone must not be one tap from
+  it.
+
+#### The bridge and `RemoteTransport`
+
+- **`Transport`** (new, `crates/web/ui/src/transport.ts`): what the page
+  needs of its connection: `request(op, args)`, the events (`state`,
+  `hello`, `changed`, `ui`), `stop()`, and `caps` (`panes`, `setup`,
+  `keys`, `devices`, `pending`). `Control` becomes `LocalTransport` (same
+  file, same tests, all caps true but `pending`). `Store` keeps its
+  `Requester`.
+- **`RemoteTransport`** (`remote.ts`): the same interface over the
+  shell's bridge. Requests and answers are the control socket's shapes
+  unchanged (`{"id","op","args"}`, `{"id","ok"}`, `{"id","error"}`), so
+  nothing above `Transport` knows which one it has. Views ask `caps`,
+  never the user agent: with `panes` false a view shows no pane; with
+  `setup`, `keys` and `devices` false those buttons are absent (their
+  ops are local-only and would be refused).
+- **The page picks nothing at run time.** A second Vite entry
+  (`app.html`, `src/app.tsx`) builds the phone page into
+  `crates/web/ui/dist-app/` with `RemoteTransport`, without xterm.js and
+  without `LocalTransport`; the local page's bundle carries no remote
+  code. `cargo xtask web build --app`.
+- **The bridge is three hops of the same JSON string.** Page to shell:
+  iOS `window.webkit.messageHandlers.rlord.postMessage(text)` (a
+  `WKScriptMessageHandler` registered for the main frame of the app's
+  own origin only); Android `WebViewCompat.addWebMessageListener` with
+  the app origin as the only allowed origin (never
+  `addJavascriptInterface`). Shell to page: iOS `callAsyncJavaScript`
+  of one fixed function with the text as an argument (never a built
+  script string); Android the listener's `JavaScriptReplyProxy`. The
+  shell parses nothing but the few `app` messages it serves itself.
+- **Messages beyond the control socket's** (typed in `proto.ts` as
+  `AppMessage` / `AppEvent`, with fixture tests):
+  - page to engine: `{"app":"status"}`, `{"app":"pair_cancel"}`,
+    `{"app":"unpair"}`, `{"app":"cancel","request":"<id>"}`,
+    `{"app":"settings",…}`; page to shell: `{"app":"scan"}` (opens the
+    native scanner).
+  - engine to page: `{"event":"conn","state":…,"host":"<name>",
+    "relay":"<origin>","detail"?}`, `{"event":"pairing","state":
+    "connecting"|"waiting"|"done"|"rejected"|"failed","code"?,
+    "reason"?}`, `{"event":"outbox","items":[{id, op, text?, at,
+    state}]}`, plus `hello`, `changed` and `ui` as a local page gets
+    them.
+  - `conn.state` is one of `unpaired`, `offline` (no network),
+    `connecting`, `relay` (linked to the relay, no session yet),
+    `host_offline`, `live`, `wrong_relay`, `revoked`, `update_app`,
+    `update_host`, `suspended`. The header shows it in words with the
+    host's name.
+- **The QR never passes through the WebView.** The scanner is a native
+  screen; its string goes from the shell straight to
+  `Engine::scanned`. The page only sees `pairing` events.
+- **Request ids.** The page numbers its requests as today. The engine
+  gives every request that needs one a device-unique id (16 random
+  bytes, base64url) and maps answers back; the id is saved with the
+  outbox entry, so it survives a restart of the app. The page never
+  chooses one.
+
+#### The WebView: CSP, Trusted Types, no network
+
+- The page is served from the app bundle by the shell: iOS a
+  `WKURLSchemeHandler` on `rlord-app://page/`; Android a
+  `WebViewAssetLoader` on `https://appassets.androidplatform.net/`. Only
+  the files of `dist-app/` (an asset table generated at build time, with
+  types); anything else is 404.
+- Response header on every file (and the same policy as a `<meta>` in
+  `app.html`, for the directives a meta may carry): `default-src 'none';
+  script-src 'self'; style-src 'self'; img-src 'self' data:; font-src
+  'self'; connect-src 'none'; base-uri 'none'; form-action 'none';
+  frame-ancestors 'none'; require-trusted-types-for 'script';
+  trusted-types 'none'`. No worker and no WASM, so no
+  `'wasm-unsafe-eval'`, no `worker-src` and no Trusted Types policy at
+  all. `style-src` drops `'unsafe-inline'` if the phone page works
+  without it (the local page needs it for xterm.js, which the phone page
+  doesn't have); kept only if step 1 shows Preact needs it.
+- The WebView can load nothing from the network, in depth: iOS a
+  `WKContentRuleList` that blocks every URL not on the app scheme, and
+  the navigation delegate cancels every navigation but the first load
+  and same-document (hash) changes; Android `blockNetworkLoads = true`,
+  `shouldInterceptRequest` answering everything itself,
+  `allowFileAccess` and `allowContentAccess` off, Safe Browsing off and
+  the WebView metrics opt-out set (both would talk to a third party
+  about a page that is only local files). A link in chat text opens
+  nothing in the WebView; it is copied or handed to the system browser
+  after a confirmation.
+- JavaScript is on; nothing else is: no file pickers, no geolocation, no
+  media capture in the WebView (the camera is the native scanner's), no
+  `window.open`. Web inspection (`isInspectable`,
+  `setWebContentsDebuggingEnabled`) in debug builds only.
+- Chat and session text is rendered as text nodes. No markdown-to-HTML,
+  no `dangerouslySetInnerHTML` (a lint rule on the UI package), so
+  `trusted-types 'none'` holds.
+- **One network path in the whole app: the engine's relay link.**
+  `cargo xtask check-deps` fails if anything under `apps/` names
+  `URLSession`, `NWConnection`, `CFNetwork`, `java.net`, `okhttp`,
+  `HttpURLConnection` or a socket API (`NWPathMonitor` and
+  `ConnectivityManager` are allowed: they only observe). App Transport
+  Security and Android's network security config allow cleartext to
+  `127.0.0.1` in debug builds only (a loopback relay in tests).
+
+#### Pairing on the phone
+
+1. First launch (or after unpairing): one screen. "On your computer run
+   `rlord relay pair` (or open Devices in rlord), then scan the code."
+   One button: Scan.
+2. The native scanner (iOS `AVCaptureMetadataOutput`; Android CameraX
+   with ZXing) accepts only a string starting `RLORD1:`; the engine
+   parses it (`QrPayload`). The camera permission is asked here, with
+   the reason in words. Debug builds also take the string by paste or a
+   launch argument (simulators have no camera).
+3. Before anything is sent the phone shows what it read: the relay's
+   origin ("this computer is reached through relay.example.com") and a
+   name field (the phone's model name as the default, 40 characters).
+   Continue.
+4. The engine makes the key set, dials the QR's relay as role `pair`,
+   checks it against the QR's pin, runs `IKpsk2`, and sends its name and
+   relay public key. The page shows the six digits: "Check that your
+   computer shows 123456, and confirm there." The host waits 120 s.
+5. `done`: the engine saves the host (static key, pin, relay key
+   fingerprint, name) and the keys, opens its first live session, keys
+   the mailbox, and the page goes to the list. `rejected`, a timeout, a
+   spent or expired QR, or "wrong relay": back to step 1 with the reason
+   in one line; the keys made in step 4 are deleted.
+- **Unpair** (the status screen): the engine sends the new op
+  `device.leave` when it has a live session (the host removes this
+  device and updates the relay's allow-list), then deletes the host
+  record, both keys and the sealed file. Without a session it deletes
+  locally and says to revoke the phone on the computer too.
+- **Revoked or expired** (close code 4403 on a `device` link): final.
+  The page says the phone is no longer paired with that computer and
+  offers to pair again; the old keys are deleted.
+
+#### The reconnect loop (`machine.rs`)
+
+The engine wants a relay link whenever the app is in the foreground and
+the phone has a network, and a live session whenever the host is online.
+Every requirement recorded for this slice ("Owed after slice 3";
+`e2e-protocol.md` §4, Device) and where it lands:
+
+| Requirement | In the machine | Named test |
+| --- | --- | --- |
+| Reconnect in a loop with backoff | 250 ms doubling to 30 s, each with up to 20% jitter; reset by a link that stayed `ready` 10 s | `backoff_grows_and_resets` |
+| At once on 4205, backing off if it repeats | the first 4205 redials with no wait; another within 60 s takes the backoff | `reset_reconnects_at_once`, `repeated_reset_backs_off` |
+| On a network change | `network(up)` or a changed path closes the link and dials at once; `network(down)` stops dialling | `network_change_redials`, `offline_stops_dialling` |
+| On coming to the foreground | `foreground` dials at once and resets the backoff; a link found silent is replaced | `foreground_dials_now` |
+| `KKpsk2` each time the host comes online | on `ready.host = online` and on `host online`; never reuses a session | `kk_on_host_online`, `no_session_reuse_after_reconnect` |
+| Compare the snapshot's `rev`, fetch when it differs | the engine keeps the last `rev`; `hello.rev` and `changed` go to the page, whose store asks `snapshot {rev}` as it does locally | `rev_differs_fetches`, `rev_same_asks_nothing` |
+| A device-unique id per request | 16 random bytes, saved with the entry before it is sent | `ids_survive_restart` |
+| Resend unanswered requests by id after any reconnect | every outbox entry without an answer goes out again, same id, oldest first, on the next live session | `resend_by_id_after_reconnect` |
+| When the relay's `boot` changes, resend every unanswered mailbox request | compared on every `ready`; each is encrypted afresh under the same request id | `boot_change_resends_mailbox` |
+| Answer `queued` / `refused`; a refused frame again later, before newer ones | one mailbox frame out at a time; the next leaves after `queued`; `refused full` is sent again (the same bytes) on the next link and every 30 s; `no_queue` fails the request as `host_offline`; `unknown` or `bad` discards the mailbox | `mailbox_one_at_a_time`, `refused_full_resent_first`, `no_queue_fails_request` |
+| Drop mailbox frames by `(boot, seq)` | saved with the state; a frame already opened is acknowledged and ignored | `redelivered_frame_ignored` |
+| Drop answers by request id it already has | an answer for an id not in the outbox is ignored | `duplicate_answer_dropped` |
+| `in_progress` means wait | the entry stays, marked running; no resend on this link; the answer follows | `in_progress_waits` |
+| `interrupted` means check, then ask anew | the entry ends with code `interrupted`; the page says it may not have happened and offers to send again (a new id) after the user has looked | `interrupted_surfaces_once` |
+
+The rest of the device's side, decided here:
+
+- **Final close codes** (4401, 4402, 4403, 4426) and "wrong relay" stop
+  the loop until the user acts: `revoked` (4403), `suspended` (4402),
+  `update_app` (4426), `wrong_relay`. No other address is ever tried;
+  the engine builds exactly one URL, from the pin.
+- **`bye {retry_after}`** is honoured with jitter; 4429 and 4503 take the
+  backoff; 4409 (replaced by a newer connection of this identity) waits
+  the backoff and does not fight; `enroll` is shown and waited on.
+- **Silence.** The engine pings every 15 s and gives a link up after 45
+  s without any message (the host's numbers). Like the host it compares
+  the wall and monotonic clocks every second and redials at once after a
+  10 s jump: a phone sleeps more than a laptop.
+- **A session that won't start.** No message 2 within 10 s, or
+  `undeliverable`, retries the handshake on the same link after 1 s
+  doubling to 30 s; it doesn't redial the relay.
+- **Any decrypt failure** poisons the session (the core does it); the
+  engine closes the socket and redials. An unknown text message is
+  skipped; a binary frame it can't parse closes the link.
+- **The mailbox.** Keyed on the first live session and again whenever
+  there is none or the host's `hello` names another. Advance, seal and save before a frame leaves; on
+  receipt: check `(boot, seq)`, the mailbox id, decrypt (a failure
+  discards the mailbox), record the answer, save, then `ack`. A
+  discarded mailbox is keyed again on the next live session and the
+  unanswered requests go out again by id.
+- **What may wait in the outbox.** Only `overlord.ask` and
+  `overlord.new_session` are accepted without a live session (they
+  travel by the mailbox, or live once the host is back). Every other op
+  needs a live session when it is sent, else it fails at once
+  (`disconnected` or `host_offline`). Once sent, an op that changes
+  something stays in the outbox until answered and is resent by id for
+  2 minutes; after that it ends as `interrupted` (the same "check, then
+  ask anew"). A look-up in flight when the link dies fails with
+  `disconnected`, as on the local page; the store asks again on `hello`.
+- **Pending messages** (open question 11): an unanswered ask is shown in
+  the chat as pending, with its age and Cancel (which removes it from
+  the outbox; what already reached the host can't be recalled). The
+  engine stops resending one after 24 hours and marks it failed. At most
+  16 entries; a 17th ask is refused with a clear message.
+- **Bounds.** At most one resend pass per link; `boot` changes and
+  signals from the relay can't make the device send faster than its
+  backoff; 20 ops per second is the host's limit and the page stays far
+  under it.
+
+#### Foreground, background and push
+
+- **Foreground:** a relay link and a live session, `changed` events,
+  the page as on a desk. On `ready` with `signal` set the engine clears
+  it (`ack_signal`) once the page has fetched.
+- **Going to the background:** the shell asks the OS for the short
+  finishing time it gives, the engine sends what is queued, then closes
+  the link cleanly (1000). No socket is held in the background and no
+  foreground service runs on Android. The host sees the session end and
+  goes back to signalling the relay.
+- **Push is not built in this slice** (open question 5). Evaluated
+  against the invariants:
+
+  | | Poll in the foreground only | OS background refresh + local notification (chosen for this slice) | APNs / FCM wake-up (a later slice) |
+  | --- | --- | --- | --- |
+  | "Anything for me?" when the app is closed | no | sometimes: when the OS grants a refresh (its choice; minutes to hours apart) | yes, promptly |
+  | Third parties | none | none | Apple or Google see a wake-up for this install each time the host's state moves; the relay holds the push token |
+  | Everyone dials out | holds | holds | holds for host and device; **the relay gains outbound connections** (to `api.push.apple.com`, FCM) and credentials |
+  | One pinned relay | holds | holds | holds only if the wake-up carries nothing (no address, no content) and the app answers it by dialling its pinned relay; the token is registered over the pinned link |
+  | Self-hosted relay | works | works | a store app's push credentials are the publisher's: a self-hosted relay needs a project-run push gateway (a fourth party), or the self-hoster builds the app themselves |
+  | Needs | nothing | nothing | a paid Apple developer account and the push entitlement; a Firebase project and Play Services on Android; a relay-link message for the token; relay code, config and docs; all of it before the protocol review |
+
+  Push wake-ups don't break either invariant if built contentless, but
+  they add a third party that learns when the user's agents are active,
+  make the relay an HTTP client with secrets, and can't be finished for
+  self-hosters without a gateway. None of that can be released from a
+  dark branch, and Android's needs Google's libraries in the app. So:
+  not now. The earlier decision ("APNs/FCM wake-ups", contentless)
+  stands as the direction; it gets its own slice with the hosted relay,
+  designed once the app is in daily use. This slice leaves room: the
+  relay's `signal` flag is already the thing a push would announce, and
+  the engine's `background_check` is what a push would call.
+- **Background refresh** (iOS `BGAppRefreshTask`; Android `WorkManager`,
+  periodic, network required): the OS calls
+  `Engine::background_check(budget)`. One attempt, no loop: dial, the
+  cheap check (`ready`'s `signal`, `queued`, `boot`); nothing waiting
+  ends there with no handshake. Otherwise `KKpsk2`, `snapshot`, deliver
+  any mailbox answers, clear the flag, close. The engine counts sessions
+  whose `shown_status` is `waiting_input` that were not in the count it
+  last notified, and asks the shell for a **local** notification:
+  "rlord: 2 sessions need you". A count only by default (open question
+  6); it is made on the phone, so no third party sees it. The
+  notification permission is asked the first time the user turns
+  notifications on in the status screen, not at launch.
+
+#### What the phone shows, and how the page adapts
+
+- **Ops**: the remote column as it stands (`snapshot`, `session.get`,
+  `view.default`, `overlord.*`, the `session.*` actions, `session.new`,
+  `session.fork`, `form.defaults`, `form.repos`), plus the additions
+  under "Daemon and plugin changes". Never `form.setup*`,
+  `overlord.setup_request`, `keys.list` or `device.*` management.
+- **Views** (the one-column layout the page already has under 900 px):
+  - *List*: sessions and groups tabs, the filter box, the usage column
+    dropped at phone width, a New button (the `n` / `N` keys have no
+    keyboard to live on): describe by default, manual from inside it.
+  - *Overlord*: a **chat view** (`views/Chat.tsx`): `overlord.messages`
+    (paged backwards on scroll), a composer that sends `overlord.ask`,
+    pending and failed bubbles from the `outbox` event, the status and
+    agent in the header, Start when it isn't running. Refreshed on
+    `changed`, and every 3 s while the overlord is `working` and the
+    chat is on screen (a look-up; `rev` doesn't move for every line).
+  - *Session*: header, description, notes, tags, the action buttons
+    (resume, restart, stop, archive, rename, describe, notes, tag, pin,
+    fork), and the session's recent messages read-only (open question
+    8). Where the pane would be: "The live terminal isn't available
+    remotely yet."
+  - *Forms*: New session (describe, then confirm; and manual) and Fork,
+    as full-screen sheets. Code folder, Keys and Devices are absent.
+  - *Status* (new, phone only): the host's name, the relay's origin, the
+    connection state in words, the device's id and name, key storage
+    (hardware or software), notifications, app lock, Unpair, versions.
+- **Phone details** (CSS and a little page code, no native UI):
+  `viewport-fit=cover` and the safe-area insets; `100dvh`; the composer
+  kept above the keyboard with `visualViewport`; inputs at 16 px so iOS
+  doesn't zoom; touch targets at least 44 px; nothing that needs hover;
+  light and dark from the system. The WebView fills the screen; the
+  system back gesture and Android's back button walk the page's hash
+  history.
+- **The local page gains nothing visible.** `Chat.tsx` is reachable
+  there only in tests (the same component, a fake `Requester`).
+
+#### Daemon and plugin changes
+
+- **The phone becomes a surface** (open question 7; slice 2 left room,
+  slice 3 left it to this slice). Without it a describe form sent from
+  the phone is answered on the host's screen, where the user isn't.
+  - `ui::target` gains `Target::Device(id)`; `pick` takes devices beside
+    pages, with the same rule: the surface the user last did something
+    on. A device's last-used time is the daemon's clock when a
+    user-driven remote op arrives from it (the same list of ops that
+    don't count) or a `page.report` with `input`.
+  - `page.report` and `page.pending` become remote; for a device the
+    "page" is the device id the plugin stamps (the device can't choose
+    it). The daemon keeps the same record per device (at most 16).
+  - `ui` lines gain `"to":"device","device":"<id>"`; the plugin sends
+    `{"event":"ui","cmd"}` on that device's live session. With no live
+    session the command is parked for that device (10 minutes, one slot)
+    and the plugin sends the relay a `signal` for it; `page.pending`
+    hands it over at the next `hello`. Not by the mailbox (slice 2
+    thought it would be): parked and pulled is less to get wrong.
+  - On a device the page handles `goto`, `show_list`, `set_view`,
+    `new_session`, `confirm_new_session` and `notice`. A tool that needs
+    a terminal or a local page (`confirm_setup`, `open_keys`, the
+    overlay) never targets a device: it takes the next surface or fails
+    naming them. Tool answers say `"on": "phone"`; `get_ui_state` gains
+    `target: "phone"` and a `phone` object shaped like `web`.
+- **`hello` gains `"api": 1`**, the remote API level (ops, snapshot and
+  `ui` shapes as a device sees them). The app is built on its own
+  schedule and meets a plugin of another version: the engine supports a
+  range and says `update_app` or `update_host` outside it. Within a
+  level, changes are additive only (a daemon test pins the remote
+  snapshot's keys against a fixture).
+- **`device.leave`** (remote, needs an id): the calling device removes
+  itself. The plugin does what `revoke` does for that one device. From a
+  local page it is `bad_request`.
+- **`session.messages {ref, before, limit}`** (both, idempotent; open
+  question 8): `overlord.messages` for any session, the same bounded
+  read of its transcript by plain code (50 messages, 4 KiB each).
+- `plugin::WEB_PROTOCOL` becomes 4. `proto.ts` `OPS` gains the new ops
+  with their tests.
+
+#### The overlord
+
+It gains a surface, so `overlord.md` changes in the same change: the
+phone is a third screen a targeted tool may land on (`"on": "phone"`),
+what can't open there (the code-folder form, the key screen, the
+overlay), and that a request from the phone is answered on the phone.
+Agent-neutral wording, a few lines. `mcp.rs`: the `get_ui_state` and
+targeted tools' descriptions name `phone`. No new MCP tool; devices and
+pairing stay invisible to it. The existing tests (every tool mentioned,
+none stale) cover it.
+
+#### Build tasks (`cargo xtask app …`, `xtask/src/app.rs`)
+
+| Task | Does |
+| --- | --- |
+| `web build --app` | the phone page into `crates/web/ui/dist-app/`, and its asset table |
+| `app bindings` | UniFFI's bindgen **in process** (`uniffi_bindgen` as a library, pinned beside `uniffi` in `Cargo.lock`; no tool download), Swift into `apps/ios/Generated/`, Kotlin into `apps/android/app/build/generated/uniffi/` |
+| `app core-ios` | `cargo build --release -p robot-overlord-e2e-ffi` for `aarch64-apple-ios` and `aarch64-apple-ios-sim`, then `xcodebuild -create-xcframework` into `apps/ios/Frameworks/` |
+| `app core-android` | the same for `aarch64-linux-android`, the linker set from `ANDROID_NDK_HOME` by xtask (no `cargo-ndk`), into `apps/android/app/src/main/jniLibs/arm64-v8a/` |
+| `app ios [--sim \| --device <id>]` | page, bindings, core, `xcodebuild` (Debug), then install and launch (`simctl` or `devicectl`) |
+| `app android [--emulator \| --device <serial>]` | page, bindings, core, `./gradlew assembleDebug`, `adb install -r`, launch |
+| `app dev` | a local relay, a dev daemon with the plugin, and `rlord-device bridge`, for working on the phone page in a desktop browser |
+| `app test-e2e`, `app test-ios`, `app test-android` | under "Tests" |
+| `install-tools --app` | the Android command line tools, SDK platform and NDK, by version and checksum |
+
+The Xcode and Gradle builds never call these tasks; they consume what
+the tasks left. Pure logic in the tasks (target names, paths, the
+asset table) gets unit tests.
+
+#### Installing on the user's own phone, without a release
+
+- **iOS:** Xcode installed and signed in; the phone in Developer Mode
+  and trusted. `apps/ios/Local.xcconfig` (git-ignored; a committed
+  `.example`) holds the team id and the bundle id. `cargo xtask app ios
+  --device <id>` builds, signs with automatic provisioning and installs
+  with `devicectl`. A free Apple ID's profile lasts 7 days (run the
+  task again; Keychain items outlive a reinstall, so the pairing should
+  too, checked in step 10); a paid account's lasts a year (open question 3).
+- **Android:** USB debugging on; `cargo xtask app android --device
+  <serial>` installs a debug build signed by the local debug keystore.
+  Reinstalling over it keeps the pairing.
+- The app's version is the workspace's. Nothing is uploaded anywhere.
+- The relay for this is the user's own (slice 3's by-hand pass, still
+  owed, comes first); there is still no default or project-run relay.
+
+### Tests
+
+Never `tmux -L rlord` or the default server; no real agent; no network
+beyond loopback; every relay in an automated test is the real
+`rlord-relay` on `127.0.0.1:0`.
+
+- **The machine** (`crates/e2e-client`, unit, a scripted link and a fake
+  clock): every row of the reconnect table by its name; the final close
+  codes; `bye`; 4409; `enroll`; silence and a clock jump; a handshake
+  that gets no answer; the mailbox's save-before-send (a "crash" between
+  each pair of steps, then a restart from what was saved, never repeats
+  or loses a request); the outbox bounds and the 24-hour stop; ids that
+  survive a restart; the background check doing no handshake when
+  nothing waits.
+- **Against the real plugin, daemon and relay** (`crates/web/tests/
+  remote.rs`, now through the engine; slice 3's tests pass unchanged
+  first): the relay restarted (`boot` changes, queued requests resent
+  and run once); the plugin restarted mid-request (`in_progress`, then
+  the answer; `interrupted`); the host's `drop` (4205) and a stalled
+  link; a full queue refusing a frame, then taking it; a connection cut
+  at each step by a test proxy (`testing::Flaky`), with the request
+  still answered once; a network that stays away, then returns; two
+  engines with one identity (4409, no fight); `device.leave`; a `ui`
+  command reaching the device live, and parked then pulled; the phone
+  chosen as the target after it sent a form.
+- **Hostile relays** (`crates/e2e-device/src/testing.rs` gains
+  `Tamper`: a relay that holds the pinned relay's own key and forwards
+  to the real one, so it passes the pin and can then misbehave). The
+  cases still owed from slice 3, end to end: a revoked device let
+  through (`KKpsk2` fails at the host); a `link` invented for a device
+  not on the list; two devices' frames swapped; a mailbox frame
+  replayed, and one skipped; a recorded pairing replayed after the
+  rendezvous closed; `bye` `retry_after` and `enroll` on the client
+  side (the plugin's and the engine's). New, aimed at the device: a
+  relay that lies that the host is online (no spin: the handshake
+  backoff); one that changes `boot` on every connect and one that
+  signals constantly (the device sends no faster than its bounds); one
+  that never answers `queued` or `refused` (a timeout, a redial); a
+  replayed message 2; garbage binary frames; old mailbox frames
+  replayed to the device (the mailbox is discarded and keyed again, no
+  answer accepted twice).
+- **Daemon** (`web_api.rs`): `page.report` and `page.pending` from a
+  device; `pick` with devices; a device never targeted by a
+  terminal-only or local-only tool; `device.leave` only removes the
+  caller and is refused locally; `session.messages` bounded; `api` in
+  the plugin's hello path; the remote snapshot's keys against the
+  fixture; `the_pages_ops_are_the_daemons` still holds.
+- **Page** (Vitest): `RemoteTransport` against a fake bridge (requests,
+  events, a reload restoring pending bubbles from `outbox`);
+  `LocalTransport` keeps `api.test.ts`; `caps` hide what a device can't
+  call; the chat view against a daemon-written fixture
+  (`overlord_messages.json`); the pairing and status screens by event
+  sequence; the `ui` commands on the phone entry.
+- **The phone page's bundle** (a Rust test beside the asset table):
+  every file local, no URL with a network scheme in the built output,
+  the CSP's `connect-src 'none'` and `trusted-types 'none'` present,
+  no xterm.js and no `LocalTransport` in it.
+- **Scripted end to end, no simulator** (`cargo xtask app test-e2e`): a
+  real relay, a dev daemon with the plugin, and `rlord-device bridge`
+  (the engine running natively, offering the bridge's JSON on a loopback
+  websocket: a debug-only stand-in for the shell). A Vitest project runs
+  the phone page's own store and `RemoteTransport` over it: pair (the
+  task confirms on the host with `rlord relay confirm`), list, ask the
+  overlord, the relay killed and restarted, the plugin killed and
+  restarted, unpair. Runs in CI's `web` job.
+- **Simulators** (local only; no macOS CI minutes on a dark branch):
+  - `app test-ios`: XCTest for the vault and signer wrappers (the
+    software fallback), the scheme handler's asset table and headers,
+    and the bridge; one XCUITest that launches with a debug QR argument
+    against the same local relay and host (the simulator shares the
+    Mac's loopback): pair, see a fixture session, ask, send the app to
+    the background and bring it back (a fresh session), stop the relay
+    and start it (recovers), a web console check that a `fetch` from
+    the page is blocked.
+  - `app test-android`: the same on an emulator (`adb reverse` for the
+    loopback relay), instrumented tests for Keystore wrapping and
+    signing, the asset loader and the message listener.
+- **`check-deps`**: the new deny-list names, the engine's tree, and the
+  app source check, each with a planted-name test.
+- **By hand, on real phones** (hardware keys exist only there): enclave
+  and StrongBox key creation and signing accepted by a real relay;
+  wifi to cellular and back; airplane mode; a long lock; the app killed
+  mid-ask; a background refresh producing a notification; app lock;
+  revoke from the host while the app is open and while it is closed;
+  the handshake and first snapshot's time on cellular, recorded here
+  (with real snapshot sizes, still owed to the compression question).
+
+### Implementation steps
+
+For an Opus implementer at high effort. One commit each; the PR bumps
+the version to the next `-dev.N` and regenerates `Cargo.lock`; nothing
+is released. Record each step in "Progress". Steps 1 and 9 onward need
+Xcode; 12 onward the Android SDK.
+
+1. **Gates, before anything is built on them** (scratch code, not
+   kept). (a) `rlord_e2e`, `relay-proto` and the link's TLS stack
+   (rustls with ring, tokio-tungstenite) build for the three mobile
+   targets. (b) UniFFI 0.32.2: bindgen in process from xtask; a foreign
+   trait called from Rust and a Rust object called from Swift (simulator)
+   and Kotlin. (c) A Secure Enclave signature (on the user's phone) and
+   an Android Keystore one, converted to `r || s`, pass
+   `relay-proto`'s check; if the verifier wants low-S, normalise in the
+   engine. (d) `WKWebView` loads a built Preact page with module scripts
+   from the custom scheme under the policy above (`'self'` on a custom
+   scheme, `connect-src 'none'`, `trusted-types 'none'`, no
+   `'unsafe-inline'` styles) and the bridge round-trips; the same in
+   Android's WebView. (e) A simulator and an emulator reach a relay on
+   the Mac's loopback. A failed gate is reported to the user with the
+   fallback under "Risks" before going on.
+2. **`crates/e2e-client`**: `machine.rs` with the table's tests, the
+   outbox, storage with the `Vault` trait, the `Signer` trait
+   (`relay-proto`'s transcript signing takes a signer, not only a seed),
+   `driver.rs`.
+3. **`e2e-device` on the engine**: the CLI and the test helpers call
+   it; slice 3's `remote.rs` and `pin.rs` pass unchanged; then the new
+   integration tests, `testing::Flaky` and `testing::Tamper` with the
+   owed hostile cases.
+4. **Daemon and plugin**: `api` in `hello`, `device.leave`,
+   `session.messages`, the device as a surface (`ui.rs`, `web.rs`, the
+   plugin's session and parked slot), `WEB_PROTOCOL` 4, `overlord.md`,
+   `mcp.rs`, tests.
+5. **Page, part 1**: `Transport`, `LocalTransport`, `caps`; no visible
+   change to the local page; tests.
+6. **Page, part 2**: `RemoteTransport`, the `app` entry and build
+   (`web build --app`), the chat view, the session messages, pairing
+   and status screens, the phone CSS, the bundle test.
+7. **`rlord-device bridge`, `cargo xtask app dev` and `app test-e2e`**;
+   CI's `web` job runs the last.
+8. **`crates/e2e-ffi`** and `app bindings`; `check-deps`.
+9. **iOS shell**: `app core-ios`, the Xcode project, the scheme
+   handler and content rules, the bridge, the enclave `Signer` and
+   `Vault`, the scanner, lifecycle and `NWPathMonitor`, app lock.
+   `app ios`.
+10. **iOS tests** (`app test-ios`) and the install on the user's phone;
+    the by-hand list on iOS.
+11. **Background refresh and local notifications** (engine
+    `background_check`, iOS task).
+12. **Android shell**: `install-tools --app`, `app core-android`, the
+    Gradle project, the asset loader and WebView settings, the message
+    listener, Keystore `Signer` and `Vault`, CameraX with ZXing,
+    lifecycle and the network callback, app lock, WorkManager. `app
+    android`.
+13. **Android tests** (`app test-android`), the install, the by-hand
+    list on Android.
+14. **Docs**: `docs/architecture.md` "Remote access" gains "The phone
+    app" (the engine, the bridge, the one network path, what is stored
+    on the phone, the phone as a surface); `docs/guide.md` (pairing a
+    phone, what it can do, unpairing, revoking a lost one);
+    `SECURITY.md` (what a stolen phone can do, what the app keeps, no
+    third parties, no push yet); `CLAUDE.md` (the app's network rule,
+    how a page feature reaches the phone, the `api` level);
+    `CONTRIBUTING.md` (the app toolchain and tasks);
+    `e2e-protocol.md` §4's device part as built (still to be reviewed,
+    then promoted); `e2e-crypto.md`'s phone row and answer 3; this doc.
+
+Steps 2 and 3 need 1(a); 4, 5 and 6 need nothing native and can run
+beside 2 and 3; 7 needs 3 and 6; 8 needs 2; 9 needs 6 and 8; 12 needs 6
+and 8. Steps 12 and 13 can move to a later PR.
+
+### Risks
+
+- **Two native apps are a new kind of thing in this repo.** Swift,
+  Kotlin, Xcode and Gradle projects, signing, simulators. Bounded by
+  keeping the shells thin (no logic the engine or the page can hold) and
+  the tasks in xtask; still the largest slice so far.
+- **Nothing native can be built today.** No Xcode, no Android SDK on
+  the build machine; hardware keys can only be tested on the user's
+  phone, by hand.
+- **UniFFI in a first use.** Foreign traits called from a tokio thread,
+  bindgen in process, a static library per target. Gate 1(b). Fallback
+  if in-process bindgen is unusable: the `uniffi-bindgen` binary built
+  from the workspace (`cargo run`), still pinned by the lockfile.
+- **`'self'` and module scripts on a custom scheme in WKWebView.** Gate
+  1(d). Fallback: name the scheme in the policy instead of `'self'`;
+  last resort, a loopback HTTP server inside the app is **not** taken
+  (a listener on the phone).
+- **Hardware signatures.** DER, random nonces, possibly high-S. Gate
+  1(c). Fallback: normalise; if the enclave can't be used at all, a
+  software P-256 key wrapped by the vault key (weaker, stated).
+- **The engine is one more implementation of the device's side** beside
+  what slice 3's tests drove. Bounded by making `rlord-device` the same
+  code, so there is one.
+- **App and host on different versions.** The page in the app was built
+  against one daemon and meets another. The `api` level and
+  additive-only snapshots; a clear `update_app` / `update_host`, not a
+  broken list.
+- **A phone is easier to lose than a laptop, and it holds a shell.**
+  App lock, hardware keys, nothing of the host's stored, revocation and
+  the 90-day expiry. An unlocked phone in the wrong hands, inside the
+  app-lock window, can still type to the overlord.
+- **No push means "needs you" arrives late.** A background refresh is
+  the OS's favour, not a schedule. The app is honest about it on the
+  status screen. If that proves the feature that matters most, the push
+  slice moves up.
+- **The phone as a surface can target wrongly** (a form opening on a
+  phone in a pocket). The same guard as slice 2: the notice on the other
+  surfaces, and the answer's `"on"`.
+- **Chat without a pane is thinner than the terminal.** Text only, 50
+  messages of 4 KiB, no tool output. It is the chat-first scope; panes
+  over the relay are the slice after.
+- **Uncompressed snapshots on cellular.** Tens of kilobytes per fetch.
+  `rev` keeps repeats off the wire; sizes are recorded in the by-hand
+  pass for the compression question.
+- **WebView differences.** WKWebView and Android's Chromium differ in
+  keyboard, viewport and scrolling behaviour; the phone CSS is checked
+  on both, by hand.
+- **Private-CA relays.** The engine trusts `webpki-roots` only; the QR
+  carries no CA. A phone can't reach a relay behind a private CA until
+  that is designed (owed).
+- **The protocol is still unreviewed** and now runs on a phone. Only
+  the user's own relay and phone, until the review (slice 3 answer 8).
+
+### Open questions for the user
+
+1. **Where the phone's crypto and relay link live.** Planned: a native
+   Rust engine in the shell (UniFFI) owns the keys, the relay
+   connection, the Noise sessions, the mailbox and the reconnect loop;
+   the WebView only draws and has no network access. This changes your
+   earlier answer ("crypto runs as WASM there too"). Alternative: WASM
+   in a worker of the page, with the shell keeping only keys at rest:
+   less native code, but key bytes in the page's memory, no hardware
+   relay key, no work in the background without a second client, and
+   the recovery logic in TypeScript. Recommended: the native engine.
+2. **Which phone first.** Planned: iOS first, then Android, both in
+   this slice, Android's steps separable. Which phone do you carry?
+   Recommended: iOS first; if you carry an Android phone, swap the
+   order (the engine and the page don't care).
+3. **Apple developer account.** A free Apple ID installs builds that
+   last 7 days and can never have push; the paid program gives a year
+   and is needed for push and any later distribution. Are you in the
+   program, and under which team should dev builds be signed?
+   Recommended: the paid team if you have one; the free one is enough
+   for this slice.
+4. **The shell.** Planned: hand-written Swift and Kotlin shells around
+   the WebView. Alternative: Tauri 2 mobile (Rust in process, no UniFFI,
+   one project), at the cost of its IPC and asset layer in the middle
+   of a locked-down WebView and plugins still needed for the keystores.
+   Recommended: hand-written.
+5. **Push notifications.** Planned: none in this slice. The app checks
+   when opened and when the OS grants a background refresh, and posts
+   local notifications; APNs/FCM wake-ups (contentless, as you decided)
+   become their own slice with the hosted relay, because they add Apple
+   or Google as a party that sees when your agents are active, make the
+   relay hold push credentials and dial out, need a paid Apple account
+   and Google's libraries, and need a gateway for self-hosters.
+   Alternative: build APNs now for your own relay and your own build
+   only. Recommended: as planned.
+6. **What a notification says.** Planned: a count ("2 sessions need
+   you"), made on the phone. Alternative: session names on the lock
+   screen, as a setting. Recommended: count only by default, names as
+   an opt-in.
+7. **The phone as a screen the overlord can target.** Planned: yes, by
+   the same rule as web pages (the screen you used last), so a describe
+   form sent from the phone is confirmed on the phone; the code-folder
+   form, the key screen and the overlay never go there. Alternative:
+   the phone offers only what needs no overlord UI command (chat,
+   actions, the manual form). Recommended: yes.
+8. **A session's view without its pane.** Planned: add a read-only
+   `session.messages` (the session's recent conversation as text, like
+   `overlord.messages`), so you can see what a waiting session asked;
+   answering it goes through the overlord until panes arrive.
+   Alternative: also a direct "send text to this session" op now.
+   Recommended: reading yes, direct sending no (a second way to type
+   into agents, before panes make it moot).
+9. **App lock.** Planned: on by default, biometrics or passcode when
+   the app opens after more than 5 minutes away, and the phone must
+   have a passcode. Recommended: on by default, with a setting to turn
+   it off.
+10. **More than one computer per phone.** Planned: storage and keys are
+    per host from the start, the app shows one host in this slice, a
+    switcher later. Recommended: as planned.
+11. **Messages typed while the computer is unreachable.** Planned: an
+    ask stays pending (visible, cancellable) and is resent until
+    answered; the app stops trying after 24 hours. Alternative: fail
+    after the relay's 10-minute queue. Recommended: as planned.
+12. **Unpairing from the phone.** Planned: a new remote op
+    `device.leave` that lets a device remove only itself, so "Unpair"
+    on the phone also clears it from the computer. Recommended: yes.
+13. **Minimum OS.** Planned: iOS 26 and Android 12. Recommended: as
+    planned, unless your phone is older.
+14. **The app's name and identifier.** Planned: "rlord", with a bundle
+    and application id under the project's domain; dev builds use
+    whatever `Local.xcconfig` says. Which identifier do you want
+    reserved? Recommended: decide before the first device install; it
+    is awkward to change once keys are stored under it.
+15. **Relays behind a private CA.** Planned: not reachable from the
+    phone in this slice (public certificates only). Alternative: trust
+    the phone's own certificate store (`rustls-platform-verifier`), so
+    a CA profile installed on the phone works. Recommended: defer
+    until someone runs such a relay.
+16. **The review and the relay.** Slice 3's answers put an informal
+    protocol review "before the phone slice ships" and a project-run
+    relay "with the phone slice". Planned: with the branch dark, neither
+    happens in this slice; you use your own relay and phone, the review
+    happens before the final merge to `main`, and the hosted relay is
+    planned with the production-relay and push work. Recommended: as
+    planned.
+
+### Slice 4 answers (user, 2026-11-23)
+
+1. Crypto and the relay link: the native Rust engine (UniFFI) in the
+   shell. This replaces the earlier "WASM in the page" answer for the phone.
+2. iOS first.
+3. The paid Apple developer team (`PL2X8AJK8A`, the one that signs the
+   macOS Developer ID builds). No Apple Development certificate is on this
+   Mac yet; Xcode automatic signing creates one on the first device build.
+4. App identifier `com.robot-lord.rlord`.
+5–16. The recommended defaults.
+
+`xcode-select` now points at Xcode (the user ran `sudo xcode-select -s`).
+
+## Slice 5: live terminals on the phone (decided, not planned yet)
+
+User, 2026-11-24, after the first real-iPhone run (paired through the
+Tailscale Serve dev relay, CONTRIBUTING.md): the phone's core job is
+good communication with the terminals, the overlord's included.
+
+- The phone talks to every session through its tmux pane, as the
+  terminal app and the desktop page do: live panes over the relay (today
+  streams 1 and up close the link), a terminal view with the keyboard and
+  a row of special keys.
+- The overlord stays special on the phone and the desktop (its own
+  place, its prominence), but on the phone it is reached through its pane
+  too. The phone's separate message path to it (the chat view over
+  `overlord.ask` / `overlord.messages`) is removed; a removal from the
+  remote API bumps `web::API`. The desktop page's overlord is unchanged.
+- The read-only transcript view (`session.messages`) is what the phone
+  shows today instead of a pane; whether it stays (as an offline or
+  slow-link fallback) is a planning question.
+- Slice 4 merges first, as built; slice 5 is its own PR.
+
+Found on the real phone, fixed on `feat/web-ui-4`: the first device
+install needs `-allowProvisioningDeviceRegistration`; the pairing screen
+restyled (robot, centred); the web view's own scroll view rubber-banded
+the whole app past a list's end. The demo gotcha: a `rlord-demo` tmux
+server left by an older demo keeps that demo's environment, so a new
+demo's stand-ins write transcripts into the old folder (stop old demos
+with `scripts/demo/demo.sh --stop DIR` first).

@@ -8,6 +8,7 @@
 
 import type { ListView, SessionBase, UiCmd } from "./proto";
 import type { Route } from "./route";
+import { type Caps, LOCAL_CAPS } from "./transport";
 
 /** The forms a page can have open (`page.report`'s `form`). */
 export type FormKind = "describe" | "confirm" | "manual" | "fork" | "setup" | "keys" | "devices";
@@ -48,8 +49,22 @@ export function formOf(cmd: UiCmd): FormKind | null {
   }
 }
 
-/** What the page does for `cmd`, given the form open now. */
-export function decide(cmd: UiCmd, open: OpenForm | null): Effect[] {
+/**
+ * What the page does for `cmd`, given the form open now. A form this
+ * connection can't use (a phone has no code-folder form or key screen;
+ * the daemon never sends one there) is only a notice.
+ */
+export function decide(cmd: UiCmd, open: OpenForm | null, caps: Caps = LOCAL_CAPS): Effect[] {
+  if (cmd.cmd === "setup" && !caps.setup) {
+    return [
+      { do: "toast", text: "The overlord opened the code-folder form: it opens on your computer." },
+    ];
+  }
+  if (cmd.cmd === "keys" && !caps.keys) {
+    return [
+      { do: "toast", text: "The overlord opened the key screen: it opens on your computer." },
+    ];
+  }
   switch (cmd.cmd) {
     case "goto":
       return [

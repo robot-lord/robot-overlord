@@ -39,3 +39,17 @@ reaching a host through another relay than its pin, adding a device
 without the user's confirmation, or a device reaching an op it isn't
 given; and in `rlord-relay` itself, anything that lets one host or
 device affect another's traffic or registration.
+
+The phone app (not released yet; built and installed by hand from a
+development branch) is such a device. Its relay key lives in the Secure
+Enclave and its files are sealed with another enclave key, in a folder
+left out of backups; it keeps nothing of the host's but its public key
+and the relay's pin. Its page has no network access (`connect-src
+'none'`, every other URL blocked): the app's only connection is the
+engine's to the pinned relay, with public certificates only. No third
+party is involved: no push service, no analytics. Someone holding the
+unlocked phone, inside the app lock's 5 minutes, can do what the phone
+can; revoke a lost phone on the host (`rlord relay revoke`). Reports in
+scope: the page reaching the network, another app or site driving the
+app, the app trusting a relay other than its pin, or key material leaving
+the enclave.

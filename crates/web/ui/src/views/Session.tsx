@@ -1,9 +1,10 @@
-// A session (`#/s/<id>`): its header, its buttons, and its pane, or
-// Resume when it isn't running.
+// A session (`#/s/<id>`): its header and its buttons, then what the entry
+// puts below them: the local page's pane (views/panes.tsx), the phone's
+// notes and recent messages (views/Chat.tsx).
 
+import type { ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import { ResumeButton, RunnerNote, SessionActions, useRunner } from "../components/Actions";
-import { Pane } from "../components/Pane";
+import { type Runner, SessionActions, useRunner } from "../components/Actions";
 import { Status, Work } from "../components/Status";
 import type { Row, SessionBase } from "../proto";
 import type { Store } from "../store";
@@ -23,7 +24,16 @@ export function Back() {
   );
 }
 
-export function Session({ store, id, token }: { store: Store; id: string; token: string }) {
+export function Session({
+  store,
+  id,
+  body,
+}: {
+  store: Store;
+  id: string;
+  /** Below the buttons: the pane, or the session's text. */
+  body: (s: SessionBase, act: Runner) => ComponentChildren;
+}) {
   const listed: SessionBase | undefined = store.row(id);
   // Not in the list's view (archived, filtered out): asked for once.
   const [fetched, setFetched] = useState<SessionBase | null>(null);
@@ -73,21 +83,7 @@ export function Session({ store, id, token }: { store: Store; id: string; token:
         <Work s={s} />
       </header>
       <SessionActions s={s} r={act} onFork={() => openFork(store, s)} />
-      <Pane
-        key={s.id}
-        target={s.id}
-        token={token}
-        watch={`${s.status}:${s.tmux_session ?? ""}`}
-        notRunning={
-          <>
-            <p>{s.archived_at ? "This session is archived." : "This session isn't running."}</p>
-            <ResumeButton s={s} r={act} />
-            <p>
-              <RunnerNote r={act} />
-            </p>
-          </>
-        }
-      />
+      {body(s, act)}
     </section>
   );
 }

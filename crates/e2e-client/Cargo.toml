@@ -1,0 +1,35 @@
+# rlord's device engine (`rlord_e2e_client`): the device's whole side of
+# remote access, natively, for the phone app (through `crates/e2e-ffi`) and
+# the test device (`rlord-device`). Keys through the platform's `Signers`
+# and `Vault`, the relay link, the Noise sessions, the mailbox, the outbox
+# and the reconnect loop. Never in the `rlord` binary, and its tree names
+# no part of rlord or the relay (`cargo xtask check-deps`). See
+# docs/working/web-ui-remote.md, "Slice 4 plan: the phone app".
+[package]
+name = "robot-overlord-e2e-client"
+description = "rlord's device engine for remote access. Not a stable API."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "rlord_e2e_client"
+
+[dependencies]
+rlord-e2e = { package = "robot-overlord-e2e", path = "../e2e" }
+rlord-relay-proto = { package = "robot-overlord-relay-proto", path = "../relay-proto" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+getrandom = "0.3"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

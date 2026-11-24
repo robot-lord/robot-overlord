@@ -1,4 +1,4 @@
-**Status:** in progress (slice 3 of `web-ui-remote.md`; written while building, to be read by a reviewer, then promoted)
+**Status:** in progress (slices 3 and 4 of `web-ui-remote.md`; written while building, the device side as built by the engine in slice 4; to be read by a reviewer, then promoted)
 
 # rlord remote protocol, v1
 
@@ -281,8 +281,14 @@ The device id is `device_id(static)`: 16 hex characters of a labelled hash.
    whose fingerprint is not one of its devices (`drop`) and answers with
    the device's stored static key, so a revoked or swapped device fails.
 2. The device's first frame: `{"event":"hello"}`. The host answers
-   `{"event":"hello","version","rev","device":"<id>"}`, and after that
-   `{"event":"changed","rev"}` on every change of the daemon's state.
+   `{"event":"hello","version","api","rev","page":"<id>","device":"<id>",
+   "mailbox":"<id>"|null}` (`api`: the remote API level; `page`: the
+   device's id, the one its `page.report`s are kept under; `mailbox`: the
+   base64url 8-byte id of the mailbox the host holds for this device, null
+   when it holds none; see step 4), and after that
+   `{"event":"changed","rev"}` on every change of the daemon's state, and
+   `{"event":"ui","cmd"}` for each overlord UI command that lands on this
+   device (§5).
 3. Requests are the local control socket's: `{"id","op","args"}`,
    answered `{"id","ok"}` or `{"id","error":{"code","message"}}`. The host
    passes each to the daemon as `web.call {op, args, via: "remote",
@@ -295,7 +301,18 @@ The device id is `device_id(static)`: 16 hex characters of a labelled hash.
    2>"}`; the device makes its mailbox, saves it, and sends
    `{"event":"mailbox_ready","frame":"<its first mailbox frame>"}`; when
    that decrypts the host saves the mailbox (replacing any older one).
-   A device keys a mailbox when it has none.
+   A device keys a mailbox when it has none, and when the host's `hello`
+   names another one or none (`mailbox`): the host discarded the device's
+   (it failed there, or its saved state lost it), so frames sealed under
+   it would be dropped by id and their answers never come. The device
+   then discards its own first (the same as a failure on its end: a
+   refused frame sealed under it is not offered again, and every
+   unanswered request goes again by id, live on this session and by the
+   new mailbox when the host is next away; the host's request store
+   answers a repeat once). A `hello` without the field (an older host)
+   changes nothing, and an older device ignores it; the field is additive,
+   so `api` stays 1 (the API level is the ops, the snapshot and the `ui`
+   commands; this is the protocol beneath them).
 5. While a device has no live session and the daemon's `rev` moves, the
    host sends the relay `signal` for it, at most once per 30 s; a move
    inside that window is owed one more, sent when the window ends (unless
@@ -376,13 +393,53 @@ never outlives a lost frame, so nothing may be lost quietly.
   it came on if still the same, and the mailbox if a resend came that
   way). A request still running when the plugin stopped is answered
   `interrupted`.
-- **Device** (the phone slice; `rlord-device` does the protocol parts):
-  reconnect on 4205, on a network change and on coming to the
-  foreground; run `KKpsk2` each time its host comes online; compare the
-  snapshot's `rev` and fetch on a difference; resend unanswered requests
-  by id; when the relay's `boot` changes, resend every mailbox request it
-  has no answer to (the queue is gone); drop mailbox frames by `(boot,
-  seq)` and answers by request id it already has.
+- **Device** (the device engine, `crates/e2e-client`: `machine` holds
+  every rule below, each with a unit test on a scripted link and a fake
+  clock; the phone app and `rlord-device` both run it).
+  - *Dialling.* One URL, built from the pin; no other address is ever
+    tried. Backoff 250 ms doubling to 30 s with up to 20% jitter, reset by
+    a link `ready` for 10 s. The first 4205 redials at once, another
+    within 60 s takes the backoff. A network change (`network(up)` or a
+    changed path) redials at once; `network(down)` stops dialling. Coming
+    to the foreground dials at once; going to the background sends what
+    is queued and closes (1000). The final codes (4401, 4402, 4403, 4426)
+    and a wrong relay stop the loop until the user acts. `bye
+    {retry_after}` is honoured with jitter; 4429 and 4503 take the
+    backoff; 4409 (replaced by a newer connection of this identity)
+    waits and doesn't fight; `enroll` is shown and waited on.
+  - *Silence.* Pings every 15 s; a link silent 45 s is gone; a 10 s jump
+    between the wall and monotonic clocks redials at once (as the host).
+  - *Sessions.* `KKpsk2` each time the host comes online, never reusing
+    a session. No message 2 within 10 s, or `undeliverable`, retries the
+    handshake on the same link (1 s doubling to 30 s). Any decrypt
+    failure ends the session and the link; an unknown text message is
+    skipped, a binary frame it can't parse closes the link.
+  - *State.* The last `rev` is kept; `hello.rev` and `changed` go to the
+    page, whose store asks `snapshot {rev}`.
+  - *The outbox.* Each request gets 16 random bytes as its id, saved
+    before it is sent. Only `overlord.ask` and `overlord.new_session` may
+    wait without a live session (they go by mailbox); any other op needs
+    one. After any reconnect every unanswered entry goes again, same id,
+    oldest first, once per link; an op that changes something is resent
+    for 2 minutes, then ends `interrupted`; an ask waits up to 24 hours.
+    At most 16 entries (`outbox_full`). `in_progress` waits;
+    `interrupted` ends the entry. Look-ups (the daemon's idempotent ops,
+    `page.report` among them) are never kept: one in flight when the
+    link dies fails `disconnected`.
+  - *The mailbox.* Keyed on the first live session and whenever there is
+    none, and again when the `hello`'s `mailbox` isn't the one it holds
+    (§3, step 4). One frame out at a time, sealed and saved before it
+    leaves; the next after `queued`; `refused full` is sent again first
+    on the next link and every 30 s; `no_queue` fails the request
+    `host_offline`; `unknown` or `bad` discards the mailbox. When the
+    relay's `boot` changes, every mailbox request without an answer goes
+    again (the queue is gone). Frames are dropped by `(boot, seq)` and by
+    mailbox id, answers by request id it already has.
+  - *In the background* (`background_check`, the OS's refresh): one
+    dial, the cheap check (`ready`'s `signal`, `boot`); only if something
+    waits a session, a snapshot and a count of sessions newly waiting.
+  - Owed: no watchdog for an answer on a live session (a request whose
+    frame the host never got waits until the next reconnect).
 
 ## 5. Host and daemon
 
@@ -391,12 +448,17 @@ The daemon holds no keys and does no crypto.
 - **Remote requests.** `web.call {op, args, via, device?}`: `via` is
   `"local"` (a page; with `page`) or `"remote"` (a device; with `device`,
   its id); anything else is refused. `web::Op` has `remote: bool`; an op
-  with `remote: false` is refused (`NotAllowed`) from a device. A remote
-  call carries no `page`, never counts as use of a screen and gets no `ui`
-  commands. `plugin::WEB_PROTOCOL` is 3. `web::Op.idempotent` marks the
-  look-ups; `web.hello`'s answer lists the remote ones (`"idempotent":
-  [op]`), and the plugin runs any op not listed at most once per request
-  id (§4).
+  with `remote: false` is refused (`NotAllowed`) from a device. A device
+  is a surface of its own (docs/architecture.md, "The phone as a
+  surface"): its id stands for its page in `page.report` and
+  `page.pending`, its user-driven ops count as its use, and UI commands
+  for it come on the `web.subscribe` stream as `{"notify":"ui","device",
+  "n","cmd"}`; the plugin sends them on its live session and says
+  `web.ui_delivered {device, n}`, or signals it. `device.leave` removes
+  the calling device. `plugin::WEB_PROTOCOL` is 4. `web::Op.idempotent`
+  marks the look-ups (and `page.report`); `web.hello`'s answer lists the
+  remote ones (`"idempotent": [op]`) and gives `"api"`, and the plugin
+  runs any op not listed at most once per request id (§4).
 - **User commands** (`relay.*`, `crates/daemon/src/relay.rs`; never on
   `OPS`, never in `mcp.rs`): `relay.status`, `relay.setup {address,
   token?, reset?}`, `relay.pair`, `relay.pair_cancel`, `relay.confirm`,

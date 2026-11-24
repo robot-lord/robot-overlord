@@ -1,10 +1,20 @@
-//! rlord's test device: what a phone will do, in Rust, for the remote
-//! tests (`crates/web/tests/remote.rs`) and for pairing by hand
-//! (`rlord-device`). It speaks `docs/working/e2e-protocol.md` from the
-//! device's side: pairing from a QR, live sessions, the cheap check, the
-//! mailbox. `testing` has the hostile relays of the adversarial tests.
+//! rlord's test device, for the remote tests and for pairing by hand
+//! (`rlord-device`).
+//!
+//! - [`Phone`]: the device engine the phone app runs
+//!   (`rlord_e2e_client`), with software keys, driven as the page drives
+//!   it. The CLI and `crates/web/tests/engine.rs` use it.
+//! - [`Device`], [`Live`], [`Conn`]: `docs/working/e2e-protocol.md` from
+//!   the device's side one step at a time (pairing from a QR, live
+//!   sessions, the cheap check, the mailbox), for tests that need to do
+//!   what the engine never would (`crates/web/tests/remote.rs`).
+//! - `testing`: the hostile relays of the adversarial tests.
+//! - [`bridge`]: `rlord-device bridge`, the engine behind a loopback
+//!   websocket that plays the phone shell's message bridge (debug only).
 
+pub mod bridge;
 pub mod client;
+pub mod phone;
 pub mod testing;
 
 use std::collections::VecDeque;
@@ -20,6 +30,7 @@ use rlord_relay_proto::address::fingerprint_from_b64;
 use rlord_relay_proto::{Identity, RelayAddress, Role};
 
 pub use client::{connect, Conn, ConnectError, Opts};
+pub use phone::Phone;
 
 const WAIT: Duration = Duration::from_secs(10);
 

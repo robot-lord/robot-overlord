@@ -73,7 +73,7 @@ matters most for self-hosted, on-prem relays.
 | Where the crypto lives | One sans-IO Rust crate, `crates/e2e` (`rlord_e2e`), used by every party | One state machine, one set of test vectors, one place to fix a bug |
 | Browser | The same crate compiled to WASM with `wasm-bindgen`, running in a Web Worker | WebCrypto cannot express the protocol across browsers and is async per call |
 | WebCrypto's role | Key-at-rest only: a non-extractable AES-GCM wrapping key in IndexedDB, optionally bound to a passkey (WebAuthn PRF) | The one thing WebCrypto does that WASM cannot |
-| Phone app | The same crate through UniFFI (Swift, Kotlin) | Same reason as the browser; UniFFI is what Matrix and Wire use |
+| Phone app | The same crate natively, inside the device engine (`crates/e2e-client`), through UniFFI (`crates/e2e-ffi`; Swift built, Kotlin later); the WebView page has no crypto and no network | Same reason as the browser, plus hardware relay keys and work in the background (slice 4, `web-ui-remote.md`); UniFFI is what Matrix and Wire use |
 | Protocol | Noise, via `snow`. Pairing: `IKpsk2`. Reconnect: `KK`. Cipher suite `25519_ChaChaPoly_SHA256` | Two-party sessions only; fits the QR flow exactly; `snow` is the audited Rust option |
 | MLS, Double Ratchet, HPKE | None of them in the first version | Sessions are always host to one device; the host is the source of truth, so nothing has to sit at the relay for long |
 | Mailbox | The same Noise session, persisted, with a one-way rekey after every message; the relay queue is ordered and short-lived | Forward secrecy for queued messages with no second protocol |
@@ -786,6 +786,10 @@ small-frame benchmark (none found).
 3. Phone app: a native shell around the same Preact page in a WebView.
    Crypto runs as WASM there too; the native side keeps keys at rest, push
    and the pinned code bundle. UniFFI shrinks to what the shell needs.
+   **Superseded (user, 2026-11-23, slice 4 answer 1):** the crypto and the
+   relay link run natively in a Rust engine in the shell (UniFFI); the
+   page in the WebView only draws, with no network access. Built on
+   `feat/web-ui-4` for iOS.
 4. Host confirmation (device name plus short code) before a newly paired
    device can act.
 

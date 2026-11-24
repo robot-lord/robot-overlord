@@ -3,16 +3,20 @@
 
 import { effect } from "@preact/signals";
 import { render } from "preact";
-import { Control, takeToken, wsUrl } from "./api";
+import { LocalTransport, takeToken, wsUrl } from "./api";
+import { runUi } from "./commands";
 import { FormHost } from "./components/FormHost";
+import { LocalForms } from "./components/LocalForms";
 import { Toast } from "./components/Toast";
 import { tick } from "./components/time";
 import type { UiCmd } from "./proto";
-import { followHash, href, parse, route } from "./route";
+import { followHash, parse, route } from "./route";
 import { listView, Store } from "./store";
-import { decide, Reporter } from "./ui";
+import { LOCAL_CAPS, menu } from "./transport";
+import { Reporter } from "./ui";
 import { List, open as openForm } from "./views/List";
 import { Overlord } from "./views/Overlord";
+import { OverlordPane, SessionPane } from "./views/panes";
 import { openFork, Session } from "./views/Session";
 import "./app.css";
 
@@ -37,27 +41,9 @@ tick();
 
 /** Carry out an overlord's UI command (`ui.ts` decides). */
 function onUi(cmd: UiCmd): void {
-  for (const e of decide(cmd, store.form.value)) {
-    switch (e.do) {
-      case "route":
-        if (e.closeForm) store.form.value = null;
-        location.hash = href(e.to);
-        break;
-      case "view":
-        store.applyView(e.view, e.select);
-        break;
-      case "open":
-        store.parked.value = null;
-        store.form.value = e.form;
-        break;
-      case "park":
-        store.parked.value = e.cmd;
-        break;
-      case "toast":
-        store.toast.value = e.text;
-        break;
-    }
-  }
+  runUi(cmd, store, LOCAL_CAPS, (h) => {
+    location.hash = h;
+  });
 }
 
 const reporter = new Reporter((args) => {
@@ -65,14 +51,14 @@ const reporter = new Reporter((args) => {
 });
 
 const control = token
-  ? new Control(wsUrl("/ws"), token, {
+  ? new LocalTransport(wsUrl("/ws"), token, {
       state: (s) => {
         store.conn.value = s;
       },
       hello: (h) => {
         // A page from another build reloads (the plugin was updated).
         if (build !== null && build !== h.build) location.reload();
-        build = h.build;
+        build = h.build ?? null;
         version = h.version;
         if (!control) return;
         store.connected(control);
@@ -138,6 +124,8 @@ const words: Record<string, string> = {
   no_token: "no token: open the link `rlord web` prints",
 };
 
+const caps = control?.caps ?? LOCAL_CAPS;
+
 function App() {
   const r = route.value;
   const conn = store.conn.value;
@@ -153,17 +141,19 @@ function App() {
         {store.error.value && conn === "open" && <span class="err">{store.error.value}</span>}
         {conn === "open" && (
           <span class="menu">
-            <button type="button" class="dim" onClick={() => openForm(store, "setup")}>
-              Code folder
-            </button>
-            <button type="button" class="dim" onClick={() => openForm(store, "keys")}>
-              Keys
-            </button>
-            <DevicesButton />
+            {menu(caps).map((m) =>
+              m === "devices" ? (
+                <DevicesButton />
+              ) : (
+                <button type="button" class="dim" onClick={() => openForm(store, m)}>
+                  {m === "setup" ? "Code folder" : "Keys"}
+                </button>
+              ),
+            )}
           </span>
         )}
       </header>
-      <FormHost store={store} />
+      <FormHost store={store} local={(f) => <LocalForms store={store} form={f} />} />
       <Toast store={store} />
       <div class="body">
         <aside class="side">
@@ -173,9 +163,17 @@ function App() {
           {r.kind === "list" || !token ? (
             <p class="hint">Pick the overlord or a session.</p>
           ) : r.kind === "overlord" ? (
-            <Overlord store={store} token={token} />
+            <Overlord
+              store={store}
+              body={(o) => <OverlordPane store={store} o={o} token={token} />}
+            />
           ) : (
-            <Session key={r.id} store={store} id={r.id} token={token} />
+            <Session
+              key={r.id}
+              store={store}
+              id={r.id}
+              body={(s, act) => <SessionPane s={s} act={act} token={token} />}
+            />
           )}
         </main>
       </div>
