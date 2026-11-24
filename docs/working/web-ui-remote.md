@@ -4656,6 +4656,11 @@ good communication with the terminals, the overlord's included.
   shows today instead of a pane; whether it stays (as an offline or
   slow-link fallback) is a planning question.
 - Slice 4 merges first, as built; slice 5 is its own PR.
+- Test setup built for it (`feat/web-ui-5`): `scripts/demo/demo.sh
+  --real-claude [--web] DIR` runs the real Claude Code (pinned) on a fake
+  local model (`cargo xtask fake-model`, `cargo xtask demo-claude`), so
+  live panes can be tried against a real Claude terminal with no model
+  calls. CONTRIBUTING.md "Demo and screenshots".
 
 Found on the real phone, fixed on `feat/web-ui-4`: the first device
 install needs `-allowProvisioningDeviceRegistration`; the pairing screen

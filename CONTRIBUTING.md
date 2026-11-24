@@ -133,6 +133,46 @@ demo's PATH exist) and a stand-in `SHELL`: set both in any scratch rlord you
 build yourself, so it can never launch a real agent. `scripts/demo/screenshots.sh DIR` retakes the
 README's images in `docs/images` with [vhs](https://github.com/charmbracelet/vhs).
 
+`scripts/demo/demo.sh --real-claude [--web] DIR` runs the real Claude Code
+CLI in place of the stand-in `claude`, on a fake model, so its terminal
+(streaming, permission prompts, hooks, transcripts) is real and nothing
+calls a model. Codex and OpenCode stay stand-ins. `cargo xtask demo-claude
+DIR` (which the demo runs) sets it up:
+
+- **Pinned CLI.** `CLAUDE_CODE_VERSION` in `xtask/src/demo_claude.rs`,
+  installed once with npm into `target/demo-claude/<version>` (needs
+  `npm`). Your own `claude` and `~/.claude` are never used.
+- **Fake model.** `cargo xtask fake-model` on a free 127.0.0.1 port,
+  logging every request to `DIR/fake-model.log` (`demo.sh --stop` stops
+  it). It echoes the prompt in a short stream; a prompt with the word
+  "tool" gets a Bash call writing `fake-model-hello.txt` in the session's
+  folder (so Claude Code asks first), and the tool's result a closing
+  line. Requests with no tools (archive summaries, titles) get one line.
+- **Safety env.** `DIR/bin/claude` drops every inherited `ANTHROPIC_*` /
+  `CLAUDE*` variable, then sets `ANTHROPIC_BASE_URL` (the fake model), a
+  dummy `ANTHROPIC_API_KEY`, `CLAUDE_CONFIG_DIR=DIR/claude`,
+  `HOME=DIR/home`, `DISABLE_AUTOUPDATER`, `DISABLE_TELEMETRY`,
+  `DISABLE_ERROR_REPORTING`, `DISABLE_GROWTHBOOK`,
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`,
+  `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL`,
+  `CLAUDE_CODE_MODEL_CATALOG=off`, and points `HTTPS_PROXY` / `HTTP_PROXY`
+  / `ALL_PROXY` at the fake model, which refuses anything sent that way
+  and logs it as `BLOCKED` (`NO_PROXY` keeps 127.0.0.1 direct). A request
+  with any other key or a bearer token is logged `auth=UNEXPECTED`.
+- **No first-run screens.** The scratch `.claude.json` is seeded with
+  `hasCompletedOnboarding` and `lastOnboardingVersion` (onboarding would
+  also check api.anthropic.com), the dummy key's last 20 characters in
+  `customApiKeyResponses.approved`, `projects.<DIR>.hasTrustDialogAccepted`
+  (trusting DIR trusts every folder under it) and
+  `hasSeenAutoDefaultNudge`. `settings.json` gets `permissions.defaultMode
+  = "default"` (Claude Code's own default, auto mode, would skip the
+  permission prompt), `disableRemoteControl` and the base URL in `env`.
+  Bumping the pinned version: start a demo and check every session opens
+  straight at its prompt; a new dialog needs another flag.
+
+Drive it like any rlord session (`tmux -L <socket> send-keys`, the list,
+the web page) and `tail -f DIR/fake-model.log` to watch the requests.
+
 The website's phone screenshots (`public/img/phone-*.webp` in
 robot-lord/website) come from the same demo:
 
