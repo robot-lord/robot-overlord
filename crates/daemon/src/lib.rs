@@ -293,8 +293,6 @@ impl Daemon {
         self.bind_nav_keys();
         profile::sync_all(self, false);
         overlord::style(&self.db(), &self.config());
-        // (The profile resets a held session's key table.)
-        control::reassert(self);
         Ok(json!({"reloaded": true}))
     }
 

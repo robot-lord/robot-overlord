@@ -139,6 +139,9 @@ pub fn sync_ref(d: &Daemon, r: &str) {
     if let Err(e) = res {
         tracing::warn!(session = %r, error = %e, "applying tmux profile");
     }
+    drop(db);
+    // (The profile resets a held session's key table.)
+    crate::control::reassert(d);
 }
 
 pub fn sync_all(d: &Daemon, refresh: bool) {
@@ -154,6 +157,9 @@ pub fn sync_all(d: &Daemon, refresh: bool) {
             tracing::warn!(session = %s.id, error = %e, "applying tmux profile");
         }
     }
+    drop(db);
+    // (The profile resets a held session's key table.)
+    crate::control::reassert(d);
 }
 
 /// `tmux.profile {ref, set?: on|off|default|toggle}` → the session's state.

@@ -5648,3 +5648,95 @@ this fills in what they left open.
 - `tmux::view_command(target, view, read_only)` attaches with `-f
   ignore-size` (and `read-only` for a view-only device).
 - `plugin::WEB_PROTOCOL` 5; `web::API` 2.
+
+#### Step 4 (daemon and TUI)
+
+Built on `s5/daemon` (Opus, 2026-11-24), to the contract above.
+
+- **`crates/daemon/src/control.rs`**: the state machine as plain code
+  (`Control`: per session the holder, its size, since when, away since
+  when, and the pages and devices showing it), unit-tested with a fake
+  clock and no tmux (the seven tests the plan names, plus the plugin's
+  line and surface parsing). Its tmux side applies only what changed
+  (`Want`: pin, unpin or keep; held or not) under the state's lock, so
+  two changes reach tmux and the plugin in order. A ticker (1 s) runs
+  only while some pane is held or viewed: the grace, the terminal
+  arriving or leaving (`list_clients`, the overlay), a terminal holder's
+  window size. The overlay opening or closing and tmux's presence hooks
+  (`attention.poke`) look at once.
+- **The terminal** shows a session when a person's client is on it, or
+  (the overlord) when the overlay is open. An entry exists only while a
+  page or device shows or holds the pane; the terminal alone needs none
+  (its window simply follows it), so a free pane with nobody left is
+  dropped and unpinned, which keeps its size (no client sizes it) until
+  a terminal attaches. With only a view-only device left it stays
+  pinned (`Keep`), per gate 1b.
+- **tmux** (`core/src/tmux.rs`): `view_command(target, view,
+  read_only)` attaches `-f ignore-size[,read-only]`; `bind_held_table`
+  (the nav keys and the take key as `run-shell -b`, root's status click,
+  `Any` → `display-message "#{@rlord-held}"`); `hold_keys` /
+  `release_keys` save the session's own `key-table` and
+  `assume-paste-time` in `@rlord_held_table` / `@rlord_held_paste` (so a
+  profile session gets its table back, and a daemon restart can let go:
+  `control::sweep` at start); `window_size`; the hint bar gains the held
+  line ahead of the hints (`#{?@rlord-held,…}`), which is rlord's status
+  row "Controlled by <name> · ⌥t to take over".
+- **The take key**: `[tmux] take = "M-t"` (a key-screen slot, overlay
+  scope). Bound only in `rlord-held` and read by the overlay; it runs
+  `rlord control take '#{session_name}'` (`control.take`, which
+  resolves a tmux name as any reference).
+- **Ops and API**: as the contract, `web::API` 2, the fixture
+  regenerated, `WEB_PROTOCOL` 5. Both `pane.open` and `pane.take` are
+  `.idempotent()` (the integrator's word: the engine treats both as
+  look-ups). `pane.open` is passive (a reopen after a reconnect isn't
+  the user's use); `pane.take` counts as use. `control.` is a forbidden
+  family. `relay.input` is the user's command behind `device.input` and
+  `rlord relay input`; `web.remote_state`'s devices keep `input`
+  (true unless the plugin says false).
+- **TUI**: the list's `◧` mark (a browser or phone controls it); the
+  overlay as viewer (polls `control.get` every 500 ms; no pin, the
+  captured frame as is, the line in its bottom bar, only close, switch
+  and take; it leaves copy mode and the size alone when it closes as a
+  viewer); the Devices screen's `v` (view-only, and back).
+
+Proved: `cargo test -p robot-overlord-daemon` (lib 368, web_api 30 with
+the new six and the snapshot's `control`), and the gated
+`RLORD_TMUX_TESTS=1` web_tmux tests: a held window is pinned and views
+(one read-only) never size it, nor does a terminal arriving; the
+terminal taking unpins it and restores the session's own key table; a
+held terminal's keys (a burst, C-c) reach no pane and show the line; the
+take key runs `control take <session>`.
+
+Deviations, and what the contract left open:
+
+- `pane.open`'s daemon answer is exactly the contract's (no `input`;
+  the plugin knows the device's flag). Viewers get the window's size in
+  `cols`/`rows`; `window` is null when the session isn't running.
+- `control` gives a terminal holder's `cols`/`rows` as its window's
+  (seen by the ticker), null until seen.
+- `web.subscribe` sends the control line once right after the ack (the
+  whole map, `{}` when nothing is held), then on every change; it is
+  never on `events.subscribe`. The plugin's `web.pane_size` answer is
+  `{"control"}`, `web.pane_closed`'s `{"ok": true}`.
+- Unpaired devices are let go of at once (marked away a grace ago, so
+  the next tick passes control on); the plugin's stream ending marks
+  every page and device holder away.
+- A debug build's `RLORD_TEST_HELD_BIN` points the held keys at a
+  stand-in (the test binary isn't `rlord`).
+
+Owed:
+
+- `docs/architecture.md` still describes `web.pane_target`,
+  `overlord.messages` and `window-size latest` for views (step 10).
+- `crates/web` (other agents): `pane.rs` still calls `web.pane_target`
+  (now gone) and must move to `web.pane_open`/`pane_size`/`pane_closed`
+  with `page:<id>`; the plugin's tests that send `overlord.ask` from a
+  device fail until the engine and plugin parts land; the page's
+  `chat.test.ts` fixture (`overlord_messages.json`) is no longer
+  written. The page's fixtures `snapshot.json` (rows and overlord gain
+  `control: null`) and `device_list.json` (`input`) were regenerated:
+  `proto.ts`'s types need the fields.
+- Not tested: a session's profile turned on or off while another screen
+  holds it (`profile::sync_ref` / `sync_all` then hold it again,
+  `control::reassert`, keeping the newly set table as the one to
+  restore).
