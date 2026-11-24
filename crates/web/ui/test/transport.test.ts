@@ -15,14 +15,22 @@ describe("caps", () => {
       },
       (url) => new FakeSock(url),
     );
-    expect(t.caps).toEqual({ panes: true, setup: true, keys: true, devices: true, pending: false });
+    expect(t.caps).toEqual({
+      panes: true,
+      tell: true,
+      setup: true,
+      keys: true,
+      devices: true,
+      pending: false,
+    });
     expect(menu(t.caps)).toEqual(["setup", "keys", "devices"]);
     t.stop();
   });
 
-  it("a device gets no pane and none of the local-only screens", () => {
+  it("a device gets panes, but no tell box and none of the local-only screens", () => {
     expect(REMOTE_CAPS).toEqual({
-      panes: false,
+      panes: true,
+      tell: false,
       setup: false,
       keys: false,
       devices: false,

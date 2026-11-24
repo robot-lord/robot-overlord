@@ -1,8 +1,9 @@
-// The list (`#/`): the overlord on top with a box to tell it something,
-// then the sessions. Sessions and Groups tabs, a filter, the sort, and
+// The list (`#/`): the overlord on top (with a box to tell it something,
+// on the local page), then the sessions. Sessions and Groups tabs, a filter, the sort, and
 // live/archived. The daemon sorts and groups; this draws.
 
 import { useSignal, useSignalEffect } from "@preact/signals";
+import type { ComponentChildren } from "preact";
 import { useEffect } from "preact/hooks";
 import { Tell } from "../components/Actions";
 import { now, ago, lastUpdate } from "../components/time";
@@ -11,6 +12,7 @@ import { usageFigure } from "../components/usage";
 import type { Overlord, Row, Snapshot } from "../proto";
 import { href, type Route } from "../route";
 import { SORTS, type Store, type View } from "../store";
+import type { Caps } from "../transport";
 import type { FormKind } from "../ui";
 
 /** "Claude Code" for "claude", from the overlord's roster. */
@@ -21,12 +23,17 @@ function agentLabels(s: Snapshot | null): Map<string, string> {
 export function List({
   store,
   route,
+  caps,
   oneNew = false,
+  waiting,
 }: {
   store: Store;
   route: Route;
+  caps: Caps;
   /** One New button (describe; manual from inside it): no keyboard for `n` / `N`. */
   oneNew?: boolean;
+  /** Under the overlord's row: what waits in the phone's outbox. */
+  waiting?: ComponentChildren;
 }) {
   const snap = store.snapshot.value;
   const view = store.view.value;
@@ -62,7 +69,8 @@ export function List({
       </div>
       <Controls store={store} view={view} />
       {snap && <OverlordRow o={snap.overlord} labels={labels} active={route.kind === "overlord"} />}
-      {snap?.overlord && <Tell store={store} />}
+      {snap?.overlord && caps.tell && <Tell store={store} />}
+      {waiting}
       {view.tab === "groups" && snap && <Groups store={store} snap={snap} />}
       {snap ? (
         <Rows rows={store.rows.value} labels={labels} selected={selected} view={view} />

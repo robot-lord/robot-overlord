@@ -4,7 +4,17 @@
 // only asks for snapshots at the right times.
 
 import { batch, computed, type Signal, signal } from "@preact/signals";
-import type { ListView, PageOp, Query, Row, Snapshot, Sort, UiCmd, Unchanged } from "./proto";
+import type {
+  Control,
+  ListView,
+  PageOp,
+  Query,
+  Row,
+  Snapshot,
+  Sort,
+  UiCmd,
+  Unchanged,
+} from "./proto";
 import type { ConnState } from "./transport";
 import type { OpenForm } from "./ui";
 
@@ -151,6 +161,10 @@ export class Store {
   readonly form = signal<OpenForm | null>(null);
   /** A form the overlord opened while the user was typing in another. */
   readonly parked = signal<UiCmd | null>(null);
+  /** This screen as a pane's holder is named (`page:<id>`, `device:<id>`; control.ts). */
+  readonly surface = signal<string | null>(null);
+  /** This screen may type into panes (false: a view-only device). */
+  readonly input = signal(true);
 
   /** The group the Groups tab shows: the picked one if it still exists. */
   readonly group = computed<string | null>(() => {
@@ -297,5 +311,18 @@ export class Store {
   /** A row by id, from the current snapshot. */
   row(id: string): Row | undefined {
     return this.snapshot.value?.rows.find((r) => r.id === id);
+  }
+
+  /**
+   * Who holds a session's pane, from the snapshot (the overlord's too):
+   * null when nobody does, undefined when the snapshot doesn't say.
+   */
+  controlOf(id: string | null): Control | null | undefined {
+    if (!id) return undefined;
+    const s = this.snapshot.value;
+    const o = s?.overlord;
+    const found: { control?: Control | null } | undefined =
+      o && o.id === id ? o : s?.rows.find((r) => r.id === id);
+    return found?.control;
   }
 }

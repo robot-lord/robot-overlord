@@ -27,8 +27,8 @@ const USAGE: &str = "usage: cargo xtask web install|check|build [--app]|check-ap
   build         the page into crates/web/ui/dist/, which rlord-web embeds when built next
   build --app   the phone app's page into crates/web/ui/dist-app/, with its asset table
                 (manifest.json) for the apps' shells; then check-app
-  check-app     the built phone page: every file local, no network, its CSP, no xterm.js
-                and no LocalTransport
+  check-app     the built phone page: every file local, no network, its CSP, xterm.js
+                (its terminal) and no LocalTransport
   watch         rebuild dist/ on every change; run a debug rlord-web with
                 RLORD_WEB_ASSETS=crates/web/ui/dist to serve it from disk";
 

@@ -13,30 +13,34 @@ import type { ErrorCode, Hello, PageOp, RemoteErrorCode, UiCmd } from "./proto";
 
 /** What this connection can do: views hide what it can't. */
 export interface Caps {
-  /** Live terminal panes (xterm.js over `/pane`). */
+  /** Live terminal panes (xterm.js on the local pane socket, or the bridge's streams). */
   panes: boolean;
+  /** The "tell the overlord" box (`overlord.ask`, local only). */
+  tell: boolean;
   /** The code-folder form (`form.setup*`, `overlord.setup_request`). */
   setup: boolean;
   /** The key screen (`keys.list`). */
   keys: boolean;
   /** Remote access: paired devices, pairing (`device.*`). */
   devices: boolean;
-  /** Requests can wait in an outbox (pending and failed bubbles). */
+  /** Requests can wait in an outbox (a described new session, shown on the list). */
   pending: boolean;
 }
 
 /** The local page: everything but an outbox. */
 export const LOCAL_CAPS: Caps = {
   panes: true,
+  tell: true,
   setup: true,
   keys: true,
   devices: true,
   pending: false,
 };
 
-/** A paired device: chat and state; no panes and no local-only ops. */
+/** A paired device: panes over its bridge and state; no local-only ops. */
 export const REMOTE_CAPS: Caps = {
-  panes: false,
+  panes: true,
+  tell: false,
   setup: false,
   keys: false,
   devices: false,
@@ -48,7 +52,7 @@ export type EngineErrorCode =
   /** No live session, and the op can't wait. */
   | "disconnected"
   | "host_offline"
-  /** A 17th waiting ask. */
+  /** A 17th waiting request. */
   | "outbox_full"
   | "cancelled"
   /** 24 hours without an answer. */

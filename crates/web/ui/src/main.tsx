@@ -12,6 +12,7 @@ import { tick } from "./components/time";
 import type { UiCmd } from "./proto";
 import { followHash, parse, route } from "./route";
 import { listView, Store } from "./store";
+import { surfaceOf } from "./control";
 import { LOCAL_CAPS, menu } from "./transport";
 import { Reporter } from "./ui";
 import { List, open as openForm } from "./views/List";
@@ -60,6 +61,7 @@ const control = token
         if (build !== null && build !== h.build) location.reload();
         build = h.build ?? null;
         version = h.version;
+        store.surface.value = surfaceOf(h);
         if (!control) return;
         store.connected(control);
         // A new page id: tell the daemon everything again, and take any
@@ -157,7 +159,7 @@ function App() {
       <Toast store={store} />
       <div class="body">
         <aside class="side">
-          <List store={store} route={r} />
+          <List store={store} route={r} caps={caps} />
         </aside>
         <main class="main">
           {r.kind === "list" || !token ? (
@@ -172,7 +174,7 @@ function App() {
               key={r.id}
               store={store}
               id={r.id}
-              body={(s, act) => <SessionPane s={s} act={act} token={token} />}
+              body={(s, act) => <SessionPane store={store} s={s} act={act} token={token} />}
             />
           )}
         </main>

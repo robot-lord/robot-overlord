@@ -1,24 +1,26 @@
 // The phone app's page (app.html, built into dist-app/ by `cargo xtask
 // web build --app`). The same store, list, forms and session buttons as
-// the local page, over `RemoteTransport` to the app's engine: no panes
-// (a chat and a session's text instead), no local-only screens, and the
-// app's own pairing and status screens. It has no network of its own.
+// the local page, over `RemoteTransport` to the app's engine: live panes
+// as streams over the bridge (with the key row), the read-only
+// transcript, no local-only screens, and the app's own pairing and
+// status screens. It has no network of its own.
 
 import { effect, signal } from "@preact/signals";
 import { render } from "preact";
 import { FormHost } from "./components/FormHost";
 import { Toast } from "./components/Toast";
 import { tick } from "./components/time";
-import { Phone, screen, viewportVars } from "./phone";
+import type { PhoneExtras } from "./components/Pane";
+import { debugBuild, Phone, screen, viewportVars, waitingWords } from "./phone";
 import { wirePhone } from "./phoneApp";
 import { type BridgeHost, findBridge, type RemoteTransport } from "./remote";
 import { followHash, parse, route } from "./route";
 import { listView, Store } from "./store";
 import { Reporter } from "./ui";
-import { Chat, OverlordChat, SessionText } from "./views/Chat";
 import { List } from "./views/List";
 import { Overlord } from "./views/Overlord";
 import { ConnLine, Pairing, StatusScreen } from "./views/Phone";
+import { OverlordBody, SessionBody } from "./views/phonePanes";
 import { Back, Session } from "./views/Session";
 import "./app.css";
 import "./phone.css";
@@ -87,6 +89,8 @@ const transport: RemoteTransport | null = bridge
     })
   : null;
 if (!transport) store.conn.value = "closed";
+// The shell's settings (a debug build mirrors panes' text for UI tests).
+transport?.send({ app: "settings" });
 
 effect(report);
 document.addEventListener("visibilitychange", report);
@@ -94,8 +98,46 @@ for (const ev of ["pointerdown", "keydown"] as const) {
   document.addEventListener(ev, () => reporter.input(), { capture: true, passive: true });
 }
 
+/** The overlord's button in the header, marked when it waits for you. */
+function OverlordLink() {
+  const o = store.snapshot.value?.overlord;
+  const waits = o?.status === "waiting_input";
+  return (
+    <a
+      class={`overlord-link${waits ? " attention" : ""}`}
+      href="#/overlord"
+      title={waits ? "the overlord waits for you" : "the overlord"}
+    >
+      overlord{waits ? " •" : ""}
+    </a>
+  );
+}
+
+/** What waits in the outbox (a described new session): one line each, with Cancel. */
+function Waiting({ cancel }: { cancel: (id: string) => void }) {
+  const items = phone.outbox.value;
+  if (items.length === 0) return null;
+  return (
+    <ul class="waiting">
+      {items.map((i) => (
+        <li key={i.id} class={`waiting-line${i.state === "failed" ? " failed" : ""}`}>
+          <span class="waiting-text">{waitingWords(i)}</span>
+          <button type="button" class="dim" onClick={() => cancel(i.id)}>
+            {i.state === "failed" || i.state === "interrupted" ? "Dismiss" : "Cancel"}
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function App({ t }: { t: RemoteTransport }) {
   const send = (m: Parameters<RemoteTransport["send"]>[0]) => t.send(m);
+  const extras: PhoneExtras = {
+    paste: () => t.paste(),
+    copy: (text) => t.copy(text),
+    debug: debugBuild(phone.settings.value),
+  };
   const sc = screen(phone.conn.value, phone.pairing.value);
   if (sc === "starting") {
     return (
@@ -125,6 +167,7 @@ function App({ t }: { t: RemoteTransport }) {
         {store.error.value && store.conn.value === "open" && (
           <span class="err">{store.error.value}</span>
         )}
+        <OverlordLink />
         <a class="menu-link" href="#/status" aria-label="this phone">
           ⋯
         </a>
@@ -136,10 +179,16 @@ function App({ t }: { t: RemoteTransport }) {
           {!snap && (
             <a class="row overlord" href="#/overlord">
               <span class="name">overlord</span>
-              <span class="dim">leave it a message</span>
+              <span class="dim">waiting for your computer</span>
             </a>
           )}
-          <List store={store} route={r} oneNew />
+          <List
+            store={store}
+            route={r}
+            caps={t.caps}
+            oneNew
+            waiting={<Waiting cancel={cancel} />}
+          />
         </aside>
         <main class="main">
           {status ? (
@@ -150,32 +199,15 @@ function App({ t }: { t: RemoteTransport }) {
             snap ? (
               <Overlord
                 store={store}
-                body={(o) => (
-                  <OverlordChat
-                    store={store}
-                    api={t}
-                    caps={t.caps}
-                    o={o}
-                    outbox={phone.outbox.value}
-                    cancel={cancel}
-                  />
-                )}
+                body={(o) => <OverlordBody store={store} t={t} o={o} extras={extras} />}
               />
             ) : (
-              // Not connected: the chat still takes an ask (it waits in the outbox).
               <section class="view">
                 <header class="view-head">
                   <Back />
                   <h1>overlord</h1>
                 </header>
-                <Chat
-                  store={store}
-                  api={t}
-                  caps={t.caps}
-                  outbox={phone.outbox.value}
-                  cancel={cancel}
-                  status={null}
-                />
+                <p class="hint">Waiting for your computer.</p>
               </section>
             )
           ) : (
@@ -183,7 +215,17 @@ function App({ t }: { t: RemoteTransport }) {
               key={r.id}
               store={store}
               id={r.id}
-              body={(s, act) => <SessionText store={store} api={t} s={s} act={act} />}
+              compact
+              body={(s, act, details) => (
+                <SessionBody
+                  store={store}
+                  t={t}
+                  s={s}
+                  act={act}
+                  details={details}
+                  extras={extras}
+                />
+              )}
             />
           )}
         </main>

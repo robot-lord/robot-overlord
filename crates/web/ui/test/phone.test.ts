@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   connBad,
   connWords,
+  debugBuild,
   deviceName,
   keysWords,
   Phone,
@@ -13,6 +14,7 @@ import {
   screen,
   spaced,
   viewportVars,
+  waitingWords,
 } from "../src/phone";
 import type { AppEvent, ConnKind } from "../src/proto";
 
@@ -160,5 +162,34 @@ describe("the status screen", () => {
       "--vvtop": "0px",
     });
     expect(viewportVars({ height: 300, offsetTop: -3 })["--vvtop"]).toBe("0px");
+  });
+});
+
+describe("the outbox's line and debug builds", () => {
+  it("a described new session waiting says where it is", () => {
+    const at = 1;
+    expect(waitingWords({ id: "a", op: "overlord.new_session", at, state: "waiting" })).toBe(
+      "New session · waiting to be sent",
+    );
+    expect(
+      waitingWords({ id: "b", op: "overlord.new_session", text: "fix it", at, state: "running" }),
+    ).toBe("New session: fix it · your computer has it");
+    expect(
+      waitingWords({
+        id: "c",
+        op: "overlord.new_session",
+        at,
+        state: "failed",
+        error: { code: "expired", message: "not answered in 24 hours" },
+      }),
+    ).toBe("New session · not answered in 24 hours");
+  });
+
+  it("panes mirror their text only in a debug build or the desktop bridge", () => {
+    const s = { event: "settings", app_lock: false, notifications: false } as const;
+    expect(debugBuild(null)).toBe(false);
+    expect(debugBuild({ ...s, platform: "ios" })).toBe(false);
+    expect(debugBuild({ ...s, platform: "ios", debug: true })).toBe(true);
+    expect(debugBuild({ ...s, platform: "bridge" })).toBe(true);
   });
 });

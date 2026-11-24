@@ -32,7 +32,7 @@
   overscroll-behavior: contain;
 }
 /* Laid over the visual viewport (app.tsx sets --vvh and --vvtop), so the
-   composer sits above the keyboard. */
+   key row sits above the keyboard. */
 .phone .app {
   position: fixed;
   left: 0;
@@ -115,8 +115,7 @@
   bottom: max(16px, env(safe-area-inset-bottom));
 }
 
-/* Chat and a session's text. */
-.chat,
+/* A session's text (the Transcript tab). */
 .session-text {
   flex: 1;
   min-height: 0;
@@ -171,50 +170,13 @@
   background: none;
   border-style: dashed;
 }
-.msg-at,
-.msg-note {
+.msg-at {
   font-size: 11px;
   color: var(--dim);
   padding: 0 4px;
 }
-.msg-you .msg-at,
-.msg-you .msg-note {
+.msg-you .msg-at {
   align-self: flex-end;
-}
-.bubble-pending .msg-text {
-  opacity: 0.7;
-  border-style: dashed;
-}
-.bubble-failed .msg-text,
-.bubble-interrupted .msg-text {
-  border-color: var(--bad);
-}
-.bubble-failed .msg-note,
-.bubble-interrupted .msg-note {
-  color: var(--bad);
-}
-.bubble-buttons {
-  display: flex;
-  gap: 6px;
-  align-self: flex-end;
-}
-.composer {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 8px 12px max(8px, env(safe-area-inset-bottom));
-  border-top: 1px solid var(--line);
-  background: var(--bg);
-}
-.composer textarea {
-  flex: 1;
-  min-width: 0;
-  max-height: 30vh;
-}
-.composer-err {
-  flex-basis: 100%;
-  margin: 0;
-  white-space: normal;
 }
 .not-running.inline {
   padding: 8px 12px;
@@ -234,10 +196,121 @@
   color: var(--dim);
   border-bottom: 1px solid var(--line);
 }
-.no-pane {
+.details {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* A view's tabs (Terminal, Transcript, Details). */
+.view-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--line);
+}
+.view-tabs button {
+  flex: 1;
+  border-radius: 0;
+}
+
+/* The overlord in the header, marked when it waits for you. */
+.overlord-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 4px;
+  color: var(--accent);
+}
+.overlord-link.attention {
+  font-weight: 600;
+}
+
+/* What waits in the outbox, under the overlord's row. */
+.waiting {
+  list-style: none;
   margin: 0;
-  padding: 8px 12px max(8px, env(safe-area-inset-bottom));
+  padding: 0;
+  border-bottom: 1px solid var(--line);
+}
+.waiting-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+}
+.waiting-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+.waiting-line.failed .waiting-text {
+  color: var(--bad);
+}
+
+/* The key row above the keyboard: one scrolling row of 44-point keys. */
+.keys-wrap {
   border-top: 1px solid var(--line);
+  background: var(--bg);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.keys {
+  display: flex;
+  gap: 4px;
+  padding: 4px 8px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  align-items: center;
+}
+.keys button {
+  flex: none;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 10px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+.keys button.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.keys.off {
+  opacity: 0.5;
+}
+.keys .echo {
+  flex: none;
+  font-size: 12px;
+  padding: 0 8px;
+}
+.keys-note {
+  margin: 0;
+  padding: 4px 12px 0;
+}
+/* The compose line: a text field sent as one paste. */
+.compose {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 8px 0;
+}
+.compose textarea {
+  flex: 1;
+  min-width: 0;
+  max-height: 30vh;
+}
+.compose-err {
+  flex-basis: 100%;
+  margin: 0;
+}
+/* The screen's text for UI tests (debug builds): read, never seen. */
+.term-mirror {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: pre;
 }
 
 /* Pairing and the status screen. */

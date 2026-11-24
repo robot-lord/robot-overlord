@@ -4,6 +4,7 @@
 // overlord's UI commands run with a device's caps.
 
 import { runUi } from "./commands";
+import { surfaceOf } from "./control";
 import type { Phone } from "./phone";
 import type { UiCmd } from "./proto";
 import { type Bridge, RemoteTransport } from "./remote";
@@ -31,6 +32,8 @@ export function wirePhone(w: Wiring): RemoteTransport {
       },
       hello: (h) => {
         phone.hello.value = h;
+        store.surface.value = surfaceOf(h);
+        store.input.value = h.input !== false;
         store.connected(t);
         w.onHello?.();
         // A command meant for this phone while it was away.

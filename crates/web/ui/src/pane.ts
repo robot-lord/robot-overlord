@@ -1,46 +1,24 @@
-// A pane in the page: xterm.js on one pane socket (crates/web/src/pane.rs).
+// A pane's link to rlord, and the local page's: one pane socket
+// (crates/web/src/pane.rs). The terminal (term.ts) draws whichever link it
+// is given: this socket on the local page, the bridge's streams on the
+// phone (remotePane.ts). Only main.tsx's views build a `PaneSocket`, so
+// the phone's bundle has no websocket.
 //
-// After the token the page sends `{"type":"open","target","cols","rows"}`;
-// then binary frames are bytes both ways and text frames are control
-// (`resize` and `close` in; `opened` and `closed {reason}` out). Opening
-// never starts anything: a target that isn't running is closed with
-// `not_running`, and the view offers Resume.
+// After the token the page sends `{"type":"open","target","cols","rows",
+// "page"}`; then binary frames are bytes both ways and text frames are
+// control (`resize` and `close` in; `opened {id, name, control, cols,
+// rows, window}` and `closed {reason}` out). Opening never starts
+// anything: a target that isn't running is closed with `not_running`, and
+// the view offers Resume.
 //
 // A socket is open only while the pane is on screen: the view mounts one
-// pane, and a hidden tab closes it shortly after (`HIDE_CLOSE_MS`), so
-// background tabs never take the window's size (tmux's `window-size
-// latest`).
+// pane, and a hidden tab closes it shortly after (`HIDE_CLOSE_MS`).
 
-import { FitAddon } from "@xterm/addon-fit";
-import { WebglAddon } from "@xterm/addon-webgl";
-import { Terminal } from "@xterm/xterm";
-import "@xterm/xterm/css/xterm.css";
 import { BACKOFF_FIRST, BACKOFF_LAST, type OpenSock, openWebSocket, type Sock } from "./api";
+import { HIDE_CLOSE_MS, type PaneLink, type PaneState, type Screen } from "./paneLink";
 import { CLOSE_UNAUTHORIZED } from "./proto";
 
-export type PaneState =
-  | { kind: "connecting" }
-  | { kind: "open"; id: string | null; name: string | null }
-  /** It isn't running: the view offers Resume. */
-  | { kind: "not_running" }
-  /** No such session (or no overlord yet). */
-  | { kind: "not_found"; message: string }
-  /** Closed on purpose while the tab is hidden. */
-  | { kind: "hidden" }
-  | { kind: "unauthorized" }
-  /** Lost or refused: retrying. */
-  | { kind: "retrying"; message: string };
-
-/** What the socket side needs of the terminal (a fake in tests). */
-export interface Screen {
-  readonly cols: number;
-  readonly rows: number;
-  reset(): void;
-  write(bytes: Uint8Array): void;
-}
-
-/** How long a hidden tab keeps its pane open. */
-export const HIDE_CLOSE_MS = 3000;
+export { HIDE_CLOSE_MS, type PaneState, type Screen } from "./paneLink";
 
 const enc = new TextEncoder();
 
@@ -48,7 +26,7 @@ const enc = new TextEncoder();
  * One pane socket, reconnecting as the control socket does. Knows nothing
  * of xterm.js: it writes to a `Screen` and is fed input by its owner.
  */
-export class PaneSocket {
+export class PaneSocket implements PaneLink {
   private sock: Sock | null = null;
   private backoff = BACKOFF_FIRST;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -59,6 +37,7 @@ export class PaneSocket {
   private readonly url: string;
   private readonly token: string;
   private readonly target: string;
+  private readonly page: () => string | null;
   private readonly screen: Screen;
   private readonly onState: (s: PaneState) => void;
   private readonly open: OpenSock;
@@ -67,6 +46,8 @@ export class PaneSocket {
     url: string;
     token: string;
     target: string;
+    /** This page's id (the control socket's hello): the plugin's surface `page:<id>`. */
+    page?: () => string | null;
     screen: Screen;
     onState: (s: PaneState) => void;
     open?: OpenSock;
@@ -74,6 +55,7 @@ export class PaneSocket {
     this.url = opts.url;
     this.token = opts.token;
     this.target = opts.target;
+    this.page = opts.page ?? (() => null);
     this.screen = opts.screen;
     this.onState = opts.onState;
     this.open = opts.open ?? openWebSocket;
@@ -95,14 +77,15 @@ export class PaneSocket {
     this.sock = s;
     s.onopen = () => {
       s.send(JSON.stringify({ auth: this.token }));
-      s.send(
-        JSON.stringify({
-          type: "open",
-          target: this.target,
-          cols: this.screen.cols,
-          rows: this.screen.rows,
-        }),
-      );
+      const open: Record<string, unknown> = {
+        type: "open",
+        target: this.target,
+        cols: this.screen.cols,
+        rows: this.screen.rows,
+      };
+      const page = this.page();
+      if (page) open.page = page;
+      s.send(JSON.stringify(open));
     };
     // Why the plugin closed it, from its `closed` message.
     let reason: string | null = null;
@@ -114,7 +97,17 @@ export class PaneSocket {
         return;
       }
       if (typeof data !== "string") return;
-      let m: { type?: string; id?: string; name?: string; reason?: string; message?: string };
+      let m: {
+        type?: string;
+        id?: string;
+        name?: string;
+        reason?: string;
+        message?: string;
+        control?: boolean;
+        cols?: number;
+        rows?: number;
+        window?: { cols: number; rows: number };
+      };
       try {
         m = JSON.parse(data) as typeof m;
       } catch {
@@ -124,7 +117,16 @@ export class PaneSocket {
         // A fresh screen for each connection: tmux redraws it whole.
         this.screen.reset();
         this.backoff = BACKOFF_FIRST;
-        this.set({ kind: "open", id: m.id ?? null, name: m.name ?? null });
+        this.set({
+          kind: "open",
+          id: m.id ?? null,
+          name: m.name ?? null,
+          control: typeof m.control === "boolean" ? m.control : null,
+          input: true,
+          cols: m.cols ?? null,
+          rows: m.rows ?? null,
+          window: m.window ?? null,
+        });
       } else if (m.type === "closed") {
         reason = m.reason ?? "";
         message = m.message ?? "";
@@ -205,97 +207,4 @@ export class PaneSocket {
     this.current = s;
     this.onState(s);
   }
-}
-
-/** The terminal's look. */
-const THEME = {
-  background: "#0b0b0d",
-  foreground: "#d8d8dc",
-  cursor: "#c79af2",
-  selectionBackground: "#4a3d5c",
-};
-
-/**
- * A terminal in `el` on its own pane socket, resized with `el`, its
- * socket closed while the tab is hidden. `dispose` ends both.
- */
-export function mountPane(
-  el: HTMLElement,
-  opts: { url: string; token: string; target: string; onState: (s: PaneState) => void },
-): { socket: PaneSocket; focus(): void; dispose(): void } {
-  const term = new Terminal({
-    cursorBlink: true,
-    fontFamily: 'Menlo, "SF Mono", "DejaVu Sans Mono", monospace',
-    fontSize: 13,
-    // tmux keeps the history (copy mode, by the wheel); the page draws
-    // only the screen.
-    scrollback: 0,
-    // Option is Meta (Option-D and friends reach the agent); Option-click
-    // selects text past tmux's mouse mode.
-    macOptionIsMeta: true,
-    macOptionClickForcesSelection: true,
-    theme: THEME,
-  });
-  const fit = new FitAddon();
-  term.loadAddon(fit);
-  term.open(el);
-  // WebGL when there is a context, else xterm.js's DOM renderer; a lost
-  // context falls back to it too.
-  try {
-    const gl = new WebglAddon();
-    gl.onContextLoss(() => gl.dispose());
-    term.loadAddon(gl);
-  } catch {
-    // The DOM renderer it is.
-  }
-  fit.fit();
-
-  const socket = new PaneSocket({
-    url: opts.url,
-    token: opts.token,
-    target: opts.target,
-    onState: (s) => {
-      if (s.kind === "open") term.focus();
-      opts.onState(s);
-    },
-    screen: {
-      get cols() {
-        return term.cols;
-      },
-      get rows() {
-        return term.rows;
-      },
-      reset: () => term.reset(),
-      write: (b) => term.write(b),
-    },
-  });
-  const subs = [
-    term.onData((d) => socket.input(d)),
-    // Mouse reports in X10 encoding can carry bytes over 127: sent raw.
-    term.onBinary((d) => socket.input(Uint8Array.from(d, (c) => c.charCodeAt(0)))),
-    term.onResize(({ cols, rows }) => socket.resize(cols, rows)),
-  ];
-  let frame = 0;
-  const ro = new ResizeObserver(() => {
-    cancelAnimationFrame(frame);
-    frame = requestAnimationFrame(() => fit.fit());
-  });
-  ro.observe(el);
-  const onVisibility = () => socket.visible(document.visibilityState === "visible");
-  document.addEventListener("visibilitychange", onVisibility);
-  socket.connect();
-  onVisibility();
-
-  return {
-    socket,
-    focus: () => term.focus(),
-    dispose: () => {
-      socket.stop();
-      document.removeEventListener("visibilitychange", onVisibility);
-      ro.disconnect();
-      cancelAnimationFrame(frame);
-      for (const d of subs) d.dispose();
-      term.dispose();
-    },
-  };
 }

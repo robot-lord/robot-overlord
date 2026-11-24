@@ -357,11 +357,35 @@ a.row:hover {
   color: var(--fg);
   border-color: var(--accent);
 }
+.pane-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
 .pane {
   position: relative;
   flex: 1;
   min-height: 0;
   background: #0b0b0d;
+  /* A phone's terminal slides under the keyboard; a viewer's is scaled. */
+  overflow: hidden;
+}
+/* Another screen holds the pane: who, and Take over. */
+.control-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: center;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.control-bar.attention {
+  border-color: var(--accent);
+}
+.control-who {
+  color: var(--dim);
 }
 .term {
   position: absolute;

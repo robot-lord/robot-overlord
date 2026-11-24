@@ -1,41 +1,13 @@
-// The chat's logic against the daemon's real `overlord.messages` answer
-// (test/fixtures/overlord_messages.json, written and checked by
-// crates/daemon/tests/web_api.rs): the latest page, earlier pages, a new
-// conversation, polling while the overlord works, and the outbox's bubbles.
+// The transcript's logic (`session.messages`; the overlord's by its id):
+// the latest page, earlier pages, a new conversation, one look-up at a
+// time, and polling while the session works.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  backToComposer,
-  bubbles,
-  MessageLog,
-  mergeLatest,
-  mergeOlder,
-  POLL_MS,
-  pollEvery,
-} from "../src/chat";
-import type { OverlordMessage, OverlordMessages } from "../src/proto";
+import type { SessionMessages, TranscriptMessage } from "../src/proto";
 import type { Requester } from "../src/store";
-import { LOCAL_CAPS, REMOTE_CAPS } from "../src/transport";
-import fixture from "./fixtures/overlord_messages.json";
+import { MessageLog, mergeLatest, mergeOlder, POLL_MS, pollEvery } from "../src/transcript";
 
-/** JSON imports type strings as `string`: compare against that. */
-type Widen<T> = T extends string
-  ? string
-  : T extends number
-    ? number
-    : T extends boolean
-      ? boolean
-      : T extends readonly (infer U)[]
-        ? Widen<U>[]
-        : T extends object
-          ? { [K in keyof T]: Widen<T[K]> }
-          : T;
-
-// The fixture fits the type (`tsc --noEmit` fails otherwise).
-const fits: Widen<OverlordMessages> = fixture;
-const answer = fixture as OverlordMessages;
-
-const msg = (line: number, text = `m${line}`): OverlordMessage => ({
+const msg = (line: number, text = `m${line}`): TranscriptMessage => ({
   line,
   who: line % 2 ? "you" : "agent",
   at: null,
@@ -68,6 +40,13 @@ function fakeApi() {
 
 const settle = () => vi.advanceTimersByTimeAsync(0);
 
+/** A `session.messages` answer: the newest page of five, earlier ones left. */
+const answer: SessionMessages = {
+  session: { id: "a1", name: "fixture session 0", agent: "claude", conversation: "c1" },
+  messages: [66, 67, 68, 69, 70].map((l) => msg(l, l % 2 ? `ask ${l}` : `answer ${l}`)),
+  more: true,
+};
+
 beforeEach(() => {
   vi.useFakeTimers();
 });
@@ -75,31 +54,31 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("the chat's messages", () => {
-  it("reads the daemon's answer", async () => {
-    expect(fits.messages.length).toBe(5);
+describe("the transcript", () => {
+  it("reads a session's messages by its id", async () => {
     const { api, calls } = fakeApi();
-    const log = new MessageLog(api, "overlord.messages");
+    const log = new MessageLog(api, "a1");
     expect(log.loaded.value).toBe(false);
     const done = log.refresh();
-    expect(calls[0]).toMatchObject({ op: "overlord.messages", args: {} });
+    expect(calls[0]).toMatchObject({ op: "session.messages", args: { ref: "a1" } });
     calls[0]?.resolve(answer);
     await done;
     expect(log.messages.value.map((m) => m.text)).toEqual(answer.messages.map((m) => m.text));
     expect(log.messages.value[0]?.who).toBe("agent");
+    expect(log.messages.value[1]?.text).toBe("ask 67");
     expect(log.more.value).toBe(true);
     expect(log.loaded.value).toBe(true);
   });
 
   it("pages back from the first shown, and merges a newer page after them", async () => {
     const { api, calls } = fakeApi();
-    const log = new MessageLog(api, "overlord.messages");
+    const log = new MessageLog(api, "a1");
     const first = log.refresh();
     calls[0]?.resolve(answer);
     await first;
     const first_line = answer.messages[0]?.line ?? 0;
     const older = log.older();
-    expect(calls[1]?.args).toEqual({ before: first_line });
+    expect(calls[1]?.args).toEqual({ ref: "a1", before: first_line });
     calls[1]?.resolve({ ...answer, messages: [msg(60), msg(61)], more: false });
     await older;
     expect(log.messages.value.map((m) => m.line)).toEqual([60, 61, 66, 67, 68, 69, 70]);
@@ -115,15 +94,15 @@ describe("the chat's messages", () => {
     expect(log.more.value).toBe(false);
   });
 
-  it("a new conversation (another overlord, a fresh start) replaces what is shown", async () => {
+  it("a new conversation (a fresh start, another overlord) replaces what is shown", async () => {
     const { api, calls } = fakeApi();
-    const log = new MessageLog(api, "overlord.messages");
+    const log = new MessageLog(api, "a1");
     const one = log.refresh();
     calls[0]?.resolve(answer);
     await one;
     const two = log.refresh();
     calls[1]?.resolve({
-      overlord: { id: "overlord-2", agent: "codex", conversation: "c2" },
+      session: { id: "a1", name: "fixture session 0", agent: "claude", conversation: "c2" },
       messages: [msg(1, "hello")],
       more: false,
     });
@@ -134,7 +113,7 @@ describe("the chat's messages", () => {
 
   it("asks one at a time, and once more after if asked meanwhile", async () => {
     const { api, calls } = fakeApi();
-    const log = new MessageLog(api, "overlord.messages");
+    const log = new MessageLog(api, "a1");
     const a = log.refresh();
     void log.refresh();
     void log.refresh();
@@ -148,7 +127,7 @@ describe("the chat's messages", () => {
 
   it("a failed look-up says why and keeps what is shown", async () => {
     const { api, calls } = fakeApi();
-    const log = new MessageLog(api, "session.messages", { ref: "a1" });
+    const log = new MessageLog(api, "a1");
     const one = log.refresh();
     expect(calls[0]).toMatchObject({ op: "session.messages", args: { ref: "a1" } });
     calls[0]?.resolve({ messages: [msg(3)], more: false });
@@ -168,49 +147,11 @@ describe("the chat's messages", () => {
     expect(mergeOlder([msg(5), msg(6)], [msg(4), msg(5)]).map((m) => m.line)).toEqual([4, 5, 6]);
   });
 
-  it("polls every 3 s only while the overlord works and the chat is on screen", () => {
+  it("polls every 3 s only while the session works and the transcript is on screen", () => {
     expect(pollEvery("working", true)).toBe(POLL_MS);
     expect(POLL_MS).toBe(3000);
     expect(pollEvery("working", false)).toBeNull();
     expect(pollEvery("idle", true)).toBeNull();
     expect(pollEvery(null, true)).toBeNull();
-  });
-});
-
-describe("pending and failed bubbles", () => {
-  it("are the outbox's asks, oldest first, each with what can be done", () => {
-    const got = bubbles([
-      { id: "c", op: "overlord.ask", text: "third", at: 30, state: "interrupted" },
-      { id: "a", op: "overlord.ask", text: "first", at: 10, state: "waiting" },
-      { id: "n", op: "overlord.new_session", at: 5, state: "waiting" },
-      { id: "b", op: "overlord.ask", text: "second", at: 20, state: "running" },
-      {
-        id: "d",
-        op: "overlord.ask",
-        text: "fourth",
-        at: 40,
-        state: "failed",
-        error: { code: "failed", message: "nothing to send" },
-      },
-    ]);
-    expect(got.map((b) => [b.id, b.kind])).toEqual([
-      ["a", "pending"],
-      ["b", "pending"],
-      ["c", "interrupted"],
-      ["d", "failed"],
-    ]);
-    expect(got[2]?.note).toContain("check the chat");
-    expect(got[3]?.note).toBe("nothing to send");
-  });
-
-  it("a refused ask goes back into the composer; one the outbox holds doesn't", () => {
-    expect(backToComposer("failed", LOCAL_CAPS)).toBe(true);
-    expect(backToComposer(undefined, LOCAL_CAPS)).toBe(true);
-    for (const code of ["outbox_full", "disconnected", "host_offline", "rate_limited"]) {
-      expect(backToComposer(code, REMOTE_CAPS)).toBe(true);
-    }
-    for (const code of ["interrupted", "expired", "cancelled", "failed"]) {
-      expect(backToComposer(code, REMOTE_CAPS)).toBe(false);
-    }
   });
 });

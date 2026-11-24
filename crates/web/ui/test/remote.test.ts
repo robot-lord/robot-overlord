@@ -1,10 +1,10 @@
 // RemoteTransport against a fake bridge: the control socket's request and
-// answer shapes, the engine's events, and a reload that gets its pending
-// bubbles back from the engine's `outbox` after `{"app":"ready"}`.
+// answer shapes, the engine's events, pane streams' events and ids, the
+// shell's paste, and a reload that gets its waiting requests back from
+// the engine's `outbox` after `{"app":"ready"}`.
 
-import { describe, expect, it } from "vitest";
-import { bubbles } from "../src/chat";
-import { Phone } from "../src/phone";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Phone, waitingWords } from "../src/phone";
 import type { AppEvent, Hello, UiCmd } from "../src/proto";
 import { type BridgeHost, connState, findBridge, RECV, RemoteTransport } from "../src/remote";
 import { ApiError, type ConnState } from "../src/transport";
@@ -45,7 +45,8 @@ describe("RemoteTransport", () => {
     const h = harness();
     expect(h.bridge.all()).toEqual([{ app: "ready" }]);
     expect(h.states).toEqual(["connecting"]);
-    expect(h.t.caps.panes).toBe(false);
+    expect(h.t.caps.panes).toBe(true);
+    expect(h.t.caps.tell).toBe(false);
     h.bridge.push(HELLO);
     expect(h.states).toEqual(["connecting", "open"]);
     expect(h.hellos[0]?.page).toBe("ab12cd34ef560789");
@@ -56,23 +57,27 @@ describe("RemoteTransport", () => {
     const h = harness(7);
     h.bridge.push(HELLO);
     const a = h.t.request("snapshot", { view: {} });
-    const b = h.t.request("overlord.ask", { text: "hi" });
+    const b = h.t.request("overlord.new_session", { description: "hi" });
     expect(h.bridge.json(1)).toEqual({ id: 7, op: "snapshot", args: { view: {} } });
-    expect(h.bridge.json(2)).toEqual({ id: 8, op: "overlord.ask", args: { text: "hi" } });
-    h.bridge.push({ id: 8, error: { code: "outbox_full", message: "16 asks wait already" } });
+    expect(h.bridge.json(2)).toEqual({
+      id: 8,
+      op: "overlord.new_session",
+      args: { description: "hi" },
+    });
+    h.bridge.push({ id: 8, error: { code: "outbox_full", message: "16 wait already" } });
     h.bridge.push({ id: 7, ok: { rev: "r-1" } });
     // An answer for no request of this page (one from before a reload): dropped.
     h.bridge.push({ id: 99, ok: {} });
     await expect(a).resolves.toEqual({ rev: "r-1" });
     const e = await b.catch((x: unknown) => x);
     expect(e).toBeInstanceOf(ApiError);
-    expect(e).toMatchObject({ code: "outbox_full", message: "16 asks wait already" });
+    expect(e).toMatchObject({ code: "outbox_full", message: "16 wait already" });
   });
 
-  it("takes requests before any hello (an ask may wait in the outbox)", async () => {
+  it("takes requests before any hello (a new session may wait in the outbox)", async () => {
     const h = harness();
-    const p = h.t.request("overlord.ask", { text: "later" });
-    expect(h.bridge.json(1)).toMatchObject({ op: "overlord.ask" });
+    const p = h.t.request("overlord.new_session", { description: "later" });
+    expect(h.bridge.json(1)).toMatchObject({ op: "overlord.new_session" });
     h.bridge.push({ id: 1, ok: null });
     await expect(p).resolves.toBeNull();
   });
@@ -121,44 +126,112 @@ describe("RemoteTransport", () => {
     expect(h.bridge.sent).toHaveLength(2);
   });
 
-  it("a reload gets its pending bubbles back from the outbox", () => {
+  it("a reload gets what waits in the outbox back", () => {
     const outbox = {
       event: "outbox",
       items: [
-        { id: "AAAA", op: "overlord.ask", text: "deploy it", at: 1000, state: "sent" },
+        { id: "AAAA", op: "overlord.new_session", text: "deploy it", at: 1000, state: "sent" },
         {
           id: "BBBB",
-          op: "overlord.ask",
-          text: "and tell me",
+          op: "overlord.new_session",
           at: 2000,
           state: "failed",
-          error: { code: "expired", message: "24 hours" },
+          error: { code: "expired", message: "not answered in 24 hours" },
         },
-        { id: "CCCC", op: "overlord.new_session", at: 1500, state: "waiting" },
       ],
     };
-    // The page before: it asked, and the engine kept the ask.
-    const before = new Phone();
-    const one = harness();
-    one.bridge.push(outbox);
-    for (const e of one.app) before.apply(e);
-    expect(bubbles(before.outbox.value).map((b) => b.id)).toEqual(["AAAA", "BBBB"]);
     // Reloaded: a new page, new transport, nothing of its own.
     const after = new Phone();
     const two = harness();
     expect(two.bridge.all()).toEqual([{ app: "ready" }]);
-    expect(bubbles(after.outbox.value)).toEqual([]);
+    expect(after.outbox.value).toEqual([]);
     // The engine replays on ready.
     two.bridge.push({ event: "conn", state: "host_offline", host: "laptop" });
     two.bridge.push(outbox);
     for (const e of two.app) after.apply(e);
-    const got = bubbles(after.outbox.value);
-    expect(got.map((b) => [b.id, b.kind, b.text])).toEqual([
-      ["AAAA", "pending", "deploy it"],
-      ["BBBB", "failed", "and tell me"],
+    expect(after.outbox.value.map(waitingWords)).toEqual([
+      "New session: deploy it · sent, waiting for your computer",
+      "New session · not answered in 24 hours",
     ]);
-    expect(got[1]?.note).toContain("24 hours");
     expect(after.conn.value?.state).toBe("host_offline");
+  });
+});
+
+describe("pane streams on the transport", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("routes a stream's events to its pane, and frees the id at its closed", () => {
+    const h = harness();
+    h.bridge.push(HELLO);
+    const got: unknown[] = [];
+    const a = h.t.claim((ev) => got.push(["a", ev.type]));
+    const b = h.t.claim((ev) => got.push(["b", ev.type]));
+    expect([a, b]).toEqual([1, 2]);
+    h.bridge.push({ event: "pane", stream: 2, type: "data", b: "aGk=" });
+    h.bridge.push({ event: "pane", stream: 1, type: "closed", reason: "ended" });
+    // An event for a stream nobody has: dropped.
+    h.bridge.push({ event: "pane", stream: 9, type: "data", b: "aGk=" });
+    expect(got).toEqual([
+      ["b", "data"],
+      ["a", "closed"],
+    ]);
+    // 1 is free again; 2 isn't.
+    expect(h.t.claim(() => {})).toBe(1);
+    expect(h.t.claim(() => {})).toBe(3);
+  });
+
+  it("a muted stream is heard no more, but its id waits for its closed", () => {
+    const h = harness();
+    h.bridge.push(HELLO);
+    const got: string[] = [];
+    const a = h.t.claim((ev) => got.push(ev.type));
+    expect(a).toBe(1);
+    h.t.mute(1);
+    h.bridge.push({ event: "pane", stream: 1, type: "data", b: "aGk=" });
+    expect(h.t.claim(() => {})).toBe(2);
+    h.bridge.push({ event: "pane", stream: 1, type: "closed", reason: "closed" });
+    expect(got).toEqual([]);
+    expect(h.t.claim(() => {})).toBe(1);
+    // An open refused: the id is free at once.
+    h.t.unclaim(1);
+    expect(h.t.claim(() => {})).toBe(1);
+  });
+
+  it("a new session's hello frees every id, then tells the panes", () => {
+    const h = harness();
+    h.bridge.push(HELLO);
+    h.t.claim(() => {});
+    h.t.claim(() => {});
+    const order: string[] = [];
+    const off = h.t.onHello(() => order.push(`hello, next id ${String(h.t.claim(() => {}))}`));
+    h.bridge.push(HELLO);
+    expect(order).toEqual(["hello, next id 1"]);
+    off();
+    h.bridge.push(HELLO);
+    expect(order).toHaveLength(1);
+  });
+
+  it("sends pane messages as they are", () => {
+    const h = harness();
+    h.t.sendPane({ pane: "ack", stream: 3, bytes: 10, frames: 1 });
+    expect(h.bridge.json(1)).toEqual({ pane: "ack", stream: 3, bytes: 10, frames: 1 });
+  });
+
+  it("asks the shell to paste and takes its answer; copy is one message", async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    const p = h.t.paste();
+    expect(h.bridge.json(1)).toEqual({ app: "paste" });
+    h.bridge.push({ event: "paste", text: "from the pasteboard" });
+    await expect(p).resolves.toBe("from the pasteboard");
+    h.t.copy("the screen");
+    expect(h.bridge.json(2)).toEqual({ app: "copy", text: "the screen" });
+    // A shell that never answers: null, in the end.
+    const q = h.t.paste();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await expect(q).resolves.toBeNull();
   });
 });
 
