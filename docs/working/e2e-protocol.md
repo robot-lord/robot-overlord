@@ -415,6 +415,11 @@ never outlives a lost frame, so nothing may be lost quietly.
     waits and doesn't fight; `enroll` is shown and waited on.
   - *Silence.* Pings every 15 s; a link silent 45 s is gone; a 10 s jump
     between the wall and monotonic clocks redials at once (as the host).
+    *Input stall*: when the page sent pane input and the link has heard
+    nothing since for 5 s, the device pings at once; nothing heard within
+    5 s more and the link is given up and dialled again at once (keys
+    must not go nowhere for 45 s). Anything heard (a pong, the echo)
+    clears it.
   - *Sessions.* `KKpsk2` each time the host comes online, never reusing
     a session. No message 2 within 10 s, or `undeliverable`, retries the
     handshake on the same link (1 s doubling to 30 s). Any decrypt
@@ -423,15 +428,34 @@ never outlives a lost frame, so nothing may be lost quietly.
   - *State.* The last `rev` is kept; `hello.rev` and `changed` go to the
     page, whose store asks `snapshot {rev}`.
   - *The outbox.* Each request gets 16 random bytes as its id, saved
-    before it is sent. Only `overlord.ask` and `overlord.new_session` may
-    wait without a live session (they go by mailbox); any other op needs
-    one. After any reconnect every unanswered entry goes again, same id,
-    oldest first, once per link; an op that changes something is resent
-    for 2 minutes, then ends `interrupted`; an ask waits up to 24 hours.
-    At most 16 entries (`outbox_full`). `in_progress` waits;
+    before it is sent. Only `overlord.new_session` may wait without a
+    live session (it goes by mailbox); any other op needs one. After any
+    reconnect every unanswered entry goes again, same id, oldest first,
+    once per link; an op that changes something is resent for 2
+    minutes, then ends `interrupted`; a new session waits up to 24
+    hours. At most 16 entries (`outbox_full`). `in_progress` waits;
     `interrupted` ends the entry. Look-ups (the daemon's idempotent ops,
-    `page.report` among them) are never kept: one in flight when the
-    link dies fails `disconnected`.
+    `page.report`, `pane.open` and `pane.take` among them) are never
+    kept: refused `disconnected` or `host_offline` without a live
+    session, and one in flight when the link dies fails `disconnected`.
+  - *Panes.* The engine passes them through for the page: the page's
+    `{"pane":"input"|"resize"|"ack"|"close","stream",…}` become data
+    frames (input split into frames of at most 16 382 bytes) and `pane`
+    events; each host frame on a pane stream goes to the page as one
+    `{"event":"pane","stream","type":"data","b"}` (standard base64 with
+    padding), so the page counts frames by messages; the host's `closed`
+    passes on. The engine knows a stream as open from `pane.open`'s
+    answer; a frame for a stream that isn't open is discarded, and so is
+    the page's input for one. **Pane streams end with their session**:
+    when it ends (the link drops, the host goes away, a decrypt fails,
+    the app goes to the background), the page hears `closed` with
+    `reason: "link"` for every stream still open. **Reopen on
+    reconnect**: after the next `hello` the page opens what it shows
+    again, with `pane.open` (a new view client, whose first bytes are a
+    full redraw); nothing is resumed. A page that reloads (`ready`)
+    loses its streams: the engine closes them at the host and drops what
+    they still send; the new page's `pane.open` of one of those stream
+    ids waits for the host's `closed` of the old one.
   - *The mailbox.* Keyed on the first live session and whenever there is
     none, and again when the `hello`'s `mailbox` isn't the one it holds
     (§3, step 4). One frame out at a time, sealed and saved before it
@@ -445,7 +469,8 @@ never outlives a lost frame, so nothing may be lost quietly.
     dial, the cheap check (`ready`'s `signal`, `boot`); only if something
     waits a session, a snapshot and a count of sessions newly waiting.
   - Owed: no watchdog for an answer on a live session (a request whose
-    frame the host never got waits until the next reconnect).
+    frame the host never got waits until the next reconnect). The input
+    stall rule covers the case that matters most (typing into a pane).
 
 ## 5. Host and daemon
 
