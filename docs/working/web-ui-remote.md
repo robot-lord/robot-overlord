@@ -5915,3 +5915,46 @@ contract above and merged here.
   copyright lines name its sites); `proto.ts`'s `control` is required;
   every test that used `overlord.ask` as the op that runs once or waits
   uses `overlord.new_session`.
+
+#### Step 9: measured here; the phone by hand is owed
+
+What could be measured without the phone (2026-11-24, this Mac, tmux
+3.8, the real Claude Code 2.1.331 on the fake model in a demo, a view
+client at 54x30 read as fast as it writes, reads grouped into frames as
+the host's 15 ms coalescing would):
+
+| Phase | Bytes | Bytes/s | Frames |
+| --- | --- | --- | --- |
+| Attach (the first whole redraw) | 4 292 | | 1 |
+| Idle, 10 s | 1 816 | 181 | 1 |
+| A streamed answer, 12 s | 6 294 | 523 | 18 (350 B each) |
+| A tool call and its permission dialog, 8 s | 4 840 | 602 | 11 |
+| The dialog dismissed | 652 | | 1 |
+| 21 keys typed by hand, their echo | 290 | | 1 |
+
+All of it is far under a pane's 64 KiB/s; a reconnect's redraw is about
+4 KiB. **Compression** of that recording (18 184 bytes, 33 frames):
+zstd -3 with a fresh context per frame 7 196 bytes (60% saved), lz4 per
+frame 8 675 (52%); across the whole stream (a context living across
+frames, the arrangement decision 1 argues against) zstd 2 836 (84%),
+lz4 3 936. At these rates the saving is a few hundred bytes a second
+per open pane; nothing argues for compressing panes in this slice.
+Recorded for the provisional decision (`e2e-crypto.md`'s note).
+
+`test-term` (10 steps) passes twice in a row; the link cut mid-answer
+reopens to the same screen as a fresh open; Esc interrupts a streamed
+answer through the key row's byte.
+
+**Owed by hand, on the iPhone through the Tailscale Serve relay**
+(`demo.sh --real-claude --web`): key-to-echo times on wifi and mobile
+(the page's debug read-out shows the last one), the real keyboard
+(autocorrect, smart punctuation now off by the shell, dictation, a
+hardware keyboard), every key of the row, the compose line, paste and
+copy (iOS's paste notice), scroll-back by drag, rotation, the font
+steps, the viewer's scaled view, control each way with the desktop TUI
+(the overlay too) and the desktop page (inside and after the 30 s),
+wifi to mobile, a tunnel, a long lock, background and foreground
+mid-answer, a flood (`cat` of a large file) on a slow network,
+view-only, revoke while a pane is open, WebGL after a long background
+(gate 1c on the phone), and the `pane.open`-behind-`hello` shortcut if
+the reopen time on mobile wants it (not built).
