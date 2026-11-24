@@ -5461,3 +5461,10 @@ To the first plan's nine questions:
    losing notes for the overlord while the computer is unreachable is
    accepted; scroll-back by touch needs `[tmux] mouse`; no local echo
    for now.
+
+Control follow-ups (user, 2026-11-24), all as recommended: only the
+controller types (viewers are pointed at Take over); a holder that leaves
+keeps control 30 s, then it returns to the terminal if it shows the pane,
+else the last-used screen, else free; a free pane goes to whoever opens it
+without a tap; the desktop page follows the same rule. Two browser tabs
+both named "a browser on <host>" was not raised; kept as planned.
