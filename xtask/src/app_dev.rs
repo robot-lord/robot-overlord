@@ -223,7 +223,7 @@ fn e2e_env(bridge_url: &str, control: &str) -> [(&'static str, String); 2] {
     ]
 }
 
-fn build_device() -> Result<()> {
+pub(crate) fn build_device() -> Result<()> {
     run(cmd::cargo().args([
         "build",
         "-p",
@@ -235,18 +235,23 @@ fn build_device() -> Result<()> {
 
 /// `rlord-device bridge`, run for a task: its events (one JSON line each
 /// on its stdout) and its stdin.
-struct DeviceBridge {
+pub(crate) struct DeviceBridge {
     child: Child,
     stdin: ChildStdin,
     events: mpsc::Receiver<Value>,
-    url: String,
+    pub(crate) url: String,
     port: u16,
 }
 
 const BRIDGE_WAIT: Duration = Duration::from_secs(30);
 
 impl DeviceBridge {
-    fn start(root: &Path, state: &Path, qr: &str, origin: Option<&str>) -> Result<DeviceBridge> {
+    pub(crate) fn start(
+        root: &Path,
+        state: &Path,
+        qr: &str,
+        origin: Option<&str>,
+    ) -> Result<DeviceBridge> {
         let bin = root.join("target/debug/rlord-device");
         let mut child = Command::new(&bin)
             .args(bridge_args(state, qr, origin))
@@ -293,13 +298,13 @@ impl DeviceBridge {
         Ok(b)
     }
 
-    fn send(&mut self, line: &str) -> Result<()> {
+    pub(crate) fn send(&mut self, line: &str) -> Result<()> {
         writeln!(self.stdin, "{line}")?;
         self.stdin.flush()?;
         Ok(())
     }
 
-    fn quit(&mut self) {
+    pub(crate) fn quit(&mut self) {
         let _ = self.send("quit");
         let until = Instant::now() + Duration::from_secs(10);
         while Instant::now() < until {

@@ -9,6 +9,7 @@
 
 mod app;
 mod app_dev;
+mod app_term;
 mod build;
 mod bump;
 mod check_deps;

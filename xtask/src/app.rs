@@ -29,7 +29,10 @@ usage: cargo xtask app <task>
                         on 127.0.0.1 (rebuilt on change); prints its URL
   test-e2e              the phone page's store and RemoteTransport in Node over the
                         bridge against that host: pair, list, ask, the relay and the
-                        plugin restarted, unpair (no simulator, no Xcode)";
+                        plugin restarted, unpair (no simulator, no Xcode)
+  test-term             the real Claude Code's terminal through the phone's pane link
+                        in Node (headless xterm.js), over the real relay, on the
+                        demo's fake model (needs tmux and npm; no model calls)";
 
 /// The FFI crate and its library name.
 const FFI_PACKAGE: &str = "robot-overlord-e2e-ffi";
@@ -51,6 +54,7 @@ pub fn main(args: &[String]) -> Result<()> {
         Some("test-ios") => test_ios(&root, &args[1..]),
         Some("dev") => crate::app_dev::dev(&root, &args[1..]),
         Some("test-e2e") => crate::app_dev::test_e2e(&root, &args[1..]),
+        Some("test-term") => crate::app_term::test_term(&root, &args[1..]),
         Some("help" | "--help" | "-h") | None => {
             println!("{USAGE}");
             Ok(())
