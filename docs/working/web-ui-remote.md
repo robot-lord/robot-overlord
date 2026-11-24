@@ -1,4 +1,4 @@
-**Status:** in progress (slices 1 to 3, the local web UI, the web as a UI target, and the e2e core and the relay, are built and merged into `feature/web`; slice 4, the phone app, is built for iOS on `feat/web-ui-4` (local commits) with Android deferred; slice 5, live terminals on the phone, is planned on `feat/web-ui-5` ("Slice 5 plan" at the end) and being built ("Slice 5 build"). The feature branch stays dark: no releases, TestFlight or store builds until the final merge to `main`; the app is built and installed locally only)
+**Status:** in progress (slices 1 to 3, the local web UI, the web as a UI target, and the e2e core and the relay, are built and merged into `feature/web`; slice 4, the phone app, is built for iOS on `feat/web-ui-4` (local commits) with Android deferred; slice 5, live terminals on the phone, is built on `feat/web-ui-5` (local commits; "Slice 5 plan" and "Slice 5 build" at the end), with the by-hand iPhone pass owed. The feature branch stays dark: no releases, TestFlight or store builds until the final merge to `main`; the app is built and installed locally only)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -1539,6 +1539,13 @@ Decided 2026-11-17 (user):
   simulator. Step 2 done: `stream.rs` pane frames (1 to 250, standing
   alone, 251 to 255 refused), the vectors (and the WASM runner) and
   `e2e-protocol.md` §3.
+  Steps 3 to 8 and 10 built (4, 5 and 6 side by side in worktrees, then
+  merged); step 9 measured where no phone is needed. Every automated
+  check passes: `cargo test --workspace` with `RLORD_TMUX_TESTS=1` (1211),
+  `web check` (149), `app test-e2e` (6), `app test-term` (10), `app
+  test-ios` (18 XCTest, the XCUITest), `check-deps`. Deviations and owed
+  items: "Slice 5 build" (gates, each step's entry, "Step 9", and "Owed
+  after slice 5" at the end).
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
@@ -5958,3 +5965,29 @@ mid-answer, a flood (`cat` of a large file) on a slow network,
 view-only, revoke while a pane is open, WebGL after a long background
 (gate 1c on the phone), and the `pane.open`-behind-`hello` shortcut if
 the reopen time on mobile wants it (not built).
+
+#### Owed after slice 5
+
+- **By hand on the iPhone** (Step 9's list): latency, the real keyboard,
+  every key, control each way, network changes, a flood on a slow
+  network, view-only, revoke, WebGL after a long background.
+- **Gate 1b's gap**: a bracketed paste from a held terminal still reaches
+  the pane (tmux forwards pastes past key tables). Typed keys are held.
+  Closing it would mean holding the terminal's client some other way
+  (not known in tmux 3.2 to 3.8).
+- **The page bundle check** exempts `/THIRD-PARTY-LICENSES.md` from the
+  URL check (xterm.js's copyright lines name its sites); the file is
+  never loaded as code. The user may want to confirm.
+- A session's profile turned on or off while another screen holds it is
+  untested (the daemon re-holds the keys after a profile sync; the
+  restore may keep the old table).
+- `LivePageTests` doesn't mount a terminal by itself (the page mounts
+  one only in a pane view); gate 1c and the XCUITest (typing into the
+  overlord's pane under the real CSP) cover it.
+- The plan's `a_blip_keeps_control` and
+  `control_passes_on_after_the_holder_leaves` are the daemon's
+  `control.rs` units (a fake clock), not end-to-end tests (30 s each).
+- Not built: `the_wanted_pane_follows_hello` (the `pane.open` behind
+  `hello` shortcut; step 9 left it for the phone's reopen times).
+- Still owed from slice 4: Android, the general answer watchdog (the
+  input-stall rule covers typing), the protocol review.
