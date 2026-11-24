@@ -11,4 +11,9 @@ ignore = [
   # newest core-models still needs hax-lib 0.3; hax-lib-macros 0.4 dropped
   # it. Drop this once libcrux's chain is on hax-lib 0.4 or later.
   { id = "RUSTSEC-2026-0173", reason = "build-time proc macro via libcrux-ml-kem; no known vulnerability" },
+  # `basic-toml` is unmaintained, not vulnerable: askama's derive macro
+  # reads its config with it, pulled in by uniffi_bindgen 0.32 (the phone
+  # app's Swift bindings, generated at build time). Drop this once askama
+  # or uniffi moves off it.
+  { id = "RUSTSEC-2026-0374", reason = "build-time proc macro via uniffi_bindgen (askama); no known vulnerability" },
 ]

@@ -319,7 +319,10 @@ fn xcodebuild(root: &Path, action: &[&str], destination: &str, signing: bool) ->
     if signing {
         // Lets Xcode create the team's development certificate and
         // profile, and register a new phone (the first install).
-        c.args(["-allowProvisioningUpdates", "-allowProvisioningDeviceRegistration"]);
+        c.args([
+            "-allowProvisioningUpdates",
+            "-allowProvisioningDeviceRegistration",
+        ]);
     } else {
         // The simulator needs no team's certificate.
         c.args(["CODE_SIGN_IDENTITY=-", "CODE_SIGNING_REQUIRED=NO"]);

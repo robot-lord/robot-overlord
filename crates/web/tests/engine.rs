@@ -232,6 +232,12 @@ async fn the_hosts_drop_and_a_stalled_link() {
     let t = Instant::now();
     let r = phone.request("snapshot", json!({}), WAIT).await.unwrap();
     assert_eq!(r["error"]["code"], "disconnected", "{r}");
+    // The test client may not have seen the drop yet (its state still
+    // reads live): wait for the redial itself, then for it to be live.
+    while w.tamper.connections(Role::Device).len() == n {
+        assert!(t.elapsed() < Duration::from_secs(3), "no redial in {:?}", t.elapsed());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     phone.conn("live", WAIT).await.unwrap();
     assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     assert_eq!(w.tamper.connections(Role::Device).len(), n + 1);
