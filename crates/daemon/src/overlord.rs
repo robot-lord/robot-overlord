@@ -781,14 +781,19 @@ fn ensure_running(db: &Db, cfg: &Config, cur: Option<Session>, params: &Value) -
     }
 }
 
-/// Before any restart of session `id`: if it is an overlord, rewrite its
-/// folder and launch flags (`refresh_launch`), so a restart from the list,
-/// the CLI or a Remote Control toggle starts it with the current MCP
-/// server and instructions, as `ensure` does. Other sessions: nothing.
-pub fn refresh_if_overlord(db: &Db, cfg: &Config, id: &str) -> Result<()> {
-    match db.resolve_ref(id) {
-        Ok(s) if is_overlord_role(&s.role) => refresh_launch(db, cfg, &s),
-        _ => Ok(()),
+/// Before a plain restart of session `id` (the list, the CLI, MCP, a
+/// Remote Control toggle): if it is a live overlord, rewrite its folder
+/// and launch flags (`refresh_launch`), as `ensure` does, so it starts
+/// with the current MCP server, instructions and effort. Best effort: a
+/// folder that can't be written is logged and never stops the restart.
+/// Other sessions: nothing.
+pub fn refresh_if_overlord(db: &Db, cfg: &Config, id: &str) {
+    let Ok(s) = db.resolve_ref(id) else { return };
+    if !is_overlord_role(&s.role) || s.archived_at.is_some() {
+        return;
+    }
+    if let Err(e) = refresh_launch(db, cfg, &s) {
+        tracing::warn!(error = %e, id = %s.id, "refreshing the overlord's folder before a restart");
     }
 }
 
@@ -1649,8 +1654,8 @@ mod tests {
         overlord_row(&db, "01o", "claude", TMUX_NAME, &od.to_string_lossy(), 10);
         row(&db, "01w", "worker", "w", &wd.to_string_lossy());
         let cfg = Config::default();
-        refresh_if_overlord(&db, &cfg, "01o").unwrap();
-        refresh_if_overlord(&db, &cfg, "01w").unwrap();
+        refresh_if_overlord(&db, &cfg, "01o");
+        refresh_if_overlord(&db, &cfg, "01w");
         let mcp: Value =
             serde_json::from_str(&std::fs::read_to_string(od.join("mcp.json")).unwrap()).unwrap();
         assert_eq!(mcp["mcpServers"]["rlord"]["args"][1], "--overlord");

@@ -405,7 +405,7 @@ fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
     rlord_core::agents::install::warm();
     let hooks = d.restart_hooks(id);
     let db = d.db();
-    overlord::refresh_if_overlord(&db, &d.config(), id)?;
+    overlord::refresh_if_overlord(&db, &d.config(), id);
     methods::session_restart(&db, &json!({"ref": id, "hooks_work": hooks}))?;
     drop(db);
     d.changed();
