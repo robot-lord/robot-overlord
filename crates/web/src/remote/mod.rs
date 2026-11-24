@@ -32,6 +32,7 @@ pub mod link;
 mod mailbox;
 mod outq;
 mod pairing;
+pub mod panes;
 mod requests;
 mod session;
 mod signals;
@@ -121,6 +122,28 @@ pub enum Input {
         n: Option<u64>,
         cmd: Value,
     },
+    /// Something from a pane's task (`panes.rs`).
+    Pane {
+        link: u32,
+        epoch: u64,
+        stream: u8,
+        gen: u64,
+        ev: panes::Event,
+    },
+    /// A device's `pane.open` came back from the daemon.
+    PaneOpened {
+        link: u32,
+        epoch: u64,
+        stream: u8,
+        id: Value,
+        device: String,
+        may_type: bool,
+        result: Box<panes::OpenResult>,
+    },
+    /// A link's queue fell below `outq::LOW_MARK`.
+    LinkLow(u32),
+    /// The daemon's map of held panes (`{"notify":"control"}`).
+    Control(Value),
     Tick,
 }
 
@@ -149,6 +172,11 @@ impl Handle {
 
     pub fn ui(&self, device: String, n: Option<u64>, cmd: Value) {
         let _ = self.tx.send(Input::Ui { device, n, cmd });
+    }
+
+    /// Who holds which pane now (the daemon's whole map).
+    pub fn control(&self, sessions: Value) {
+        let _ = self.tx.send(Input::Control(sessions));
     }
 }
 
@@ -213,6 +241,8 @@ pub(crate) struct Actor {
     signals: Signals,
     last_expiry: Option<Instant>,
     state_tx: watch::Sender<Value>,
+    /// Devices' open panes (`panes.rs`).
+    pub(crate) panes: panes::Panes,
 }
 
 /// Start the remote-access task. `rev` is the daemon's state now;
@@ -265,6 +295,7 @@ pub fn start(
         signals: Signals::default(),
         last_expiry: None,
         state_tx,
+        panes: panes::Panes::default(),
     };
     tokio::spawn(report_states(d, state_rx));
     let ticker = tx.clone();
@@ -355,6 +386,24 @@ impl Actor {
                 answer,
             } => self.done(&device, &op, key, from, answer),
             Input::Ui { device, n, cmd } => self.ui(&device, n, cmd),
+            Input::Pane {
+                link,
+                epoch,
+                stream,
+                gen,
+                ev,
+            } => self.pane_event(link, epoch, stream, gen, ev),
+            Input::PaneOpened {
+                link,
+                epoch,
+                stream,
+                id,
+                device,
+                may_type,
+                result,
+            } => self.pane_opened(link, epoch, stream, id, device, may_type, *result),
+            Input::LinkLow(link) => self.pane_link_low(link),
+            Input::Control(sessions) => self.pane_control(sessions),
             Input::Tick => self.tick(),
         }
     }
@@ -518,6 +567,10 @@ impl Actor {
             q.set_limit(l.bytes_per_sec, l.burst_bytes);
         }
         q.set_links(self.links.len());
+        let low = self.tx.clone();
+        q.set_on_low(Box::new(move |link| {
+            let _ = low.send(Input::LinkLow(link));
+        }));
         tokio::spawn(outq::write(q.clone(), sink));
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -630,6 +683,10 @@ impl Actor {
     }
 
     fn drop_links(&mut self) {
+        let ids: Vec<u32> = self.links.keys().copied().collect();
+        for id in ids {
+            self.pane_end_link(id);
+        }
         for (_, l) in self.links.drain() {
             if l.is_live() {
                 self.audit
@@ -749,6 +806,7 @@ impl Actor {
     }
 
     fn unlink(&mut self, id: u32) {
+        self.pane_end_link(id);
         if let Some(l) = self.links.remove(&id) {
             if let Some(dev) = l.device_id() {
                 if l.is_live() {
@@ -766,6 +824,7 @@ impl Actor {
     /// Close one link at the relay (the relay closes the device with 4205,
     /// "reconnect now").
     pub(crate) fn drop_link(&mut self, id: u32, why: &str) {
+        self.pane_end_link(id);
         // Its session failed: what is still queued for it is no use.
         if let Some(q) = self.queue() {
             q.forget(id);
@@ -935,6 +994,27 @@ impl Actor {
                 self.revoke(id, "by the user")?;
                 Ok(json!({}))
             }
+            "input" => {
+                let id = req["device"].as_str().ok_or("which device?")?;
+                let on = req["input"].as_bool().ok_or("input: true or false")?;
+                if !self
+                    .devices
+                    .set_input(id, on)
+                    .map_err(|e| format!("{e:#}"))?
+                {
+                    return Err(format!("no device {id}"));
+                }
+                self.audit.log(
+                    id,
+                    if on {
+                        "input on"
+                    } else {
+                        "input off (view only)"
+                    },
+                );
+                self.pane_input_changed(id);
+                Ok(json!({}))
+            }
             "disable" => {
                 self.cfg.enabled = false;
                 self.cancel_pairing("remote access turned off");
@@ -1009,6 +1089,7 @@ impl Actor {
                 "paired_at": d.paired_at,
                 "last_seen": d.last_seen,
                 "linked": live.contains(&d.id),
+                "input": d.input,
             })).collect::<Vec<_>>(),
             "pairing": self.pairing.as_ref().map(|p| json!({"expires": p.expires})),
             "pending": self.pairing.as_ref().and_then(|p| p.pending.as_ref()).map(|w| json!({

@@ -13,6 +13,7 @@
 //! (`plugin::EXIT_PORT_IN_USE`). The daemon retries neither 3 nor 4.
 
 mod assets;
+mod bridge;
 mod daemon;
 mod http;
 mod pane;
@@ -128,6 +129,12 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
                 // The user's relay commands (`relay.*`), for the remote
                 // task, which answers each with `web.remote_reply`.
                 daemon::Event::Remote { id, req } => remote.command(id, req),
+                // Who holds which pane: the remote task's typing and
+                // viewers' sizes, and the local pane sockets'.
+                daemon::Event::Control { sessions } => {
+                    remote.control(sessions.clone());
+                    pump.control(sessions);
+                }
             }
         }
         eprintln!("rlord-web: the daemon went away; exiting");

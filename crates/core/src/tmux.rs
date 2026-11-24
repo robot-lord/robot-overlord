@@ -681,7 +681,7 @@ pub fn bind_web_table() -> Result<()> {
 /// Checks `target` exists first: `new-session -t` on a missing name makes a
 /// fresh shell instead of failing. After attaching, confirm with
 /// `view_shows` (the target can go in between).
-pub fn view_command(target: &str, view: &str) -> Result<Command> {
+pub fn view_command(target: &str, view: &str, read_only: bool) -> Result<Command> {
     if !is_view(view) {
         bail!("{view:?} isn't a web view session name");
     }
@@ -693,7 +693,21 @@ pub fn view_command(target: &str, view: &str) -> Result<Command> {
     c.env_remove("TMUX")
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
-        .args(["new-session", "-t", &exact(target), "-s", view]);
+        // A view never sizes the window (the daemon pins it for whoever
+        // controls the pane); a view-only device's can't type.
+        .args([
+            "new-session",
+            "-f",
+            if read_only {
+                "ignore-size,read-only"
+            } else {
+                "ignore-size"
+            },
+            "-t",
+            &exact(target),
+            "-s",
+            view,
+        ]);
     for (opt, val) in [
         ("status", "off"),
         ("key-table", WEB_TABLE),

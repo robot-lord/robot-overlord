@@ -45,6 +45,11 @@ pub const LINK_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
 /// The host pings its relay this often (the relay pings too); any message
 /// from the relay, a pong included, says it is still there.
 pub const PING_EVERY: Duration = Duration::from_secs(15);
+/// A pane frame is encrypted only while its link's queue holds less than
+/// this (`remote/panes.rs`): frames are encrypted when queued, so a
+/// link's queue is first in, first out, and this mark is what keeps an
+/// answer from waiting behind a busy pane for long.
+pub const LOW_MARK: usize = 32 * 1024;
 /// The share of the relay's rate and burst the writer uses, so the relay's
 /// own bucket never runs dry (it counts time a little differently).
 const PACE: f64 = 0.9;
@@ -79,6 +84,10 @@ struct Inner {
     limit: Option<(u64, u64)>,
     /// The links the relay counts for us.
     link_count: usize,
+    /// Links whose queue someone waits to see fall below [`LOW_MARK`].
+    want_low: std::collections::BTreeSet<u32>,
+    /// Those that did, for the waker.
+    lowered: Vec<u32>,
 }
 
 impl Inner {
@@ -105,8 +114,12 @@ impl Inner {
         if let Message::Binary(b) = &f {
             q.bytes -= b.len();
         }
+        let bytes = q.bytes;
         if q.frames.is_empty() {
             self.links.remove(&id);
+        }
+        if bytes < LOW_MARK && self.want_low.remove(&id) {
+            self.lowered.push(id);
         }
         Some(f)
     }
@@ -118,7 +131,12 @@ impl Inner {
 pub struct OutQ {
     inner: Arc<Mutex<Inner>>,
     wake: Arc<Notify>,
+    /// Told the link whose queue fell below [`LOW_MARK`] (`want_low`).
+    on_low: Arc<Mutex<Option<LowHook>>>,
 }
+
+/// What `OutQ` calls when a watched link's queue falls below the mark.
+pub type LowHook = Box<dyn Fn(u32) + Send>;
 
 impl OutQ {
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -191,7 +209,31 @@ impl OutQ {
 
     /// The link failed: what was queued for it goes (its session is over).
     pub fn forget(&self, link: u32) {
-        self.lock().links.remove(&link);
+        let mut g = self.lock();
+        g.links.remove(&link);
+        g.want_low.remove(&link);
+    }
+
+    /// Bytes queued for `link` now.
+    #[cfg(test)]
+    pub fn link_bytes(&self, link: u32) -> usize {
+        self.lock().links.get(&link).map_or(0, |q| q.bytes)
+    }
+
+    /// Who to tell when a watched link's queue falls below the mark.
+    pub fn set_on_low(&self, hook: LowHook) {
+        *self.on_low.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// Whether `link`'s queue is below [`LOW_MARK`]; if not, the hook is
+    /// called once when it falls below it.
+    pub fn below_mark(&self, link: u32) -> bool {
+        let mut g = self.lock();
+        if g.links.get(&link).map_or(0, |q| q.bytes) < LOW_MARK {
+            return true;
+        }
+        g.want_low.insert(link);
+        false
     }
 
     /// Send `m` (a close frame), then stop.
@@ -233,7 +275,19 @@ impl OutQ {
     }
 
     fn next(&self) -> Option<Message> {
-        self.lock().pop()
+        let (m, lowered) = {
+            let mut g = self.lock();
+            let m = g.pop();
+            (m, std::mem::take(&mut g.lowered))
+        };
+        if !lowered.is_empty() {
+            if let Some(hook) = &*self.on_low.lock().unwrap_or_else(|e| e.into_inner()) {
+                for id in lowered {
+                    hook(id);
+                }
+            }
+        }
+        m
     }
 
     /// Count `n` bytes sent; how long to wait before sending more.
@@ -414,6 +468,43 @@ mod tests {
         q.set_limit(Some(1000), Some(1000));
         q.set_links(1);
         assert!(q.spent(&mut Bucket::default(), 1 << 20) > Duration::from_secs(500));
+    }
+
+    #[test]
+    fn a_links_queue_reports_its_bytes() {
+        let q = OutQ::default();
+        assert_eq!(q.link_bytes(1), 0);
+        q.link(1, vec![0; 1000]).unwrap();
+        q.link(1, vec![0; 24]).unwrap();
+        q.link(2, vec![0; 5]).unwrap();
+        assert_eq!(q.link_bytes(1), 1024);
+        q.next();
+        q.next();
+        assert_eq!(q.link_bytes(1), 24);
+        q.forget(1);
+        assert_eq!(q.link_bytes(1), 0);
+    }
+
+    #[test]
+    fn the_low_mark_wakes_once() {
+        let q = OutQ::default();
+        let woke = Arc::new(Mutex::new(Vec::new()));
+        let w = woke.clone();
+        q.set_on_low(Box::new(move |id| w.lock().unwrap().push(id)));
+        // Below the mark: no wait, no wake.
+        assert!(q.below_mark(3));
+        for _ in 0..3 {
+            q.link(3, vec![0; LOW_MARK / 2]).unwrap();
+        }
+        assert!(!q.below_mark(3));
+        assert!(!q.below_mark(3));
+        q.next(); // 1 frame out, 1.0 mark left: still at the mark
+        assert!(woke.lock().unwrap().is_empty());
+        q.next(); // below it now
+        assert_eq!(*woke.lock().unwrap(), vec![3]);
+        q.next();
+        // Once: nobody asked again.
+        assert_eq!(*woke.lock().unwrap(), vec![3]);
     }
 
     #[test]

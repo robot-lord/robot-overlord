@@ -155,6 +155,10 @@ pub enum Event {
     /// `{"cmd": "setup" | "pair" | "pair_cancel" | "confirm" | "reject" |
     /// "revoke" | "disable", …}`.
     Remote { id: String, req: Value },
+    /// Who holds which pane: the daemon's whole map, `{"<session id>":
+    /// {"holder","by","name","away","cols","rows","tmux_session"}}`, on
+    /// every change.
+    Control { sessions: Value },
 }
 
 /// The daemon's push stream.
@@ -196,6 +200,13 @@ fn event(line: &str) -> Option<Event> {
                 cmd: v.get("cmd")?.clone(),
             }),
         },
+        "control" => Some(Event::Control {
+            sessions: v
+                .get("sessions")
+                .filter(|s| s.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        }),
         "remote" => Some(Event::Remote {
             id: v["id"].as_str()?.to_string(),
             req: v.get("req").filter(|r| r.is_object())?.clone(),
@@ -288,6 +299,12 @@ mod tests {
         assert_eq!(
             remote_reply_params("r2", Err("no".into())),
             json!({"id": "r2", "error": "no"})
+        );
+        assert_eq!(
+            event(r#"{"notify":"control","sessions":{"s1":{"holder":"terminal"}}}"#),
+            Some(Event::Control {
+                sessions: json!({"s1": {"holder": "terminal"}})
+            })
         );
         assert_eq!(event(r#"{"notify":"other"}"#), None);
         assert_eq!(event("not json"), None);

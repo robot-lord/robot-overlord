@@ -402,9 +402,9 @@ fn view_helpers() {
     let target = "rlord_webhelp";
     tmux::new_session(target, "/tmp", "cat").unwrap();
     // Refused: a missing target (it would make a shell), a non-view name.
-    let e = tmux::view_command("rlord_nosuch", "webview-9").unwrap_err();
+    let e = tmux::view_command("rlord_nosuch", "webview-9", false).unwrap_err();
     assert!(e.to_string().contains("not running"), "{e}");
-    assert!(tmux::view_command(target, "rlord_other").is_err());
+    assert!(tmux::view_command(target, "rlord_other", false).is_err());
 
     // The web table: root's pane mouse bindings, no keyboard keys; the
     // same again when remade.
@@ -416,7 +416,11 @@ fn view_helpers() {
     tmux::bind_web_table().unwrap();
     assert_eq!(tmux::bindings(tmux::WEB_TABLE), keys);
 
-    let mut c = PtyClient::run(tmux::view_command(target, "webview-1").unwrap(), 80, 24);
+    let mut c = PtyClient::run(
+        tmux::view_command(target, "webview-1", false).unwrap(),
+        80,
+        24,
+    );
     wait_for("the view's client", || {
         tx(&["list-clients", "-F", "#{session_name}"]) == "webview-1"
     });

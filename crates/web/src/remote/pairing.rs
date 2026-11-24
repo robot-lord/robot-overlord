@@ -287,6 +287,8 @@ impl Actor {
             relay_fp: B64(w.relay_fp.to_vec()),
             paired_at: now(),
             last_seen: None,
+            // New devices may type (slice 5 answer 2).
+            input: true,
         };
         if let Err(e) = self.devices.add(device) {
             // Not stored: the device still waits, so confirming can be

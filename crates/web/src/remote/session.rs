@@ -219,6 +219,8 @@ impl Actor {
                     "page": device,
                     "device": device,
                     "mailbox": mailbox,
+                    "panes": super::panes::hello_limits(),
+                    "input": self.devices.by_id(&device).is_none_or(|d| d.input),
                 });
                 if let Some(l) = self.links.get_mut(&id) {
                     l.phase = Phase::Live(Box::new(Live::new(session, device)));
@@ -237,9 +239,7 @@ impl Actor {
                 match msg {
                     Err(e) => self.drop_link(id, &format!("{device}: {e}")),
                     Ok(None) => {}
-                    Ok(Some(m)) if m.stream != CONTROL => {
-                        self.drop_link(id, "panes are not served yet")
-                    }
+                    Ok(Some(m)) if m.stream != CONTROL => self.pane_input(id, m.stream, m.body),
                     Ok(Some(m)) => self.control_message(id, &m.body),
                 }
             }
@@ -308,6 +308,21 @@ impl Actor {
         }
     }
 
+    /// Encrypt and send one frame plaintext (a pane frame) on a link's
+    /// session. False if it couldn't be (the link is dropped then).
+    pub(crate) fn send_plain(&mut self, id: u32, plain: &[u8]) -> bool {
+        let Some(s) = self.links.get_mut(&id).and_then(|l| l.session()) else {
+            return false;
+        };
+        match s.encrypt(plain) {
+            Ok(w) => self.send_live(id, w),
+            Err(e) => {
+                self.drop_link(id, &e.to_string());
+                false
+            }
+        }
+    }
+
     /// A whole control message from a live device.
     fn control_message(&mut self, id: u32, body: &[u8]) {
         let Ok(req) = serde_json::from_slice::<Value>(body) else {
@@ -317,6 +332,7 @@ impl Actor {
             return match ev {
                 "mailbox_key" => self.mailbox_key(id, &req),
                 "mailbox_ready" => self.mailbox_ready(id, &req),
+                "pane" => self.pane_device_event(id, &req),
                 _ => {}
             };
         }
@@ -334,6 +350,12 @@ impl Actor {
             );
         }
         let device = live.device.clone();
+        if req["op"] == "pane.open" {
+            return self.pane_open(id, &req);
+        }
+        if let Some(target) = super::panes::audit_take(&req) {
+            self.audit.log(&device, &format!("pane take {target}"));
+        }
         let next = self.admit(&device, &req, Waiter::Live { link: id, epoch });
         if matches!(next, Next::Run { key: Some(_), .. }) {
             // Recorded as running before it runs: a resend by id, by any

@@ -63,6 +63,9 @@ pub struct App {
     pub changes: broadcast::Sender<()>,
     pub controls: AtomicUsize,
     pub panes: AtomicUsize,
+    /// Who holds which pane (the daemon's `control` map): pane sockets
+    /// pass input on only for the holder, and size viewers' clients.
+    pub control: tokio::sync::watch::Sender<Value>,
     /// The open pages: id, and where its socket's messages go.
     pages: Mutex<BTreeMap<String, mpsc::Sender<Message>>>,
     page_seq: AtomicU64,
@@ -80,6 +83,7 @@ impl App {
             changes: broadcast::channel(16).0,
             controls: AtomicUsize::new(0),
             panes: AtomicUsize::new(0),
+            control: tokio::sync::watch::channel(Value::Object(Default::default())).0,
             pages: Mutex::new(BTreeMap::new()),
             page_seq: AtomicU64::new(0),
             pages_sent: tokio::sync::Mutex::new(()),
@@ -122,6 +126,11 @@ impl App {
 
     pub fn rev(&self) -> String {
         self.rev.lock().expect("rev mutex").clone()
+    }
+
+    /// The daemon's map of held panes changed.
+    pub fn control(&self, sessions: Value) {
+        self.control.send_replace(sessions);
     }
 
     /// The daemon said something changed.

@@ -28,6 +28,14 @@ pub struct Device {
     /// Unix seconds of its last live session; None before the first.
     #[serde(default)]
     pub last_seen: Option<u64>,
+    /// It may type into panes (false: view only, set by the user on the
+    /// computer, `rlord relay input <device> off`).
+    #[serde(default = "yes")]
+    pub input: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Device {
@@ -80,6 +88,16 @@ impl Devices {
 
     pub fn by_id(&self, id: &str) -> Option<&Device> {
         self.list.iter().find(|d| d.id == id)
+    }
+
+    /// Set a device's view-only switch and save. False: no such device.
+    pub fn set_input(&mut self, id: &str, on: bool) -> Result<bool> {
+        let Some(d) = self.list.iter_mut().find(|d| d.id == id) else {
+            return Ok(false);
+        };
+        d.input = on;
+        self.save()?;
+        Ok(true)
     }
 
     /// The relay allow-list: every device's relay key fingerprint.
@@ -144,7 +162,20 @@ mod tests {
             relay_fp: B64(vec![fp; 32]),
             paired_at: 100,
             last_seen: None,
+            input: true,
         }
+    }
+
+    #[test]
+    fn an_old_record_may_type_and_the_switch_persists() {
+        let old = r#"[{"id":"a","name":"a","static":"AQ","relay_fp":"Ag","paired_at":1}]"#;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("devices.json"), old).unwrap();
+        let mut d = Devices::load(tmp.path()).unwrap();
+        assert!(d.list[0].input);
+        assert!(d.set_input("a", false).unwrap());
+        assert!(!d.set_input("zz", false).unwrap());
+        assert!(!Devices::load(tmp.path()).unwrap().list[0].input);
     }
 
     #[test]
