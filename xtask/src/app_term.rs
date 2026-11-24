@@ -80,10 +80,20 @@ pub fn test_term(root: &Path, args: &[String]) -> Result<()> {
         .map_while(std::result::Result::ok)
         .find(|l| l.starts_with("RLORD1:"))
         .context("no pairing QR")?;
+    // The host links to the relay for the pairing: only then is the
+    // offer's rendezvous there for the device.
+    let until = Instant::now() + WAIT;
+    while !cmd::output(&mut rlord(&["relay", "status"]))
+        .unwrap_or_default()
+        .contains("link:    connected")
+    {
+        if Instant::now() > until {
+            bail!("the demo host never linked to the relay");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let state = cmd::TempDir::new_in(&root.join("target"), "term-device")?;
     let mut bridge = DeviceBridge::start(root, state.path(), &qr, None)?;
-    confirm(&mut rlord)?;
-    let _ = pair.wait();
     // Control files for the tests (the bridge's network).
     let control = demo.dir.join("term-control");
     std::fs::create_dir_all(&control)?;
@@ -97,7 +107,21 @@ pub fn test_term(root: &Path, args: &[String]) -> Result<()> {
         .env("RLORD_TERM_ENV", serde_json::to_string(&env)?)
         .env("RLORD_TERM_CONTROL", &control);
     let mut child = c.spawn().context("starting vitest")?;
+    // The tests continue the pairing (as the page does); the host's user
+    // confirms it here once it waits.
+    let mut confirmed = false;
+    let mut last_try = Instant::now() - Duration::from_secs(1);
     let status = loop {
+        if !confirmed && last_try.elapsed() > Duration::from_millis(500) {
+            last_try = Instant::now();
+            confirmed = try_confirm(&mut rlord);
+            if confirmed {
+                // (It may not have seen the device before the confirm: it
+                // would wait out the offer.)
+                let _ = pair.kill();
+                let _ = pair.wait();
+            }
+        }
         for (name, line) in pending_commands(&control)? {
             let r = bridge.send(&line);
             std::fs::write(
@@ -110,6 +134,8 @@ pub fn test_term(root: &Path, args: &[String]) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    let _ = pair.kill();
+    let _ = pair.wait();
     bridge.quit();
     drop(relay);
     let log = std::fs::read_to_string(demo.dir.join("fake-model.log")).unwrap_or_default();
@@ -155,23 +181,14 @@ fn blocked_lines(log: &str) -> Vec<&str> {
         .collect()
 }
 
-/// `rlord relay confirm`, once a device waits (it fails until then).
-fn confirm(rlord: &mut impl FnMut(&[&str]) -> Command) -> Result<()> {
-    let until = Instant::now() + WAIT;
-    loop {
-        let ok = rlord(&["relay", "confirm"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if ok {
-            return Ok(());
-        }
-        if Instant::now() > until {
-            bail!("the device never reached the host's confirmation");
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
+/// `rlord relay confirm`: true once it worked (it fails until a device
+/// waits).
+fn try_confirm(rlord: &mut impl FnMut(&[&str]) -> Command) -> bool {
+    rlord(&["relay", "confirm"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn which(program: &str) -> Option<PathBuf> {
@@ -268,7 +285,8 @@ impl Relay {
         std::fs::write(
             &conf,
             format!(
-                "listen = \"127.0.0.1:{port}\"\ndata_dir = \"{}\"\n[tls]\nmode = \"proxy\"\n",
+                "origin = \"http://127.0.0.1:{port}\"\nlisten = \"127.0.0.1:{port}\"\n\
+                 data_dir = \"{}\"\n[tls]\nmode = \"proxy\"\n",
                 dir.display()
             ),
         )?;

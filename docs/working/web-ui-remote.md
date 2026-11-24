@@ -5856,3 +5856,62 @@ Owed:
   holds it (`profile::sync_ref` / `sync_all` then hold it again,
   `control::reassert`, keeping the newly set table as the one to
   restore).
+
+#### Steps 2, 3, 7, 8 and 10 (integrator), and the merge
+
+Built on `feat/web-ui-5` (Opus); steps 4, 5 and 6 were built side by
+side in worktrees (`s5/daemon`, `s5/engine`, `s5/page`) against the
+contract above and merged here.
+
+- **Step 2, core**: `stream.rs` (pane streams 1 to 250 stand alone,
+  "more" on one refused, 251 to 255 refused), the vectors
+  (`pane_frames`, `stream_pane_more`, `stream_reserved_id`), the WASM
+  runner reproducing them, `e2e-protocol.md` §3.
+- **Step 3, host** (`crates/web`): `bridge.rs` (the view client on a PTY,
+  out of `pane.rs`; `ignore-size`, read-only for a view-only device);
+  `remote/panes.rs` (a task per stream; credit; the queue's low mark,
+  `OutQ::below_mark` and a wake from the writer; the per-pane rate;
+  15 ms coalescing; input only for the holder, 64 frames then
+  `overflow`; gate 1a's always-read hold of 256 KiB and the fresh client
+  behind `CAN ESC c`); `session.rs` (pane frames in, `pane` events, the
+  hello's `panes` and `input`, `pane.open` handled by the host and passed
+  to the daemon); devices' `input` (relay command `input`); audit lines;
+  the local pane socket as a surface (`web.pane_open` with `page:<id>`,
+  input only for the holder, viewers drawn at the holder's size, its
+  resizes pin through `web.pane_size`); the mailbox carries only
+  `overlord.new_session`. `rlord-device pane <target>` (raw mode, through
+  the engine) replaces `rlord-device ask`; the low-level device gains
+  pane helpers for the host's tests. Tests: `outq` (2 new), `panes.rs`
+  (6 units), `remote_pane.rs` (9, gated), `hostile.rs` (3 pane tests,
+  gated), `pane.rs` (the local page as holder and as viewer).
+- **Step 7**: `cargo xtask app test-term` (`xtask/src/app_term.rs`): a
+  real-Claude demo under `/tmp/rlord-term-<pid>` (its own tmux socket and
+  web port; the fake model at 250 ms a step so an answer can be
+  interrupted, `RLORD_FAKE_MODEL_DELAY_MS`), the real `rlord-relay` on
+  127.0.0.1, the demo set up and paired with `rlord-device bridge` (the
+  harness confirms with `rlord relay confirm` once the tests continued
+  the pairing), the Vitest project `vitest.app-term.config.ts`
+  (`@xterm/headless` 6.0.0 through `RemotePaneLink`), and a `BLOCKED`
+  check of the fake model's log. CI's `web` job runs it with
+  `target/demo-claude` cached (`actions/cache`, GitHub-owned, allowed).
+  `demo.sh`'s `sqlite3` calls now wait for a busy database (the real
+  Claude's hooks write it too: a run failed on "database is locked").
+- **Step 8, iOS shell**: the web view's content view gets a subclass of
+  rlord's (no input accessory view; smart quotes, dashes and
+  insert-delete off), `paste` and `copy` shell messages (`UIPasteboard`),
+  `debug: true` in a debug build's settings (the page's hidden text
+  mirror); `ShellTests` (2 new); the XCUITest now types into the fake
+  overlord's pane with the keyboard and the key row's Enter, and checks
+  the redraw after the background.
+- **Step 10, docs**: `docs/architecture.md` ("Control: one screen holds
+  a pane", "Panes on a device", the phone's terminal and bridge
+  messages), `docs/guide.md` (the phone's tabs and key row, "Controlled
+  by" and Take over, view only), `SECURITY.md` (typing is running code;
+  view only; the audit lines), `CLAUDE.md` (the phone page's terminal),
+  `CONTRIBUTING.md` (`app test-term`, the fake model's delay),
+  `e2e-protocol.md` ("Panes", §4's host side, §5's methods).
+- **Merging**: the page's bundle check now requires xterm.js and exempts
+  only `/THIRD-PARTY-LICENSES.md` from the URL check (xterm.js's
+  copyright lines name its sites); `proto.ts`'s `control` is required;
+  every test that used `overlord.ask` as the op that runs once or waits
+  uses `overlord.new_session`.

@@ -76,7 +76,8 @@ class HeadlessScreen implements Screen {
     const b = this.term.buffer.active;
     const out: string[] = [];
     for (let i = 0; i < this.term.rows; i++) {
-      out.push(b.getLine(b.viewportY + i)?.translateToString(true) ?? "");
+      // (Only the columns shown: a line keeps what a narrower resize hid.)
+      out.push(b.getLine(b.viewportY + i)?.translateToString(true, 0, this.term.cols) ?? "");
     }
     return out.join("\n");
   }
@@ -270,6 +271,12 @@ describe("Claude Code's terminal on the phone's pane link", () => {
       return now !== before && now;
     });
     expect(after).not.toBe(before);
+    // Round the modes back to the default for what follows.
+    for (let i = 0; i < 6 && !screen.has("? for shortcuts"); i++) {
+      link.input(keyBytes("backtab", keys));
+      await sleep(700);
+    }
+    await until("the default mode again", () => screen.has("? for shortcuts"));
   });
 
   it("stops a slow answer with Esc", async () => {
