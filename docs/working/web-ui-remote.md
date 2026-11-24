@@ -5991,3 +5991,11 @@ the reopen time on mobile wants it (not built).
   `hello` shortcut; step 9 left it for the phone's reopen times).
 - Still owed from slice 4: Android, the general answer watchdog (the
   input-stall rule covers typing), the protocol review.
+
+### Slice 5 calls (user, 2026-11-24)
+
+- The gate-1b gap is accepted for now: a bracketed paste from a held
+  terminal still reaches the pane (tmux forwards pastes past key tables).
+  Owed: close it if tmux grows a way.
+- The phone bundle's URL check exempting only `/THIRD-PARTY-LICENSES.md`
+  is accepted.
