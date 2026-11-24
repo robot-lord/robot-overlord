@@ -196,11 +196,8 @@ export interface SessionBase {
   async_shells: { count: number; tasks: BackgroundTask[] } | null;
   /** What the list shows: a usage limit, then background work, else the status. */
   shown_status: Status | "limited" | "background";
-  /**
-   * Which screen holds its pane: null when none does. (Optional until the
-   * snapshot fixture carries it.)
-   */
-  control?: Control | null;
+  /** Which screen holds its pane: null when none does. */
+  control: Control | null;
 }
 
 /** The screen that holds a pane (decision 3 of slice 5): only its keys reach it. */
