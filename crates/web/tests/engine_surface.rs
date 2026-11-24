@@ -163,7 +163,7 @@ async fn a_phone_leaves_by_itself() {
     let id = device_id(&mut phone).await;
     keyed(&id, 1).await;
     let hello = last(&mut phone, "hello");
-    assert_eq!(hello["api"], 1, "{hello}");
+    assert_eq!(hello["api"], 2, "{hello}");
     assert_eq!(hello["page"], id.as_str(), "{hello}");
     assert_eq!(hello["device"], id.as_str(), "{hello}");
     // Its folder (keys and host record), copied before it leaves.
