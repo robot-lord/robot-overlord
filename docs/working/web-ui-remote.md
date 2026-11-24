@@ -1388,7 +1388,13 @@ Decided 2026-11-17 (user):
       outbox) and started (a new hello, the ask answered once, the outbox
       empty); unpair (`unpaired`, the host drops the device). After a
       failed step the rest are skipped. No Xcode, no `DEVELOPER_DIR`.
-      CI's `web` job installs tmux and runs it.
+      CI's `web` job installs tmux and runs it. Run on macOS about 25
+      times and on Linux (Debian, Node 26, without xtask, whose build
+      needs more than Docker's 2 GB here) twice.
+    - Owed: 2 of those macOS runs, both while other builds ran beside
+      them, timed out at the pairing step; the bridge's messages were
+      lost and it didn't happen again under CPU load. The step now fails
+      at once with the pairing's reason, so the next one says why.
 - Owed from merging main 1.15.3 into `feature/web` (1.16.0-dev.1):
   - The attention queue (main's `attention.rs`) counts only terminals as
     "looking": `tmux::list_clients` leaves web views out, so a session

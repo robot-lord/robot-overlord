@@ -72,6 +72,13 @@ describe("the phone page over the bridge", () => {
   /** Waits for a hello after `n` of them (a new session with the host). */
   const helloAfter = (seen: number) => until(`hello #${seen + 1}`, () => hellos > seen);
 
+  /** The pairing screen; a pairing that ended without success fails the test at once. */
+  const pairing = () => {
+    const p = phone.pairing.value;
+    if (p.kind === "start" && p.reason) throw new Error(`the pairing ended: ${p.reason}`);
+    return p;
+  };
+
   /** The overlord's messages' text. */
   const chat = async () => {
     const m = await t.request<OverlordMessages>("overlord.messages", {});
@@ -127,11 +134,11 @@ describe("the phone page over the bridge", () => {
     expect(scanned.relay).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$|^http:\/\/127\.0\.0\.1:\d+$/);
     t.send({ app: "pair_continue", name: "e2e phone" });
     const waiting = await until("the code to compare", () => {
-      const p = phone.pairing.value;
+      const p = pairing();
       return p.kind === "waiting" && p;
     });
     expect(waiting.code).toMatch(/^\d{6}$/);
-    await until("paired", () => phone.pairing.value.kind === "done");
+    await until("paired", () => pairing().kind === "done");
     await until("live", () => phone.conn.value?.state === "live");
     await until("the store connected", () => store.conn.value === "open" && store.snapshot.value);
     t.send({ app: "status" });
