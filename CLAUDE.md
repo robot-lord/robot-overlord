@@ -293,6 +293,7 @@ get handled without the user looking. For each one:
   crypto and no part of rlord; `rlord_e2e` (`crates/e2e`) stays sans-IO.
   The plugin's only listener is the loopback one in `crates/web/src/main.rs`;
   only `crates/relay` binds every interface. Pairing, confirming and
-  revoking devices are user-only: never an MCP tool, never a remote op.
+  revoking devices are user-only: never an MCP tool, never a remote op
+  (the one exception: a device may unpair itself, `device.leave`).
   A change to the protocol updates `docs/working/e2e-protocol.md` and the
   vectors (`cargo xtask e2e vectors`).
