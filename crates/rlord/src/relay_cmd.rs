@@ -49,6 +49,14 @@ pub enum RelayCmd {
     Devices,
     /// Unpair a device (by its id, or its name)
     Revoke { device: String },
+    /// Whether a device may type into sessions (`on`, as new devices do)
+    /// or only watch them (`off`: view-only)
+    Input {
+        /// Its id, or its name
+        device: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
     /// Remote access: on or off, the relay, the connection, the devices
     Status,
     /// Turn remote access off (closes the relay connection; devices stay
@@ -107,6 +115,18 @@ pub fn run(cmd: RelayCmd, call: fn(&str, Value) -> Result<Value>) -> Result<()> 
             let id = pick_device(&r["devices"], &device)?;
             call("relay.revoke", json!({"device": id}))?;
             println!("unpaired {id}");
+            Ok(())
+        }
+        RelayCmd::Input { device, state } => {
+            let r = call("relay.devices", json!({}))?;
+            let id = pick_device(&r["devices"], &device)?;
+            let on = state == "on";
+            call("relay.input", json!({"device": id, "input": on}))?;
+            if on {
+                println!("{id} may type into sessions");
+            } else {
+                println!("{id} is view-only: it watches sessions and can't type or take one over");
+            }
             Ok(())
         }
         RelayCmd::Status => {
@@ -272,12 +292,12 @@ fn devices_table(devices: &Value) -> String {
         return "no paired devices (`rlord relay pair` adds one)\n".into();
     }
     let mut out = format!(
-        "{:<24} {:<18} {:<21} {:<10} {}\n",
-        "NAME", "ID", "PAIRED", "LAST SEEN", "LINKED"
+        "{:<24} {:<18} {:<21} {:<10} {:<6} {}\n",
+        "NAME", "ID", "PAIRED", "LAST SEEN", "LINKED", "TYPES"
     );
     for d in &list {
         out.push_str(&format!(
-            "{:<24} {:<18} {:<21} {:<10} {}\n",
+            "{:<24} {:<18} {:<21} {:<10} {:<6} {}\n",
             d["name"].as_str().unwrap_or(""),
             d["id"].as_str().unwrap_or(""),
             ms(&d["paired_at"]).map_or("-".into(), fmt_ts),
@@ -286,6 +306,11 @@ fn devices_table(devices: &Value) -> String {
                 None => "never".into(),
             },
             if d["linked"] == true { "yes" } else { "no" },
+            if d["input"] == false {
+                "no (view-only)"
+            } else {
+                "yes"
+            },
         ));
     }
     out
@@ -387,7 +412,7 @@ mod tests {
             {"id": "ab12cd34ef560789", "name": "phone", "paired_at": 1_800_000_000,
              "last_seen": null, "linked": true},
             {"id": "ab99000011112222", "name": "tablet", "paired_at": 1_800_000_000,
-             "last_seen": 1_800_000_100, "linked": false},
+             "last_seen": 1_800_000_100, "linked": false, "input": false},
         ])
     }
 
@@ -419,6 +444,16 @@ mod tests {
             "{t}"
         );
         assert!(devices_table(&json!([])).contains("rlord relay pair"));
+        // Which may type: a view-only one says so.
+        let tablet = t.lines().find(|l| l.starts_with("tablet")).unwrap();
+        assert!(tablet.ends_with("no (view-only)"), "{t}");
+        assert!(
+            t.lines()
+                .find(|l| l.starts_with("phone"))
+                .unwrap()
+                .ends_with("yes"),
+            "{t}"
+        );
         let st = json!({
             "enabled": true, "relay": "https://relay.example.com",
             "relay_key": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80",

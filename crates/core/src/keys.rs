@@ -121,6 +121,15 @@ pub const SLOTS: &[Slot] = &[
         scope: Scope::Overlay,
         optional: true,
     },
+    // Read by the overlay; in tmux bound only in a session another screen
+    // holds (`rlord-held`), beside the global keys.
+    Slot {
+        section: "tmux",
+        field: "take",
+        does: "take over a session a browser or phone controls",
+        scope: Scope::Overlay,
+        optional: true,
+    },
     l("overlord", "show/hide the overlord"),
     l("new", "new session (ask the overlord)"),
     l("new_manual", "new session (form)"),

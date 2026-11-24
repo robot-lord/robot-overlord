@@ -3,6 +3,7 @@
   "devices": [
     {
       "id": "ab12cd34ef560789",
+      "input": true,
       "last_seen": 1800000100,
       "linked": true,
       "name": "phone",

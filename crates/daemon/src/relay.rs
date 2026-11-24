@@ -6,7 +6,8 @@
 //!
 //! - The user's commands, `relay.status`, `relay.setup`, `relay.pair`,
 //!   `relay.pair_cancel`, `relay.confirm`, `relay.reject`,
-//!   `relay.devices`, `relay.revoke`, `relay.disable`: called by the CLI
+//!   `relay.devices`, `relay.revoke`, `relay.input`, `relay.disable`:
+//!   called by the CLI
 //!   (`rlord relay …`) and the TUI (`:relay`) over the socket. They are
 //!   reached only from the socket's own dispatch (`user_call`), never
 //!   through `Daemon::rpc`, so no MCP tool and no `web.call` op can reach
@@ -84,6 +85,7 @@ pub fn user_call(d: &Daemon, method: &str, params: &Value) -> Option<Result<Valu
         "relay.reject" => reject(d),
         "relay.devices" => devices(d),
         "relay.revoke" => revoke(d, params),
+        "relay.input" => input(d, params),
         "relay.disable" => disable(d),
         _ => return None,
     })
@@ -128,6 +130,8 @@ pub(crate) struct Paired {
     pub name: String,
     /// It has a live session now.
     pub linked: bool,
+    /// It may type into panes (false: view-only, set by the user).
+    pub input: bool,
 }
 
 /// The paired devices, as the plugin last reported them (none when it
@@ -143,6 +147,7 @@ pub(crate) fn paired(d: &Daemon) -> Vec<Paired> {
                 id: v["id"].as_str()?.to_string(),
                 name: v["name"].as_str().unwrap_or("").to_string(),
                 linked: v["linked"] == true,
+                input: v["input"] != false,
             })
         })
         .collect()
@@ -257,6 +262,21 @@ pub(crate) fn revoke(d: &Daemon, p: &Value) -> Result<Value> {
     forward(d, json!({"cmd": "revoke", "device": device}))
 }
 
+/// `relay.input {device, input}` (and the page's `device.input`): whether
+/// a paired device may type into panes (false: view-only, it only ever
+/// watches). The plugin keeps it on the device's record, as `revoke` is
+/// passed on; the user's alone, never a device's or the overlord's.
+pub(crate) fn input(d: &Daemon, p: &Value) -> Result<Value> {
+    let device = p["device"].as_str().map(str::trim).unwrap_or("");
+    if device.is_empty() {
+        bail!("input needs a device id (`rlord relay devices` lists them)");
+    }
+    let Some(on) = p["input"].as_bool() else {
+        bail!("input needs input: true (it may type) or false (view-only)");
+    };
+    forward(d, json!({"cmd": "input", "device": device, "input": on}))
+}
+
 /// `relay.disable`: the plugin closes its relay connection (if it runs),
 /// then `[remote] enabled = false`. Devices stay paired.
 fn disable(d: &Daemon) -> Result<Value> {
@@ -361,6 +381,8 @@ pub fn remote_state(d: &Daemon, p: &Value) -> Result<Value> {
     // A device no longer paired is no surface any more.
     let paired: Vec<String> = paired(d).into_iter().map(|p| p.id).collect();
     d.web_ui().keep_devices(&paired);
+    // (Nor does it hold a pane.)
+    crate::control::keep_devices(d, &paired);
     let key = |m: &Value| -> Option<(String, String)> {
         let p = &m["pending"];
         p.is_object().then(|| {
@@ -389,8 +411,9 @@ pub fn remote_state(d: &Daemon, p: &Value) -> Result<Value> {
 
 /// The plugin's report, with only the fields rlord shows, each clipped:
 /// `{relay, connected, error, devices: [{id, name, paired_at, last_seen,
-/// linked}], pairing: {expires} | null, pending: {name, code, expires} |
-/// null}`. Times are Unix seconds.
+/// linked, input}], pairing: {expires} | null, pending: {name, code,
+/// expires} | null}`. Times are Unix seconds; `input` is true unless the
+/// plugin says the device is view-only.
 fn normalize(p: &Value) -> Value {
     let s = |v: &Value, n: usize| json!(clip(v.as_str().unwrap_or(""), n));
     let num = |v: &Value| v.as_u64().map_or(Value::Null, |n| json!(n));
@@ -407,6 +430,7 @@ fn normalize(p: &Value) -> Value {
                 "paired_at": num(&v["paired_at"]),
                 "last_seen": num(&v["last_seen"]),
                 "linked": v["linked"] == true,
+                "input": v["input"] != false,
             })
         })
         .collect();
@@ -457,7 +481,7 @@ mod tests {
             json!({
                 "relay": "https://r.example", "connected": true, "error": null,
                 "devices": [{"id": "ab12", "name": "phonename-that-goes-on-and-on-past-forty",
-                             "paired_at": 5, "last_seen": null, "linked": true}],
+                             "paired_at": 5, "last_seen": null, "linked": true, "input": true}],
                 "pairing": {"expires": 9},
                 "pending": {"name": "tab", "code": "123456", "expires": 9},
             })
