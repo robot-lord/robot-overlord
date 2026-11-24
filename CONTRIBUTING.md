@@ -84,6 +84,42 @@ The generated bindings, the xcframework and the copied page are
 git-ignored. `cargo xtask check-deps` fails if `apps/` names a network
 API.
 
+The first `--device` install registers the phone with the team and makes
+the development certificate and profile (Xcode signed in to the team,
+Developer Mode on in the phone's Privacy & Security settings, then trust
+the developer under General → VPN & Device Management). Later installs
+work over Wi-Fi while the phone is unlocked on the same network.
+
+#### A relay for your phone: Tailscale Serve
+
+The phone trusts public certificates only. In development, run the relay
+on your Mac and let [Tailscale Serve](https://tailscale.com/kb/1312/serve)
+give it your tailnet name and certificate. Serve is reachable from your
+tailnet only, not the internet (Funnel would publish it; don't). The
+phone needs the Tailscale app on the same tailnet. The host is a scratch
+demo rlord, never your real install.
+
+```sh
+cargo build --release -p robot-overlord-relay
+mkdir -p /tmp/rwd/relay && cat > /tmp/rwd/relay/relay.toml <<'EOF'
+origin = "https://<mac>.<tailnet>.ts.net"   # tailscale status --json | jq -r .Self.DNSName, no trailing dot
+listen = "127.0.0.1:8787"
+data_dir = "/tmp/rwd/relay"
+[tls]
+mode = "proxy"
+EOF
+target/release/rlord-relay --config /tmp/rwd/relay/relay.toml serve   # prints the address
+tailscale serve --bg --https=443 http://127.0.0.1:8787   # the first time, enable Serve at the link it prints
+target/release/rlord-relay --config /tmp/rwd/relay/relay.toml token new
+
+scripts/demo/demo.sh --web /tmp/rwd/t1 && source /tmp/rwd/t1/env.sh
+rlord relay setup '<address>' --token <token>
+rlord relay pair                    # scan with the app, check the code, confirm
+```
+
+`tailscale serve reset` takes it down. `relay.key` in `data_dir` is the
+relay's identity: keep the folder, or every host sets the relay up again.
+
 ## Demo and screenshots
 
 `scripts/demo/demo.sh` starts a throwaway rlord full of made-up sessions
