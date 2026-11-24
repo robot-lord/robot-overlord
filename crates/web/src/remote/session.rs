@@ -355,6 +355,7 @@ impl Actor {
         }
         if let Some(target) = super::panes::audit_take(&req) {
             self.audit.log(&device, &format!("pane take {target}"));
+            self.pane_taking(&device, &target);
         }
         let next = self.admit(&device, &req, Waiter::Live { link: id, epoch });
         if matches!(next, Next::Run { key: Some(_), .. }) {

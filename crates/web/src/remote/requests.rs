@@ -165,6 +165,9 @@ impl Actor {
         from: Waiter,
         answer: Value,
     ) {
+        if op == "pane.take" {
+            self.pane_took(device, &answer);
+        }
         self.answer_waiters(device, key, from, &answer);
         if op == "device.leave" && answer.get("ok").is_some() {
             self.leaving

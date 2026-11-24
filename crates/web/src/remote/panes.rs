@@ -461,6 +461,8 @@ pub struct Panes {
     pub opening: HashMap<(u32, u8), Opening>,
     /// The daemon's last `control` map (`web.subscribe`).
     pub control: Value,
+    /// Each device's last `pane.take` target, until it is answered.
+    pub taking: HashMap<String, String>,
     next_gen: u64,
 }
 
@@ -917,6 +919,32 @@ impl Actor {
 
 /// What a `pane.open` attempt came to.
 pub type OpenResult = Result<(Bridge, Value, String, u16, u16), (&'static str, String)>;
+
+impl Actor {
+    /// A device's `pane.take` is on its way to the daemon.
+    pub(crate) fn pane_taking(&mut self, device: &str, target: &str) {
+        self.panes
+            .taking
+            .insert(device.to_string(), target.to_string());
+    }
+
+    /// The daemon answered a device's `pane.take`: if it took the pane, its
+    /// keys reach it at once (the control line that says so may come a
+    /// moment after the answer, and a key typed between is not lost).
+    pub(crate) fn pane_took(&mut self, device: &str, answer: &Value) {
+        let Some(target) = self.panes.taking.remove(device) else {
+            return;
+        };
+        if answer["ok"]["control"] != true {
+            return;
+        }
+        for p in self.panes.open.values_mut() {
+            if p.device == device && p.session == target {
+                p.control = true;
+            }
+        }
+    }
+}
 
 /// The `id` of `pane.take` and `op` names: `pane.take` goes the usual way.
 pub fn audit_take(req: &Value) -> Option<String> {

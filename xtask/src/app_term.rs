@@ -241,6 +241,14 @@ impl Demo {
 
 impl Drop for Demo {
     fn drop(&mut self) {
+        // (RLORD_TERM_KEEP=1: leave it running, to look at after a failure.)
+        if std::env::var("RLORD_TERM_KEEP").as_deref() == Ok("1") {
+            eprintln!(
+                "kept the demo: scripts/demo/demo.sh --stop {}",
+                self.dir.display()
+            );
+            return;
+        }
         let _ = Command::new(self.root.join("scripts/demo/demo.sh"))
             .arg("--stop")
             .arg(&self.dir)

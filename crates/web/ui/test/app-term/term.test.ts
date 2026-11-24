@@ -77,7 +77,9 @@ class HeadlessScreen implements Screen {
     const out: string[] = [];
     for (let i = 0; i < this.term.rows; i++) {
       // (Only the columns shown: a line keeps what a narrower resize hid.)
-      out.push(b.getLine(b.viewportY + i)?.translateToString(true, 0, this.term.cols) ?? "");
+      out.push(
+        (b.getLine(b.viewportY + i)?.translateToString(true, 0, this.term.cols) ?? "").trimEnd(),
+      );
     }
     return out.join("\n");
   }
@@ -349,12 +351,12 @@ describe("Claude Code's terminal on the phone's pane link", () => {
     link.input(`\x1b[200~${text}\x1b[201~`);
     await sleep(500);
     link.input(keyBytes("enter", keys));
-    // One turn with both lines: the paste didn't submit the first alone.
-    await until("the echo", () => screen.has("first pasted line"));
-    const log = execFileSync("grep", ["-c", "second pasted line", join(DIR, "fake-model.log")], {
-      encoding: "utf8",
-    });
-    expect(Number(log.trim())).toBeGreaterThan(0);
+    // One turn with both lines: the paste didn't submit the first alone
+    // (the fake model echoes the prompt, white space folded).
+    await until("the echo of both lines", () =>
+      screen.has('You said: "first pasted line second pasted line"'),
+    );
+    expect(screen.has('You said: "first pasted line"')).toBe(false);
   });
 
   it("opens as a viewer while the terminal holds it, and takes over", async () => {
@@ -379,13 +381,15 @@ describe("Claude Code's terminal on the phone's pane link", () => {
       tmux(["list-clients", "-F", "#{client_session}"]).includes(tmuxSession(HELD)),
     );
     rlord(["control", "take", HELD]);
-    await until("the window at the terminal's size", () => windowSize(HELD) === "100x30");
+    // (Its status row takes a line of the terminal's 30.)
+    await until("the window at the terminal's size", () => windowSize(HELD).startsWith("100x"));
+    const win = windowSize(HELD);
     const { link, screen } = await open(HELD);
     t = link;
     const st = link.state;
     if (st.kind !== "open") throw new Error("not open");
     expect(st.control).toBe(false);
-    expect([st.cols, st.rows]).toEqual([100, 30]);
+    expect(`${st.cols}x${st.rows}`).toBe(win);
     await until("Claude Code drawn for the terminal", () => screen.has("? for shortcuts"));
     // Taking over lays Claude Code out for the phone, and typing works.
     await tr.request("pane.take", { target: st.id, cols: COLS, rows: ROWS });
