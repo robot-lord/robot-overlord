@@ -87,7 +87,9 @@ final class PairAndAskUITests: XCTestCase {
 
         // The key row: Enter from the row, after typing on the keyboard.
         typeIntoTerminal("again", enter: false)
-        page().buttons["Enter"].tap()
+        let enterKey = page().buttons.matching(NSPredicate(format: "label == '⏎' OR label == 'Enter'")).firstMatch
+        waitFor(enterKey, "the key row's Enter")
+        enterKey.tap()
         waitFor(shows("Fake overlord here: you said \"again\""), "the key row's Enter")
 
         // Away and back: the pane is opened again and drawn whole.
@@ -98,11 +100,10 @@ final class PairAndAskUITests: XCTestCase {
         waitFor(shows(answer), "the pane redrawn after coming back", timeout: 45)
     }
 
-    /// Tap the terminal (its keyboard comes up) and type `text`.
+    /// Tap the terminal (its keyboard comes up, unless it is up) and type
+    /// `text`. (xterm.js's text area is a few points wide: tap the screen.)
     func typeIntoTerminal(_ text: String, enter: Bool = true) {
-        let term = page().descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS 'Terminal input'")).firstMatch
-        if term.exists { term.tap() } else {
+        if !app.keyboards.firstMatch.exists {
             page().coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4)).tap()
         }
         let kb = app.keyboards.firstMatch
