@@ -12,7 +12,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
 /// How long a call may take: `overlord.ensure` and `session.resume` may
-/// start an agent, and `overlord.ask` waits up to 90 s for a just-started
+/// start an agent, and `overlord.ask` / `overlord.new_session` wait up to 90 s for a just-started
 /// overlord to take input (`crates/daemon/src/ask.rs`).
 const CALL_LIMIT: Duration = Duration::from_secs(120);
 

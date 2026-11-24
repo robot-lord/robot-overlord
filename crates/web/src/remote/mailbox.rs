@@ -3,7 +3,7 @@
 //! recovery").
 //!
 //! When a device finds its host offline (or has no live session), it may
-//! queue `overlord.ask` or `overlord.new_session` at the relay; the host
+//! queue `overlord.new_session` at the relay; the host
 //! answers the same way.
 //!
 //! Per device, in `remote/mailbox-<id>.json`, in one atomic write: the

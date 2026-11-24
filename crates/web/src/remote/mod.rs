@@ -12,7 +12,7 @@
 //! are the daemon's user commands (`relay.*`, forwarded on the subscribe
 //! stream), the daemon's changes, the relay's messages, finished daemon
 //! calls and a one-second tick. Calls to the daemon run in their own tasks
-//! (an `overlord.ask` may take a while); their answers come back to the
+//! (an `overlord.new_session` may take a while); their answers come back to the
 //! actor, which alone encrypts, so each session's frames stay in order.
 //!
 //! **Delivery.** One relay connection carries one Noise session per device
