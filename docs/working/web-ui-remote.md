@@ -1,4 +1,4 @@
-**Status:** in progress (slices 1 to 3, the local web UI, the web as a UI target, and the e2e core and the relay, are built and merged into `feature/web`; slice 4, the phone app, is built for iOS on `feat/web-ui-4` (local commits) with Android deferred; slice 5, live terminals on the phone, is planned on `feat/web-ui-5` ("Slice 5 plan" at the end) and not built. The feature branch stays dark: no releases, TestFlight or store builds until the final merge to `main`; the app is built and installed locally only)
+**Status:** in progress (slices 1 to 3, the local web UI, the web as a UI target, and the e2e core and the relay, are built and merged into `feature/web`; slice 4, the phone app, is built for iOS on `feat/web-ui-4` (local commits) with Android deferred; slice 5, live terminals on the phone, is planned on `feat/web-ui-5` ("Slice 5 plan" at the end) and being built ("Slice 5 build"). The feature branch stays dark: no releases, TestFlight or store builds until the final merge to `main`; the app is built and installed locally only)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -1528,6 +1528,17 @@ Decided 2026-11-17 (user):
   an explicit control handoff (one screen controls a pane; the others
   show "Controlled by <location>" and Take over), which raises five
   new questions.
+- Slice 5 build (Opus implementer, from 2026-11-24, `feat/web-ui-5`):
+  gates and the contract in "Slice 5 build: gates and the contract
+  between the parts" at the end. Gate 1a failed as stated (an unread
+  tmux client's server memory grows with a flood); the plan's fallback
+  is taken (the host always reads, holds at most 256 KiB, and past that
+  reattaches a fresh view client behind a reset). 1b passes with
+  `assume-paste-time 0` on a held session; a bracketed paste from the
+  held terminal still reaches the pane (accepted). 1c to 1f pass in the
+  simulator. Step 2 done: `stream.rs` pane frames (1 to 250, standing
+  alone, 251 to 255 refused), the vectors (and the WASM runner) and
+  `e2e-protocol.md` §3.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
@@ -5468,3 +5479,172 @@ keeps control 30 s, then it returns to the terminal if it shows the pane,
 else the last-used screen, else free; a free pane goes to whoever opens it
 without a tap; the desktop page follows the same rule. Two browser tabs
 both named "a browser on <host>" was not raised; kept as planned.
+
+### Slice 5 build: gates and the contract between the parts
+
+Implementer's record (Opus, 2026-11-24, `feat/web-ui-5`). The gates ran
+first (scratch code, not kept); then the contract below was fixed so
+the host, the daemon, the engine and the page could be built side by
+side. Where this differs from the plan, the gate result is why.
+
+#### Gate results
+
+- **1a, tmux and an unread client: fails as stated; the plan's fallback
+  is taken.** A view client whose PTY is never read gets one redraw when
+  read again (3.5 KB after a 200 MB flood on 3.8; about 24 KB on 3.2a and
+  3.4), but tmux's memory grows with the flood while it isn't read: 880
+  MB for an 800 MB `yes` flood on tmux 3.8 (macOS), 290 MB on 3.2a and
+  3.4 (Ubuntu 22.04 and 24.04). The reason is in tmux (`tty.c`,
+  `server-client.c`): after a redraw tmux stops discarding for a client
+  until that redraw's bytes are written (`c->redraw > 0`), and an unread
+  client never writes them. A client that is read, even slowly, stays
+  bounded and coalesced: read at 64 KiB/s (or 16 KiB/s) through a 200 MB
+  flood, the server stayed at 4 to 10 MB and the client got 54 to 400 KB
+  in all. So the host never leaves a view client unread: when a pane
+  can't send (no credit, the link's queue over its mark, or the pane's
+  rate), its task keeps reading into a hold of at most 256 KiB, sent
+  first when it can send again; if the hold would overflow, the task
+  drops it and ends that view client, and when the pane can send again
+  attaches a fresh one at the same size, its first frame starting with
+  `CAN ESC c` (abort any sequence, full reset) ahead of tmux's full
+  redraw. A fresh client rather than `refresh-client`: after discarded
+  bytes tmux's idea of the terminal's state (modes, attributes) is wrong,
+  and a new client starts from none. Lossless on the wire still (only
+  bytes never sent are dropped); a slow phone sees fewer, whole screens,
+  as planned. Measured by hand only in the gate; `a_flood_never_drops_the_link`
+  covers it.
+- **1b, control in tmux: passes on 3.2a, 3.4 and 3.8, with one gap.**
+  `new-session -f ignore-size` (and `refresh-client -f ignore-size`)
+  works on all three: views never size the window; `resize-window` pins
+  it with a terminal and views attached, and a terminal's resize doesn't
+  unpin it; unsetting `window-size` hands it back to the terminal's size
+  (with only ignore-size views left it takes a view's size, so a free
+  pane is never unpinned). A `read-only` view client can't type. A
+  session `key-table` of rlord's with `Any` bound holds a real terminal's
+  keys (letters, Enter, arrows, C-c, mouse wheel) while rlord's own
+  bindings in that table (navigation, take) still run, **only with
+  `assume-paste-time 0` on the held session**: otherwise keys typed
+  faster than 1 ms apart count as a paste and skip the table (3.2a and
+  3.4 leaked a fast burst and a C-c). The gap: a **bracketed paste** from
+  the held terminal reaches the pane on 3.4 and 3.8 (tmux forwards
+  pastes past key tables; not on 3.2a). Taken as the plan's "honest
+  rather than strict" for pastes only: typed keys are held, a paste from
+  the computer's own terminal still lands. `Any` runs `display-message`
+  (not `-N`: with `-N` a held message swallows the take key too). The
+  table's name: `rlord-held`.
+- **1c, xterm.js with WebGL in WKWebView under the phone's CSP: passes
+  (simulator).** The WebGL renderer loads and draws; the only policy
+  violations are xterm.js's refused `<style>` elements
+  (`style-src-elem`); a lost context (`WEBGL_lose_context`, no restore)
+  fires `onContextLoss` and a new addon draws again. A context that is
+  restored within xterm.js's own 3 s window is handled by the addon
+  itself. Claude Code's glyphs are all present in `ui-monospace`;
+  `⏺` and `⏸` draw as colour emoji (Apple's emoji presentation), a
+  cosmetic difference, so no font is bundled. 12 px fits 52 columns on
+  an iPhone 18 Pro. On the real phone: owed to the by-hand pass.
+- **1d, the iOS keyboard on xterm.js's textarea: passes (simulator).**
+  Letters, quotes, `--`, `...`, Enter (`\r`) and delete (`\x7f`) arrive
+  as typed (no smart punctuation through XCUITest's typing; the real
+  keyboard's smart punctuation and dictation are owed to the by-hand
+  pass, and the shell turns them off in step 8). The web view's
+  accessory bar (up, down, Done) is there, so step 8 removes it. The
+  page is a secure context (`isSecureContext` true) and
+  `navigator.clipboard.readText`/`writeText` exist on `rlord-app://`;
+  but whether `readText` works was
+  inconclusive (the test couldn't find iOS's paste callout and hung on
+  it), so the shell's `paste` and `copy` messages (`UIPasteboard`) are
+  built as planned.
+- **1e, the real Claude Code at 45 to 60 columns: passes.** At 54, 45 and
+  60 columns its prompt, answers, the mode line and the permission
+  dialog (four options, wrapped) are all usable; a resize redraws its
+  whole screen at the new width at once (rows already in tmux's history
+  keep their old wrapping).
+- **1f, the bridge: passes (simulator).** 16 KiB frames base64 in JSON
+  through `callAsyncJavaScript`: 64 KiB/s paced for 5 s with nothing
+  dropped; a burst of 200 frames (3.2 MB) queued in 10 ms and written
+  into xterm.js in 0.15 s (about 21 MB/s), in order.
+
+#### The contract
+
+Names and shapes the parts build against. The plan's decisions hold;
+this fills in what they left open.
+
+**Device and host (control stream, JSON).**
+
+- `pane.open` is a remote op: `{"id","op":"pane.open","args":{"stream",
+  "target","cols","rows"}}`. The host checks `stream` (1 to 250, not
+  open on this link), the size (2 to 1000) and its limits (2 per device,
+  8 remote in all: `too_many`), then asks the daemon (`web.call` with the
+  op, `via: "remote"`, `device`), which resolves the target and applies
+  the control rules, and attaches the view client. Answer `{"id","ok":
+  {"stream","id","name","overlord","input","control","cols","rows",
+  "window":{"cols","rows"}}}`: `cols`, `rows` the size the view client is
+  attached at (the device's own when it controls, else the window's),
+  `window` the window's size now. Errors: `not_running`, `not_found`,
+  `too_many`, `bad_request`, `not_allowed`, `failed`.
+- `pane.take` is a remote and local op: `{"target","cols","rows"}`,
+  answered `{"control":true,"cols","rows"}`; refused `not_allowed` for a
+  view-only device.
+- Events, device to host: `{"event":"pane","stream","type":"resize",
+  "cols","rows"}`, `{"event":"pane","stream","type":"ack","bytes",
+  "frames"}` (cumulative), `{"event":"pane","stream","type":"close"}`.
+  Host to device: `{"event":"pane","stream","type":"closed","reason",
+  "message"}`, reason `ended`, `closed`, `revoked`, `overflow` or
+  `failed`. Data frames: `stream | 0 | bytes`.
+- `hello` gains `"panes":{"max":2,"window":65536,"frames":48}` and
+  `"input": true|false`.
+
+**Engine and page (the bridge).**
+
+- Page to engine: `pane.open` and `pane.take` as ordinary requests
+  (`{"id","op","args"}`; never kept in the outbox, refused
+  `disconnected`/`host_offline` with no live session);
+  `{"pane":"input","stream","b":"<base64>"}`,
+  `{"pane":"resize","stream","cols","rows"}`,
+  `{"pane":"ack","stream","bytes","frames"}`,
+  `{"pane":"close","stream"}`. The engine turns them into the events
+  above and data frames (input split into frames of at most 16 382
+  bytes); `ack` and `resize` are events, not ops (no rate limit).
+- Engine to page: `{"event":"pane","stream","type":"data","b":
+  "<base64>"}` (one per host frame, so the page counts frames by
+  messages), `{"event":"pane","stream","type":"closed","reason",
+  "message"}` (the host's, and `reason: "link"` for every stream the
+  engine saw opened when the session ends). Base64 is standard with
+  padding (`atob`).
+
+**Plugin and daemon.**
+
+- `web.call {op: "pane.open", args, via: "remote", device}`: answered
+  `{"id","name","overlord","tmux_session","running","control","cols",
+  "rows","window":{"cols","rows"}}` (the plugin keeps `tmux_session`
+  and drops it from the device's answer). `web.pane_open {target,
+  surface, cols, rows}` (local pages; `surface` `page:<id>`) answers the
+  same. Both: a free pane is taken by the opener, unless the opener is
+  a view-only device; `running: false` with no control change for a
+  target that isn't running.
+- `web.pane_size {target, surface, cols, rows}`: the surface's terminal
+  changed size; if it holds the pane, pin again. Answer `{"control"}`.
+- `web.pane_closed {target, surface}`: the surface stopped showing the
+  pane (holder: away for 30 s).
+- `target` after an open is the session id the open returned.
+- `web.subscribe` gains `{"notify":"control","sessions":{"<session id>":
+  {"holder","by","name","away","cols","rows","tmux_session"}}}`, the
+  whole map of held panes, on every change (the plugin decides typing
+  and viewers' sizes from it).
+- `web.remote_state` gains `devices: [{"id","name","input"}]` (names
+  and the view-only flag; no keys).
+- Snapshot sessions and the overlord gain `control`: `null` or
+  `{"holder","by","name","away","cols","rows"}`; `holder` is `terminal`,
+  `page:<id>` or `device:<id>`, `by` is `terminal`, `web` or `phone`.
+- `device.input {device, input}` is a local-only op; the daemon passes
+  it to the plugin as a relay command (`{"cmd":"input","device",
+  "input"}`), as it does a revoke. `rlord relay input <device> on|off`
+  is the same.
+- `control.take {target}` (daemon method, `rlord control take
+  <session>`): the terminal takes.
+- The local pane socket's `open` gains `"page"` (the page id from the
+  control socket's `hello`); `opened` gains `control`, `cols`, `rows`,
+  `window`.
+- `tmux::view_command(target, view, read_only)` attaches with `-f
+  ignore-size` (and `read-only` for a view-only device).
+- `plugin::WEB_PROTOCOL` 5; `web::API` 2.
