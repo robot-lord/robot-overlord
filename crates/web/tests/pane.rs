@@ -86,10 +86,17 @@ async fn read_until(ws: &mut Ws, seen: &mut Seen, what: &str, done: impl Fn(&See
     }
 }
 
+/// A pane socket for `target`, as page `page` (the surface it holds or
+/// views the pane as).
 async fn open(r: &Rig, target: &str, cols: u16, rows: u16) -> Ws {
+    open_as(r, "p1", target, cols, rows).await
+}
+
+async fn open_as(r: &Rig, page: &str, target: &str, cols: u16, rows: u16) -> Ws {
     let mut ws = r.authed("/pane").await;
     ws.send(Message::text(
-        json!({"type": "open", "target": target, "cols": cols, "rows": rows}).to_string(),
+        json!({"type": "open", "target": target, "cols": cols, "rows": rows, "page": page})
+            .to_string(),
     ))
     .await
     .unwrap();
@@ -166,6 +173,8 @@ async fn a_pane_through_the_bridge() {
     let mut ws = open(&r, "alpha", 80, 24).await;
     let opened = next_json(&mut ws).await;
     assert_eq!(opened["type"], "opened", "{opened}");
+    // Nobody held it: this page does now.
+    assert_eq!(opened["control"], true, "{opened}");
     assert_eq!(
         (opened["id"].as_str(), opened["name"].as_str()),
         (Some("alpha"), Some("alpha"))
@@ -233,10 +242,31 @@ async fn a_pane_through_the_bridge() {
     wait_for("100 columns", || dim("#{window_width}") == "100").await;
     wait_for("30 rows", || dim("#{window_height}") == "30").await;
 
-    // A second view at once: its own view session.
-    let mut ws2 = open(&r, "alpha", 80, 24).await;
-    assert_eq!(next_json(&mut ws2).await["type"], "opened");
+    // A second page at once: its own view session, as a viewer at the
+    // window's size, and its keys reach nothing.
+    let mut ws2 = open_as(&r, "p2", "alpha", 80, 24).await;
+    let o2 = next_json(&mut ws2).await;
+    assert_eq!(o2["type"], "opened", "{o2}");
+    assert_eq!(o2["control"], false, "{o2}");
+    assert_eq!(
+        (o2["cols"].as_u64(), o2["rows"].as_u64()),
+        (Some(100), Some(30)),
+        "{o2}"
+    );
     wait_for("two views", || views().len() == 2).await;
+    ws2.send(Message::binary(b"from-the-viewer".to_vec()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!read_log(&log).contains("from-the-viewer"));
+    // Nor does its resize size the window.
+    ws2.send(Message::text(
+        json!({"type": "resize", "cols": 60, "rows": 20}).to_string(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(dim("#{window_width}"), "100");
     // Closing it: its view goes, the other stays.
     ws2.send(Message::text(json!({"type": "close"}).to_string()))
         .await

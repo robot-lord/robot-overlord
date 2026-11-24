@@ -97,7 +97,11 @@ async fn pane(app: &Arc<App>, mut ws: WebSocket) {
     };
     // The page's id (from its control socket's hello): this surface's
     // name in the daemon's control map.
-    let surface = format!("page:{}", open["page"].as_str().unwrap_or(""));
+    // (A page that doesn't say is a surface of its own.)
+    let surface = match open["page"].as_str().filter(|p| !p.is_empty()) {
+        Some(p) => format!("page:{p}"),
+        None => format!("page:{}", crate::bridge::view_name()),
+    };
     let t = match app
         .daemon
         .call(
