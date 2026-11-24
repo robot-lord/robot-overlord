@@ -244,21 +244,21 @@ rlord describe "$name" "Search indexer: cron batches to the event queue" >/dev/n
 sleep 2
 rlord archive "$name" >/dev/null
 for _ in $(seq 20); do
-  sqlite3 "$d/data/robot-overlord/state.db" "select summary from sessions where name='$name'" | grep -q . && break
+  sqlite3 -cmd ".timeout 5000" "$d/data/robot-overlord/state.db" "select summary from sessions where name='$name'" | grep -q . && break
   sleep 0.5
 done
 
 # The OpenCode session's status comes from rlord's own look at OpenCode's
 # database (every few seconds): wait for it, so the times below stand.
 for _ in $(seq 20); do
-  [[ $(sqlite3 "$d/data/robot-overlord/state.db" "select status from sessions where name='onboarding-emails'") == idle ]] && break
+  [[ $(sqlite3 -cmd ".timeout 5000" "$d/data/robot-overlord/state.db" "select status from sessions where name='onboarding-emails'") == idle ]] && break
   sleep 0.5
 done
 
 # Spread the times out, as if the fleet had been running for a while.
 now=$(($(date +%s) * 1000))
 ago() { echo $((now - $1 * 60000)); }
-sql() { sqlite3 "$d/data/robot-overlord/state.db" "$1"; }
+sql() { sqlite3 -cmd ".timeout 5000" "$d/data/robot-overlord/state.db" "$1"; }
 set_times() { # name user_min agent_min created_min
   sql "update sessions set last_user_msg_at=$(ago "$2"), last_agent_msg_at=$(ago "$3"), last_state_change_at=$(ago "$3"), created_at=$(ago "$4") where name='$1'"
 }
