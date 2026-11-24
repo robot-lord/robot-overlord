@@ -123,6 +123,10 @@ pub struct TmuxKeys {
     /// In the overlord's overlay: switch to the next agent's overlord (the
     /// overlay reads it; tmux doesn't bind it). Empty = off.
     pub overlord_switch: String,
+    /// Take over a session another screen (a browser, a phone) holds: in
+    /// that session, and in the overlay. Bound only while another screen
+    /// holds it (tmux's `rlord-held` table). Empty = off.
+    pub take: String,
     /// Agent sessions use your imported tmux profile (`rlord tmux import`):
     /// your prefix, bindings and status bar, in that session only. Turn it
     /// on/off per session with `rlord tmux profile` or `T` in the list.
@@ -150,6 +154,7 @@ impl Default for TmuxKeys {
             prev: String::new(),
             overlord: "M-o".into(),
             overlord_switch: "M-s".into(),
+            take: "M-t".into(),
             profile: true,
             mouse: true,
             profile_env: None,
@@ -1173,6 +1178,7 @@ prev = ""       # e.g. "M-p"
 overlord = "M-o" # from any pane: the overlord over it
 overlord_switch = "M-s" # in the overlay: the next agent's overlord
                         # (not the same key as back/next/prev/overlord)
+take = "M-t"     # take over a session a browser or phone controls
 profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 mouse = true     # click and scroll in the list, the overlay and agent panes
                  # (drag-select then needs Shift; Option in some macOS

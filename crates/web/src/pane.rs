@@ -210,7 +210,7 @@ impl Bridge {
     /// Blocking (tmux).
     fn attach(target: &str, view: &str, cols: u16, rows: u16) -> Result<Bridge> {
         tmux::bind_web_table().context("making the web key table")?;
-        let cmd = tmux::view_command(target, view)?;
+        let cmd = tmux::view_command(target, view, false)?;
         let (pty, child) = Pty::spawn(cmd, cols, rows)?;
         let mut b = Bridge {
             pty,

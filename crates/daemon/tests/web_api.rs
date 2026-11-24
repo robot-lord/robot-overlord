@@ -171,7 +171,11 @@ fn web_call_reaches_its_ops_and_nothing_else() {
         "web.start",
         "web.stop",
         "web.rotate",
-        "web.pane_target",
+        "web.pane_open",
+        "web.pane_size",
+        "web.pane_closed",
+        "control.take",
+        "control.get",
         "config.reload",
         "ui.goto",
         "ui.state",
@@ -476,6 +480,9 @@ fn web_subscribe_coalesces_changes_and_carries_the_rev() {
     let ack: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
     assert_eq!(ack["result"]["subscribed"], true);
     assert_eq!(ack["result"]["rev"], r.daemon.rev().as_str());
+    // Then who holds which pane now (nobody).
+    let control: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    assert_eq!(control, json!({"notify": "control", "sessions": {}}));
     // A burst of changes (more than the channel holds, so the subscriber
     // lags too).
     let began = Instant::now();
@@ -557,30 +564,80 @@ fn web_subscribe_marks_a_relay_status_change() {
     assert!(v.get("relay").is_none(), "{v}");
 }
 
+/// A local page's pane socket opening a pane: the daemon resolves the
+/// target and starts nothing.
 #[test]
-fn pane_target_finds_the_pane_and_starts_nothing() {
+fn pane_open_finds_the_pane_and_starts_nothing() {
     let r = start();
-    let o = ok(&r.sock, "web.pane_target", json!({"target": "overlord"}));
+    let open = |target: &str| {
+        raw(
+            &r.sock,
+            "web.pane_open",
+            json!({"target": target, "surface": "page:p1-aa", "cols": 80, "rows": 24}),
+        )
+    };
+    let o = open("overlord")["result"].clone();
     assert_eq!(o["id"], "overlord-1");
     assert_eq!(o["overlord"], true);
     assert_eq!(o["tmux_session"], "overlord-rlord");
-    // (No tmux server here: not running, and nothing was started.)
-    assert_eq!(o["running"], false);
-    let a = ok(&r.sock, "web.pane_target", json!({"target": "alpha"}));
+    // (No tmux server here: not running, nothing started, nobody holds
+    // it, and it would attach at its own size.)
+    assert_eq!(
+        (
+            o["running"].clone(),
+            o["control"].clone(),
+            o["cols"].clone(),
+            o["rows"].clone()
+        ),
+        (json!(false), json!(false), json!(80), json!(24)),
+        "{o}"
+    );
+    assert!(o["window"].is_null(), "{o}");
+    let a = open("alpha")["result"].clone();
     assert_eq!(
         (a["id"].as_str(), a["running"].as_bool()),
         (Some("alpha"), Some(false))
     );
     assert!(a["tmux_session"].is_null());
-    let missing = raw(&r.sock, "web.pane_target", json!({"target": "nosuch"}));
+    let missing = open("nosuch");
     assert!(missing["error"].is_object(), "{missing}");
+    // A bad surface or size: the plugin's mistake.
+    for p in [
+        json!({"target": "beta", "surface": "phone:x", "cols": 80, "rows": 24}),
+        json!({"target": "beta", "surface": "page:p1", "cols": 1, "rows": 24}),
+        json!({"target": "beta", "surface": "page:p1", "cols": 80}),
+    ] {
+        let got = raw(&r.sock, "web.pane_open", p.clone());
+        assert_eq!(
+            got["error"]["code"],
+            plugin::RPC_ERR_BAD_REQUEST,
+            "{p}: {got}"
+        );
+    }
     let rev = r.daemon.rev();
-    ok(&r.sock, "web.pane_target", json!({"target": "beta"}));
-    assert_eq!(r.daemon.rev(), rev, "a look-up changed something");
+    open("beta");
+    assert_eq!(
+        r.daemon.rev(),
+        rev,
+        "opening a stopped pane changed something"
+    );
     assert_eq!(
         ok(&r.sock, "session.get", json!({"ref": "overlord-1"}))["status"],
         "starting"
     );
+    // Size and close of a pane nobody holds: nothing to do.
+    let s = ok(
+        &r.sock,
+        "web.pane_size",
+        json!({"target": "beta", "surface": "page:p1-aa", "cols": 90, "rows": 30}),
+    );
+    assert_eq!(s, json!({"control": false}));
+    ok(
+        &r.sock,
+        "web.pane_closed",
+        json!({"target": "beta", "surface": "page:p1-aa"}),
+    );
+    assert_eq!(r.daemon.rev(), rev);
 }
 
 /// A browser request from page `page` (the plugin stamps the id).
@@ -1148,6 +1205,7 @@ fn a_device_reaches_only_the_remote_ops() {
     assert_eq!(
         local,
         [
+            "overlord.ask",
             "keys.list",
             "form.setup",
             "form.setup_save",
@@ -1158,6 +1216,7 @@ fn a_device_reaches_only_the_remote_ops() {
             "device.confirm",
             "device.reject",
             "device.revoke",
+            "device.input",
         ]
     );
     for o in &local {
@@ -1574,75 +1633,29 @@ fn claude_line(kind: &str, text: &str) -> String {
     .to_string()
 }
 
-/// The overlord's conversation as text: from its transcript, at most 50
-/// messages a call, each at most 4 KiB, paged back by `before`.
+/// The phone's chat path to the overlord is gone (slice 5): it reaches
+/// the overlord through its pane, and reads its conversation with
+/// `session.messages` by the overlord's id.
 #[test]
-fn overlord_messages_are_bounded() {
-    let dir = env().join("messages");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("0b1d7a52-0000-4000-8000-000000000001.jsonl");
-    let mut lines = Vec::new();
-    for i in 0..60 {
-        lines.push(claude_line("user", &format!("ask {i}")));
-        // Long, in three-byte characters: past 4 KiB until clipped.
-        let reply = if i % 10 == 0 {
-            "€".repeat(3000)
-        } else {
-            format!("answer {i}")
-        };
-        lines.push(claude_line("assistant", &reply));
+fn overlord_messages_is_gone() {
+    let r = start();
+    assert!(!rlord_daemon::web::OPS
+        .iter()
+        .any(|o| o.op == "overlord.messages"));
+    for got in [
+        op(&r.sock, "overlord.messages", json!({})),
+        op_remote(&r.sock, PHONE, "overlord.messages", json!({})),
+    ] {
+        assert!(not_allowed(&got).contains("not available"), "{got}");
     }
-    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
-    let p = path.to_str().unwrap().to_string();
-    let r = start_with(|db| db.upsert_transcript_source("overlord-1", &p).unwrap());
-
-    let got = op(&r.sock, "overlord.messages", json!({}))["result"].clone();
-    assert_eq!(got["overlord"]["id"], "overlord-1", "{got}");
-    let msgs = got["messages"].as_array().unwrap();
-    assert_eq!(msgs.len(), 50);
-    assert_eq!(got["more"], true);
-    assert_eq!(msgs.last().unwrap()["text"], "answer 59");
-    assert_eq!(msgs.last().unwrap()["who"], "agent");
-    assert!(msgs
-        .iter()
-        .all(|m| m["text"].as_str().unwrap().len() <= 4096));
-    assert!(msgs
-        .iter()
-        .any(|m| m["text"].as_str().unwrap().starts_with('€')));
-    // Paged back from the oldest shown.
-    let first = msgs[0]["line"].as_u64().unwrap();
-    let back = op(
+    let got = op_remote(
         &r.sock,
-        "overlord.messages",
-        json!({"before": first, "limit": 5}),
+        PHONE,
+        "session.messages",
+        json!({"ref": "overlord-1"}),
     )["result"]
         .clone();
-    // (Five short messages: the phone page's chat test reads them.)
-    fixture("overlord_messages", &back);
-    let back = back["messages"].as_array().unwrap().clone();
-    assert_eq!(back.len(), 5);
-    assert!(back.iter().all(|m| m["line"].as_u64().unwrap() < first));
-    // A big limit is 50; from a device too.
-    let big = op_remote(
-        &r.sock,
-        "ab12cd34",
-        "overlord.messages",
-        json!({"limit": 500}),
-    )["result"]
-        .clone();
-    assert_eq!(big["messages"].as_array().unwrap().len(), 50);
-    // The start: nothing earlier.
-    let all = op(&r.sock, "overlord.messages", json!({"before": 3}))["result"].clone();
-    assert_eq!(all["messages"].as_array().unwrap().len(), 2);
-    assert_eq!(all["more"], false);
-    // A look-up: no change.
-    let rev = r.daemon.rev();
-    op(&r.sock, "overlord.messages", json!({}));
-    assert_eq!(r.daemon.rev(), rev);
-    // No transcript: no messages.
-    let none = start();
-    let got = op(&none.sock, "overlord.messages", json!({}))["result"].clone();
-    assert_eq!(got["messages"], json!([]), "{got}");
+    assert_eq!(got["session"]["id"], "overlord-1", "{got}");
 }
 
 // ---- slice 4: the phone ----
@@ -1952,6 +1965,10 @@ fn device_leave_is_the_callers_own() {
 fn the_remote_api_only_grows_within_a_level() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/remote_api.json");
     let r = start();
+    // Every pane held, so the fixture has `control`'s keys.
+    for id in ["overlord-1", "alpha", "beta", "gamma"] {
+        rlord_daemon::control::test_open(&r.daemon, id, id, &format!("device:{PHONE}"), 54, 40);
+    }
     let snap = op_remote(&r.sock, PHONE, "snapshot", json!({}))["result"].clone();
     assert!(snap.get("relay").is_none(), "{snap}");
     let mut keys = std::collections::BTreeSet::new();
@@ -2020,5 +2037,299 @@ fn key_paths(v: &Value, at: &str, out: &mut std::collections::BTreeSet<String>) 
             }
         }
         _ => {}
+    }
+}
+
+// ---- slice 5: live panes, and who controls one ----
+
+/// A device's `pane.open`, as the plugin passes it on (`web.call`, via
+/// remote): the daemon resolves the target and answers with the tmux
+/// session (the plugin keeps it and drops it from the device's answer),
+/// whether it runs, whether the device holds it and the size to attach at.
+/// It starts nothing; a look-up the plugin may repeat.
+#[test]
+fn pane_open_from_a_device() {
+    let r = start();
+    let rev = r.daemon.rev();
+    let got = op_remote(
+        &r.sock,
+        PHONE,
+        "pane.open",
+        json!({"stream": 1, "target": "overlord", "cols": 54, "rows": 40}),
+    );
+    let o = got["result"].clone();
+    let mut keys: Vec<&str> = o.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "cols",
+            "control",
+            "id",
+            "name",
+            "overlord",
+            "rows",
+            "running",
+            "tmux_session",
+            "window"
+        ],
+        "{got}"
+    );
+    assert_eq!(o["id"], "overlord-1");
+    assert_eq!(o["tmux_session"], "overlord-rlord");
+    // (No tmux here: not running, so nobody holds it and nothing moved.)
+    assert_eq!(
+        (o["running"].clone(), o["control"].clone()),
+        (json!(false), json!(false))
+    );
+    assert_eq!(
+        (o["cols"].clone(), o["rows"].clone()),
+        (json!(54), json!(40))
+    );
+    assert_eq!(r.daemon.rev(), rev);
+    // A session by reference; a missing one is the method's error.
+    let a = op_remote(
+        &r.sock,
+        PHONE,
+        "pane.open",
+        json!({"stream": 2, "target": "alpha", "cols": 54, "rows": 40}),
+    );
+    assert_eq!(a["result"]["id"], "alpha", "{a}");
+    let m = op_remote(
+        &r.sock,
+        PHONE,
+        "pane.open",
+        json!({"stream": 2, "target": "nosuch", "cols": 54, "rows": 40}),
+    );
+    assert!(m["error"]["message"].is_string(), "{m}");
+    assert_ne!(m["error"]["code"], plugin::RPC_ERR_NOT_ALLOWED, "{m}");
+    // A size out of bounds: bad_request.
+    let b = op_remote(
+        &r.sock,
+        PHONE,
+        "pane.open",
+        json!({"stream": 2, "target": "alpha", "cols": 5000, "rows": 40}),
+    );
+    assert_eq!(b["error"]["code"], plugin::RPC_ERR_BAD_REQUEST, "{b}");
+    // The plugin is told it may run it again (and `pane.take`).
+    let h = ok(
+        &r.sock,
+        "web.hello",
+        json!({"protocol": plugin::WEB_PROTOCOL, "version": "x"}),
+    );
+    assert_eq!(h["api"], 2);
+    let idem = h["idempotent"].as_array().unwrap();
+    assert!(
+        idem.contains(&json!("pane.open")) && idem.contains(&json!("pane.take")),
+        "{h}"
+    );
+}
+
+/// A local page opens panes on its pane socket (`web.pane_open`), never
+/// with `pane.open`.
+#[test]
+fn pane_open_is_refused_locally() {
+    let r = start();
+    let got = op_from(
+        &r.sock,
+        "p1-aaaa",
+        "pane.open",
+        json!({"stream": 1, "target": "alpha", "cols": 80, "rows": 24}),
+    );
+    assert_eq!(got["error"]["code"], plugin::RPC_ERR_BAD_REQUEST, "{got}");
+    assert!(
+        got["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pane socket"),
+        "{got}"
+    );
+}
+
+/// `pane.take` from a device and from a page reaches control (here no
+/// session runs: control's own answer, never the allow-list's); a
+/// view-only device is refused `not_allowed` before anything else, and a
+/// page needs its id.
+#[test]
+fn pane_take_from_a_device_and_a_page() {
+    let r = start();
+    let take = json!({"target": "alpha", "cols": 54, "rows": 40});
+    let d = op_remote(&r.sock, PHONE, "pane.take", take.clone());
+    assert!(
+        d["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("isn't running"),
+        "{d}"
+    );
+    let p = op_from(&r.sock, "p1-aaaa", "pane.take", take.clone());
+    assert!(
+        p["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("isn't running"),
+        "{p}"
+    );
+    let none = op(&r.sock, "pane.take", take.clone());
+    assert_eq!(none["error"]["code"], plugin::RPC_ERR_BAD_REQUEST, "{none}");
+    // The user made this phone view-only.
+    paired(
+        &r.sock,
+        json!([{"id": PHONE, "name": "pocket", "linked": true, "input": false}]),
+    );
+    let m = not_allowed(&op_remote(&r.sock, PHONE, "pane.take", take));
+    assert!(m.contains("view-only"), "{m}");
+    // The daemon's own `control.take` (the terminal's key) is no op.
+    let got = op(&r.sock, "control.take", json!({"target": "alpha"}));
+    assert_eq!(got["error"]["code"], plugin::RPC_ERR_NOT_ALLOWED, "{got}");
+}
+
+/// The phone reaches the overlord through its pane: `overlord.ask` (the
+/// desktop page's "tell the overlord" box) is a local page's only.
+#[test]
+fn overlord_ask_is_local_only() {
+    let r = start();
+    let m = not_allowed(&op_remote(
+        &r.sock,
+        PHONE,
+        "overlord.ask",
+        json!({"text": "hi"}),
+    ));
+    assert!(m.contains("remote device"), "{m}");
+    // A page still reaches it (here: its own error, the text is blank).
+    let got = op(&r.sock, "overlord.ask", json!({"text": "  "}));
+    assert_ne!(got["error"]["code"], plugin::RPC_ERR_NOT_ALLOWED, "{got}");
+}
+
+/// Whether a device may type is the user's: a local page's `device.input`
+/// (and `relay.input`) goes to the plugin as a relay command, as a revoke
+/// does; never from a device.
+#[test]
+fn device_input_is_local_only() {
+    let r = start();
+    let m = not_allowed(&op_remote(
+        &r.sock,
+        PHONE,
+        "device.input",
+        json!({"device": PHONE, "input": true}),
+    ));
+    assert!(m.contains("remote device"), "{m}");
+    let plugin = FakePlugin::start(&r.sock, plugin_answer);
+    let got = op(
+        &r.sock,
+        "device.input",
+        json!({"device": PHONE, "input": false, "extra": 1}),
+    );
+    assert!(got["error"].is_null(), "{got}");
+    assert_eq!(
+        plugin.next()["req"],
+        json!({"cmd": "input", "device": PHONE, "input": false})
+    );
+    ok(
+        &r.sock,
+        "relay.input",
+        json!({"device": PHONE, "input": true}),
+    );
+    assert_eq!(
+        plugin.next()["req"],
+        json!({"cmd": "input", "device": PHONE, "input": true})
+    );
+    // Both are needed.
+    let e = method_error(&op(&r.sock, "device.input", json!({"device": PHONE})));
+    assert!(e.contains("input"), "{e}");
+    // The mirror keeps the flag (true unless the plugin says otherwise).
+    paired(
+        &r.sock,
+        json!([{"id": PHONE, "name": "pocket", "input": false}, {"id": "cd56", "name": "tab"}]),
+    );
+    let st = ok(&r.sock, "relay.status", json!({}));
+    let inputs: Vec<Value> = st["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["input"].clone())
+        .collect();
+    assert_eq!(inputs, [json!(false), json!(true)], "{st}");
+}
+
+/// Each session in the snapshot, and the overlord, says who holds its
+/// pane (`control`: null when free); a change moves `rev`, and the plugin
+/// hears the whole map of held panes on its stream.
+#[test]
+fn the_snapshot_says_who_holds_each_pane() {
+    let r = start();
+    paired(
+        &r.sock,
+        json!([{"id": PHONE, "name": "pocket", "linked": true}]),
+    );
+    let s = UnixStream::connect(&r.sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut w = s.try_clone().unwrap();
+    writeln!(w, "{}", json!({"id": 1, "method": "web.subscribe"})).unwrap();
+    let mut lines = BufReader::new(s).lines();
+    lines.next().unwrap().unwrap();
+    let snap = op_remote(&r.sock, PHONE, "snapshot", json!({}))["result"].clone();
+    for row in snap["rows"].as_array().unwrap() {
+        assert!(row["control"].is_null(), "{row}");
+    }
+    assert!(snap["overlord"]["control"].is_null(), "{snap}");
+    let rev = r.daemon.rev();
+    // (No tmux here: opened as the plugin's pane.open would, once running.)
+    let held = rlord_daemon::control::test_open(
+        &r.daemon,
+        "alpha",
+        "rlord-alpha",
+        &format!("device:{PHONE}"),
+        54,
+        40,
+    );
+    assert!(held, "a free pane is its opener's");
+    assert_ne!(r.daemon.rev(), rev);
+    let snap = op(&r.sock, "snapshot", json!({}))["result"].clone();
+    let alpha = snap["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "alpha")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        alpha["control"],
+        json!({"holder": format!("device:{PHONE}"), "by": "phone", "name": "pocket",
+               "away": false, "cols": 54, "rows": 40})
+    );
+    // A second screen opening it is a viewer.
+    assert!(!rlord_daemon::control::test_open(
+        &r.daemon,
+        "alpha",
+        "rlord-alpha",
+        "page:p1-aaaa",
+        80,
+        24
+    ));
+    // The plugin's line: every held pane, with its tmux session.
+    let line = loop {
+        let v: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        if v["notify"] == "control" && !v["sessions"]["alpha"].is_null() {
+            break v;
+        }
+    };
+    assert_eq!(
+        line["sessions"]["alpha"],
+        json!({"holder": format!("device:{PHONE}"), "by": "phone", "name": "pocket",
+               "away": false, "cols": 54, "rows": 40, "tmux_session": "rlord-alpha"})
+    );
+    // A TUI's stream never gets it.
+    let events = UnixStream::connect(&r.sock).unwrap();
+    events
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut ew = events.try_clone().unwrap();
+    writeln!(ew, "{}", json!({"id": 1, "method": "events.subscribe"})).unwrap();
+    let mut ev = BufReader::new(events).lines();
+    ev.next().unwrap().unwrap();
+    rlord_daemon::control::test_open(&r.daemon, "beta", "rlord-beta", "page:p1-aaaa", 80, 24);
+    while let Some(Ok(l)) = ev.next() {
+        assert!(!l.contains("\"control\""), "{l}");
     }
 }

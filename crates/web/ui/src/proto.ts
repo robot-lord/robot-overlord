@@ -98,7 +98,6 @@ export const OPS = [
   "overlord.setup_request",
   "session.new",
   "session.fork",
-  "overlord.messages",
   "device.list",
   "device.pair",
   "device.pair_cancel",
@@ -107,6 +106,9 @@ export const OPS = [
   "device.revoke",
   "session.messages",
   "device.leave",
+  "pane.open",
+  "pane.take",
+  "device.input",
 ] as const;
 
 export type Op = (typeof OPS)[number];

@@ -249,6 +249,26 @@ fn where_(t: &Target) -> &'static str {
     }
 }
 
+/// Each screen's last use (ms; None: never), as `target` weighs them:
+/// for control's "the screen used last" (`control.rs`).
+pub(crate) fn surface_uses(
+    d: &Daemon,
+) -> std::collections::HashMap<crate::control::Surface, Option<i64>> {
+    use crate::control::Surface;
+    let clients = tmux::list_clients();
+    let home = tmux::home();
+    let term = tmux::user_client(&clients, home.as_deref()).map(|c| c.activity * 1000);
+    let mut out: std::collections::HashMap<Surface, Option<i64>> = Default::default();
+    out.insert(Surface::Terminal, term);
+    for (id, at, _) in page_uses(d) {
+        out.insert(Surface::Page(id), at);
+    }
+    for (id, at, _) in device_uses(d) {
+        out.insert(Surface::Device(id), at);
+    }
+    out
+}
+
 /// The id of the most recently used open page, if any.
 pub(crate) fn latest_page(d: &Daemon) -> Option<String> {
     page_uses(d)

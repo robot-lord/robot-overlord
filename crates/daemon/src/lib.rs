@@ -5,6 +5,7 @@ pub mod autostart;
 pub mod background;
 pub mod codex_daemon;
 pub mod context;
+pub mod control;
 pub mod discover;
 pub mod first_prompt;
 pub mod fork;
@@ -76,7 +77,9 @@ pub struct Daemon {
     /// `{"notify":"ui","to":"device","device":"<id>","n"?,"cmd":{...}}` —
     /// one for a paired device (the same; `n` when it is parked);
     /// `{"notify":"remote","id","req"}` — a user's relay command for the
-    /// plugin (`relay.rs`; only `web.subscribe` gets these).
+    /// plugin (`relay.rs`; only `web.subscribe` gets these);
+    /// `{"notify":"control","sessions"}` — every held pane, for the
+    /// plugin (`control.rs`; only `web.subscribe` gets these).
     notify: tokio::sync::broadcast::Sender<String>,
     /// The TUI's current list view, as it last reported it.
     pub(crate) ui_view: Mutex<Value>,
@@ -131,6 +134,8 @@ pub struct Daemon {
     pub(crate) proposals: Mutex<std::collections::VecDeque<(String, Value)>>,
     /// The open web pages and what each shows (web.rs `WebUi`).
     web_ui: Mutex<web::WebUi>,
+    /// Which screen holds each pane (control.rs).
+    pub(crate) control: control::Shared,
     /// The attention queue's watcher (attention.rs).
     pub(crate) attention: attention::Watch,
     /// Live OpenCode sessions can't be followed (no server reached): their
@@ -170,6 +175,7 @@ impl Daemon {
             changes: std::sync::atomic::AtomicU64::new(0),
             web: Default::default(),
             web_ui: Default::default(),
+            control: Default::default(),
             proposals: Default::default(),
             attention: Default::default(),
             opencode_blind: Default::default(),
@@ -287,6 +293,8 @@ impl Daemon {
         self.bind_nav_keys();
         profile::sync_all(self, false);
         overlord::style(&self.db(), &self.config());
+        // (The profile resets a held session's key table.)
+        control::reassert(self);
         Ok(json!({"reloaded": true}))
     }
 
@@ -481,6 +489,8 @@ impl Daemon {
         drop(db);
         self.bind_nav_keys();
         profile::sync_all(self, false);
+        // Who held which pane was the last daemon's: every pane is free.
+        control::sweep();
         Ok(())
     }
 
@@ -580,6 +590,11 @@ impl Daemon {
                     };
                     let mut out = serde_json::to_vec(&Response::ok(req.id, ack))?;
                     out.push(b'\n');
+                    // The plugin starts from who holds what now.
+                    if let Push::Web = kind {
+                        out.extend_from_slice(self.control.notify_line().as_bytes());
+                        out.push(b'\n');
+                    }
                     write_half.write_all(&out).await?;
                     return self.push_loop(lines, write_half, kind).await;
                 }
@@ -641,8 +656,11 @@ impl Daemon {
                 Err(RecvError::Lagged(_)) => CHANGED.to_string(),
                 Err(RecvError::Closed) => break Ok(()),
             };
-            // (A relay command is for the plugin alone.)
-            if matches!(kind, Push::Events { .. }) && is_remote_line(&line) {
+            // (A relay command, and the control map, are for the plugin
+            // alone.)
+            if matches!(kind, Push::Events { .. })
+                && (is_remote_line(&line) || is_control_line(&line))
+            {
                 continue;
             }
             let mut out = vec![line];
@@ -703,6 +721,7 @@ impl Daemon {
         if let Push::Web = kind {
             self.web.stream_closed(|| {
                 self.web_ui().clear();
+                control::plugin_gone(self);
                 if self.relay.plugin_gone() {
                     self.changed();
                 }
@@ -793,6 +812,8 @@ impl Daemon {
             // A terminal moved or changed focus (tmux's client hooks).
             "attention.poke" => {
                 self.attention.poke();
+                // (A terminal moved: control looks at who shows what.)
+                control::tick(self);
                 return Ok(json!({"ok": true}));
             }
             _ => {}
@@ -953,6 +974,9 @@ impl Daemon {
                     let id = row["id"].as_str().unwrap_or("").to_string();
                     row["loading"] = json!(loading.contains(&id));
                     row["summarizing"] = json!(summarizing.contains(&id));
+                    // Which screen holds its pane (null: free, or only
+                    // the terminal looks).
+                    row["control"] = self.control.entry(&id);
                 }
                 annotate_status(self, &mut rows, true);
                 if let Some((taken, others)) = &status_filter {
@@ -1068,6 +1092,8 @@ impl Daemon {
                     }
                     // The other agents' overlords, for the switchers.
                     v["overlords"] = self.roster(rows);
+                    // Which screen holds its pane.
+                    v["control"] = self.control.entry(v["id"].as_str().unwrap_or(""));
                     // Stopped on a usage limit: the row and the overlay say
                     // so (the user may switch to another agent's).
                     let mut rows = [v];
@@ -1249,6 +1275,8 @@ impl Daemon {
                         *o = None;
                     }
                 }
+                // The terminal shows the overlord, or stopped showing it.
+                control::tick(self);
                 Ok(json!({"ok": true}))
             }
             "ui.show_list" => ui::show_list(self),
@@ -1306,7 +1334,9 @@ impl Daemon {
             // browser's `web.call`.
             "web.hello" => web::hello(self, params),
             "web.call" => web::call(self, params),
-            "web.pane_target" => web::pane_target(self, params),
+            "web.pane_open" => web::pane_open(self, params),
+            "web.pane_size" => control::size(self, params),
+            "web.pane_closed" => control::closed(self, params),
             "web.pages" => web::pages(self, params),
             "web.ui_delivered" => web::ui_delivered(self, params),
             "web.status" => web::status(self),
@@ -1316,6 +1346,12 @@ impl Daemon {
             // The plugin's relay side (relay.rs).
             "web.remote_reply" => relay::remote_reply(self, params),
             "web.remote_state" => relay::remote_state(self, params),
+            // Control of a pane (control.rs): the terminal's take key, and
+            // the overlay's look-up.
+            "control.take" => {
+                control::take(self, control::who(self, control::Surface::Terminal), params)
+            }
+            "control.get" => control::get(self, params),
             "mcp.tools" => Ok(mcp::tools_for(params["overlord"] == true)),
             "mcp.call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -1344,11 +1380,12 @@ const CHANGED_RELAY: &str = r#"{"notify":"changed","relay":true}"#;
 
 /// A broadcast line as `web.subscribe` passes it on: a UI command for a
 /// web page (`{"notify":"ui","page","cmd"}`) or for a paired device
-/// (`{"notify":"ui","device","n"?,"cmd"}`), or a relay command for the
-/// plugin (`{"notify":"remote","id","req"}`, as is).
+/// (`{"notify":"ui","device","n"?,"cmd"}`), or a relay command or the
+/// control map for the plugin (`{"notify":"remote","id","req"}`,
+/// `{"notify":"control","sessions"}`, as is).
 fn web_line(line: &str) -> Option<String> {
     let v: Value = serde_json::from_str(line).ok()?;
-    if v["notify"] == "remote" {
+    if v["notify"] == "remote" || v["notify"] == "control" {
         return Some(line.to_string());
     }
     if v["notify"] != "ui" {
@@ -1367,6 +1404,11 @@ fn web_line(line: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The control map (`control.rs`), which only the plugin's stream carries.
+fn is_control_line(line: &str) -> bool {
+    line.starts_with(r#"{"notify":"control""#)
 }
 
 /// A relay command (`relay.rs`), which only the plugin's stream carries.

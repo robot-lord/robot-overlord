@@ -681,7 +681,12 @@ pub fn bind_web_table() -> Result<()> {
 /// Checks `target` exists first: `new-session -t` on a missing name makes a
 /// fresh shell instead of failing. After attaching, confirm with
 /// `view_shows` (the target can go in between).
-pub fn view_command(target: &str, view: &str) -> Result<Command> {
+///
+/// The client is `ignore-size`: no browser or phone ever sizes the window
+/// by itself; only the daemon does, for the screen that holds the pane
+/// (`resize_window`). `read_only`: a view-only device's client, which tmux
+/// gives no keys at all.
+pub fn view_command(target: &str, view: &str, read_only: bool) -> Result<Command> {
     if !is_view(view) {
         bail!("{view:?} isn't a web view session name");
     }
@@ -693,7 +698,19 @@ pub fn view_command(target: &str, view: &str) -> Result<Command> {
     c.env_remove("TMUX")
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
-        .args(["new-session", "-t", &exact(target), "-s", view]);
+        .args([
+            "new-session",
+            "-f",
+            if read_only {
+                "ignore-size,read-only"
+            } else {
+                "ignore-size"
+            },
+            "-t",
+            &exact(target),
+            "-s",
+            view,
+        ]);
     for (opt, val) in [
         ("status", "off"),
         ("key-table", WEB_TABLE),
@@ -778,6 +795,180 @@ pub fn sweep_views() -> Vec<String> {
         .filter(|(_, name)| run(&["kill-session", "-t", &exact(name)]).is_ok())
         .map(|(_, name)| name.to_string())
         .collect()
+}
+
+// ---- control: a session another screen holds (`daemon/src/control.rs`) ----
+//
+// While a page or a phone holds a session's pane, the terminal's keys must
+// not reach it. tmux can't make a client read-only and back, so the
+// session's `key-table` is pointed at rlord's `rlord-held` table: rlord's
+// navigation keys, the take-over key, and `Any` bound to a message. View
+// sessions have their own key table, so only real terminals are affected.
+// Keys typed faster than `assume-paste-time` apart count as a paste and
+// skip key tables, so it is 0 while held. (A bracketed paste from the
+// terminal still reaches the pane on tmux 3.4 and later: accepted.)
+
+/// The key table of a session another screen holds.
+pub const HELD_TABLE: &str = "rlord-held";
+/// The held session's line: who holds it and the take key. Shown by
+/// `Any` and on the hint bar.
+const HELD_LINE: &str = "@rlord-held";
+/// What the held session had before (`-`: nothing of its own), restored
+/// when it is let go.
+const HELD_TABLE_SAVED: &str = "@rlord_held_table";
+const HELD_PASTE_SAVED: &str = "@rlord_held_paste";
+
+/// (Re)make `rlord-held`: each `(key, command)` in `keys` (rlord's
+/// navigation keys and the take key, as `run-shell -b` commands), root's
+/// status click (the hints), and `Any` saying who holds the session.
+/// Idempotent; call before holding a session (the table is gone with the
+/// server).
+pub fn bind_held_table(keys: &[(String, String)]) -> Result<()> {
+    // (Errors when the table doesn't exist yet: fine.)
+    let _ = run(&["unbind-key", "-a", "-T", HELD_TABLE]);
+    for (key, cmd) in keys {
+        run(&["bind-key", "-T", HELD_TABLE, key, "run-shell", "-b", cmd])?;
+    }
+    if let Some((_, cmd)) = bindings("root")
+        .into_iter()
+        .find(|(k, _)| k == STATUS_CLICK)
+    {
+        let conf = format!("bind-key -T {HELD_TABLE} {STATUS_CLICK} {cmd}\n");
+        source_conf_text(&conf)?;
+    }
+    // Not `-N`: a message held that way swallows the take key too.
+    run(&[
+        "bind-key",
+        "-T",
+        HELD_TABLE,
+        "Any",
+        "display-message",
+        &format!("#{{{HELD_LINE}}}"),
+    ])?;
+    Ok(())
+}
+
+/// Source `conf` (tmux commands, one per line) on rlord's server.
+fn source_conf_text(conf: &str) -> Result<()> {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("rlord-keys-{}-{n}.conf", std::process::id()));
+    std::fs::write(&tmp, conf)?;
+    let r = run(&["source-file", &tmp.to_string_lossy()]);
+    let _ = std::fs::remove_file(&tmp);
+    r.map(|_| ())
+}
+
+/// Hold `session`'s keys for another screen: its key table becomes
+/// `rlord-held` and `assume-paste-time` 0, what it had is saved (once:
+/// holding again only changes `line`, or picks up a key table set since,
+/// such as the user's profile turned on), and `line` is what a key press
+/// and the hint bar say.
+pub fn hold_keys(session: &str, line: &str) -> Result<()> {
+    let t = format!("{}:", exact(session));
+    let local =
+        |opt: &str| run(&["show-options", "-qv", "-t", &t, opt]).map(|v| v.trim().to_string());
+    let saved = local(HELD_TABLE_SAVED)?;
+    let table = local("key-table")?;
+    let mut cmds: Vec<Vec<String>> = Vec::new();
+    let set = |opt: &str, val: &str| -> Vec<String> {
+        ["set-option", "-t", &t, opt, val]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    };
+    if saved.is_empty() {
+        let paste = local("assume-paste-time")?;
+        let or_none = |v: String| if v.is_empty() { "-".to_string() } else { v };
+        let table = if table == HELD_TABLE {
+            String::new()
+        } else {
+            table
+        };
+        cmds.push(set(HELD_TABLE_SAVED, &or_none(table)));
+        cmds.push(set(HELD_PASTE_SAVED, &or_none(paste)));
+    } else if !table.is_empty() && table != HELD_TABLE {
+        cmds.push(set(HELD_TABLE_SAVED, &table));
+    }
+    cmds.push(set("key-table", HELD_TABLE));
+    cmds.push(set("assume-paste-time", "0"));
+    cmds.push(set(HELD_LINE, line));
+    let mut args: Vec<&str> = Vec::new();
+    for c in &cmds {
+        if !args.is_empty() {
+            args.push(";");
+        }
+        args.extend(c.iter().map(String::as_str));
+    }
+    run(&args)?;
+    Ok(())
+}
+
+/// Give `session` its keys back (what `hold_keys` saved). Not held:
+/// nothing changes.
+pub fn release_keys(session: &str) -> Result<()> {
+    let t = format!("{}:", exact(session));
+    let saved_table = run(&["show-options", "-qv", "-t", &t, HELD_TABLE_SAVED])?;
+    let saved_table = saved_table.trim();
+    if saved_table.is_empty() {
+        // Not held by rlord (or already let go); a line left alone goes.
+        let _ = run(&["set-option", "-u", "-t", &t, HELD_LINE]);
+        return Ok(());
+    }
+    let saved_paste = run(&["show-options", "-qv", "-t", &t, HELD_PASTE_SAVED])?;
+    let mut args: Vec<String> = Vec::new();
+    let mut push = |cmd: &[&str]| {
+        if !args.is_empty() {
+            args.push(";".into());
+        }
+        args.extend(cmd.iter().map(|s| s.to_string()));
+    };
+    for (opt, val) in [
+        ("key-table", saved_table),
+        ("assume-paste-time", saved_paste.trim()),
+    ] {
+        if val.is_empty() || val == "-" {
+            push(&["set-option", "-u", "-t", &t, opt]);
+        } else {
+            push(&["set-option", "-t", &t, opt, val]);
+        }
+    }
+    for opt in [HELD_LINE, HELD_TABLE_SAVED, HELD_PASTE_SAVED] {
+        push(&["set-option", "-u", "-t", &t, opt]);
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(&refs)?;
+    Ok(())
+}
+
+/// The sessions whose keys rlord holds now (`hold_keys`): after a daemon
+/// restart, which forgets who held what, they are let go.
+pub fn held_sessions() -> Vec<String> {
+    run(&[
+        "list-sessions",
+        "-F",
+        &format!("#{{{HELD_TABLE_SAVED}}}\t#{{session_name}}"),
+    ])
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|l| l.split_once('\t'))
+    .filter(|(saved, _)| !saved.is_empty())
+    .map(|(_, name)| name.to_string())
+    .collect()
+}
+
+/// The size of `session`'s current window (columns, rows).
+pub fn window_size(session: &str) -> Option<(u16, u16)> {
+    let out = run(&[
+        "display-message",
+        "-p",
+        "-t",
+        &format!("{}:", exact(session)),
+        "#{window_width} #{window_height}",
+    ])
+    .ok()?;
+    let (w, h) = out.trim().split_once(' ')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
 }
 
 /// The client events that change who is looking at what: each runs
@@ -1242,7 +1433,13 @@ const PROFILE_ON: &str = "@rlord_profile";
 
 /// Session options rlord itself sets on agent sessions (kept when the
 /// profile is turned off).
-const RLORD_SESSION_OPTS: &[&str] = &[AGENT_PANE, PROFILE_ON];
+const RLORD_SESSION_OPTS: &[&str] = &[
+    AGENT_PANE,
+    PROFILE_ON,
+    HELD_LINE,
+    HELD_TABLE_SAVED,
+    HELD_PASTE_SAVED,
+];
 
 /// The overlord keeps its own bar, but gets the user's keys: their key
 /// table (root bindings, with rlord's nav keys), prefix, and copy-mode keys.
@@ -1308,7 +1505,7 @@ pub fn set_hint_bar(name: &str, hints: &str, profile_on: bool) -> Result<()> {
         "-t",
         &t,
         HINTS_OPT,
-        &format!("#[fg=colour245] {hints} #[default]"),
+        &format!("{HELD_HINT}#[fg=colour245] {hints} #[default]"),
     ])?;
     if profile_on {
         if run(&["show-options", "-v", "-t", &t, "status"])?.trim() == "off" {
@@ -1352,6 +1549,10 @@ pub fn set_hint_bar(name: &str, hints: &str, profile_on: bool) -> Result<()> {
 /// refers to it (also how we tell it's already there).
 const HINTS_OPT: &str = "@rlord-hints";
 const HINTS_REF: &str = "#{E:@rlord-hints}";
+/// Ahead of the hints while another screen holds the session: its line
+/// ("Controlled by … · ⌥t to take over", `hold_keys`). No comma in the
+/// branch: it would end it.
+const HELD_HINT: &str = "#{?@rlord-held,#[fg=yellow]#[bold] #{@rlord-held} #[default],}";
 
 /// Whether `key` in the root table runs rlord's nav (it's skipped when the
 /// user's own binding already holds it).

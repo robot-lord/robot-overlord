@@ -17,8 +17,12 @@
 //!   access (`relay.rs`).
 //! - `web.subscribe`: a push stream of `{"notify":"changed","rev"}`, at
 //!   most one per 100 ms (`Daemon::push_loop`).
-//! - `web.pane_target {target}`: which tmux session a pane shows. Starts
-//!   nothing.
+//! - `web.pane_open {target, surface, cols, rows}`, `web.pane_size`,
+//!   `web.pane_closed`: a local page's pane socket opening, resizing and
+//!   closing a pane, so the daemon knows which screen holds it
+//!   (`control.rs`). Opening starts nothing.
+//! - `web.subscribe` also carries `{"notify":"control","sessions"}`, every
+//!   held pane, on each change (and once at the start).
 //! - `web.pages {pages}`: the pages (control sockets) open now, by the
 //!   page id the plugin gave each. `web.call` carries the id of the page
 //!   that asked (`page`), never set by the browser. The daemon keeps what
@@ -50,9 +54,10 @@ use serde_json::{json, Value};
 
 use rlord_core::db::{SessionQuery, SortMode};
 use rlord_core::types::Status;
-use rlord_core::{groups, plugin, tmux};
+use rlord_core::{groups, plugin};
 
-use crate::{methods, overlord, Daemon};
+use crate::control::{self, Surface};
+use crate::{methods, Daemon};
 
 /// A `web.hello` from a plugin speaking another protocol. Answered with
 /// RPC code `plugin::RPC_ERR_INCOMPATIBLE`; the plugin then exits with
@@ -109,7 +114,7 @@ impl std::error::Error for BadRequest {}
 /// and asks for an update outside it. Within a level, changes are
 /// additive only: `tests/web_api.rs` pins the remote ops and the remote
 /// snapshot's keys against `tests/fixtures/remote_api.json`.
-pub const API: u32 = 1;
+pub const API: u32 = 2;
 
 /// One browser op: the daemon method it calls ("" when it is answered
 /// here), the only arguments passed on (any others are dropped, so a
@@ -177,8 +182,9 @@ pub const OPS: &[Op] = &[
     op("session.resume", "", &["ref"]),
     op("session.restart", "session.restart", &["ref"]),
     op("session.stop", "session.stop", &["ref"]),
-    // The "tell the overlord" box: typed into the overlord's pane.
-    op("overlord.ask", "overlord.ask", &["text"]),
+    // The "tell the overlord" box: typed into the overlord's pane. Local
+    // only: a phone reaches the overlord through its pane (`pane.open`).
+    local("overlord.ask", "overlord.ask", &["text"]),
     op("session.archive", "session.archive", &["ref"]),
     op("session.unarchive", "session.unarchive", &["ref"]),
     op("session.rename", "session.rename", &["ref", "name"]),
@@ -273,10 +279,6 @@ pub const OPS: &[Op] = &[
         "session.fork",
         &["ref", "prompt", "name", "workspace"],
     ),
-    // The overlord's recent conversation as text (a chat view beside
-    // `overlord.ask`), read from its transcript; `before`: a message's
-    // `line`, for the ones before it.
-    op("overlord.messages", "", &["before", "limit"]).idempotent(),
     // Remote access, from the page's Devices view (relay.rs): the state,
     // a pairing offer and its cancel, the waiting device's confirmation,
     // unpairing a device.
@@ -286,12 +288,26 @@ pub const OPS: &[Op] = &[
     local("device.confirm", "", &[]),
     local("device.reject", "", &[]),
     local("device.revoke", "", &["device"]),
-    // A session's recent conversation as text (its view without a pane),
-    // as `overlord.messages` reads the overlord's.
+    // A session's (or, by its id, the overlord's) recent conversation as
+    // text: its transcript, read-only, beside its pane.
     op("session.messages", "", &["ref", "before", "limit"]).idempotent(),
     // A paired device unpairs itself (the plugin removes it once the
     // answer is on its way). From a local page: `bad_request`.
     op("device.leave", "", &[]),
+    // A device opens a live pane on a stream of its link: the daemon
+    // resolves the target and says who holds it (control.rs), the plugin
+    // attaches the view client. "Idempotent" stretches the word here: it
+    // opens something in the plugin, though in rlord it changes nothing a
+    // second open would change again (a free pane is its opener's either
+    // way). It keeps the op out of the request store and the outbox, which
+    // is what is wanted: a pane is never opened late. A local page opens
+    // panes on its pane socket (`web.pane_open`): refused from one.
+    op("pane.open", "", &["stream", "target", "cols", "rows"]).idempotent(),
+    // Take a pane over: this page or device holds it now (twice is once).
+    // Refused for a view-only device.
+    op("pane.take", "", &["target", "cols", "rows"]).idempotent(),
+    // Whether a paired device may type into panes (false: view-only).
+    local("device.input", "", &["device", "input"]),
 ];
 
 /// Ops that don't count as the user doing something on the page (look-ups
@@ -307,15 +323,16 @@ const PASSIVE: &[&str] = &[
     "form.defaults",
     "form.repos",
     "form.setup",
-    "overlord.messages",
     "session.messages",
+    // (Opened when a view shows: on a reconnect too.)
+    "pane.open",
     "device.list",
     "device.leave",
 ];
 
 /// Method families no op may name, whatever `OPS` says: a second check.
 const FORBIDDEN: &[&str] = &[
-    "admin.", "mcp.", "hook.", "web.", "config.", "ui.", "tmux.", "setup.", "relay.",
+    "admin.", "mcp.", "hook.", "web.", "config.", "ui.", "tmux.", "setup.", "relay.", "control.",
 ];
 
 /// `web.hello`: the plugin's first call. From the plugin this daemon
@@ -424,6 +441,22 @@ pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
             "device.leave is a paired device's own: a page unpairs one with device.revoke".into(),
         )
         .into()),
+        ("pane.open", Via::Remote(device)) => {
+            control::open(d, control::who(d, Surface::Device(device.into())), &args)
+        }
+        ("pane.open", Via::Local(_)) => Err(BadRequest(
+            "pane.open is a paired device's: a page opens a pane on its pane socket".into(),
+        )
+        .into()),
+        ("pane.take", Via::Remote(device)) => {
+            control::take(d, control::who(d, Surface::Device(device.into())), &args)
+        }
+        ("pane.take", Via::Local(page)) if !page.is_empty() => {
+            control::take(d, control::who(d, Surface::Page(page.into())), &args)
+        }
+        ("pane.take", Via::Local(_)) => {
+            Err(BadRequest("pane.take needs the page that asks".into()).into())
+        }
         _ => call_op(d, found, args, via, page),
     }
 }
@@ -432,7 +465,6 @@ pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
 fn call_op(d: &Daemon, found: &Op, args: Value, via: Via, page: &str) -> Result<Value> {
     match found.op {
         "snapshot" => snapshot(d, &args, via),
-        "overlord.messages" => overlord_messages(d, &args),
         "session.messages" => session_messages(d, &args),
         "device.list" => crate::relay::status(d),
         "device.pair" => crate::relay::pair(d),
@@ -440,6 +472,7 @@ fn call_op(d: &Daemon, found: &Op, args: Value, via: Via, page: &str) -> Result<
         "device.confirm" => crate::relay::confirm(d),
         "device.reject" => crate::relay::reject(d),
         "device.revoke" => crate::relay::revoke(d, &args),
+        "device.input" => crate::relay::input(d, &args),
         "session.resume" => resume(d, &args),
         "page.report" => d.web_ui().report(page, &args),
         "page.pending" => Ok(pending(d)),
@@ -622,40 +655,17 @@ pub fn snapshot(d: &Daemon, args: &Value, via: Via) -> Result<Value> {
     Ok(out)
 }
 
-/// At most this many messages per `overlord.messages`, each at most this
+/// At most this many messages per `session.messages`, each at most this
 /// many bytes.
 const MESSAGES_MAX: usize = 50;
 const MESSAGE_BYTES: usize = 4096;
 
-/// Op `overlord.messages {before, limit}`: the active overlord's current
-/// conversation as text, oldest first: the last `limit` messages (at most
-/// 50), or with `before` (a message's `line`) the ones before it. Read by
-/// plain code from its transcript (`history::read`, as `recall` reads
-/// one); `more` says whether earlier ones are left. No overlord, or no
-/// conversation yet: no messages.
-pub fn overlord_messages(d: &Daemon, args: &Value) -> Result<Value> {
-    let limit = args["limit"]
-        .as_u64()
-        .map_or(MESSAGES_MAX, |l| (l as usize).clamp(1, MESSAGES_MAX));
-    let before = args["before"].as_u64().filter(|b| *b > 0);
-    let (o, path) = {
-        let db = d.db();
-        let Some(o) = overlord::session(&db)? else {
-            return Ok(json!({"overlord": null, "messages": [], "more": false}));
-        };
-        let path = db.transcript_source(&o.id)?;
-        (o, path)
-    };
-    let head = json!({"id": o.id, "agent": o.agent, "conversation": o.agent_session});
-    let (messages, more) = messages_of(path, before, limit, "the overlord's")?;
-    Ok(json!({"overlord": head, "messages": messages, "more": more}))
-}
-
 /// Op `session.messages {ref, before, limit}`: any session's current
-/// conversation as text, oldest first, read as `overlord.messages` reads
-/// the overlord's (at most 50 messages, each at most 4 KiB; `before`: a
-/// message's `line`). What a device shows of a session it has no pane
-/// for. No conversation yet: no messages.
+/// conversation as text, oldest first (at most 50 messages, each at most
+/// 4 KiB; `before`: a message's `line`), read by plain code from its
+/// transcript (`history::read`, as `recall` reads one). The transcript
+/// beside a session's or the overlord's pane. No conversation yet: no
+/// messages.
 pub fn session_messages(d: &Daemon, args: &Value) -> Result<Value> {
     let r = methods::p_str(args, "ref")?;
     let limit = args["limit"]
@@ -763,30 +773,17 @@ fn label(row: &mut Value) {
     row["status_label"] = json!(l);
 }
 
-/// `web.pane_target {target}`: the tmux session a pane shows. `overlord`
-/// is the active overlord; anything else a session reference. Starts
-/// nothing: a session that isn't running says so, and the page offers
-/// Resume.
-pub fn pane_target(d: &Daemon, params: &Value) -> Result<Value> {
-    let target = methods::p_str(params, "target")?;
-    let s = {
-        let db = d.db();
-        if target == "overlord" {
-            overlord::session(&db)?.context("no overlord is set up yet")?
-        } else {
-            db.resolve_ref(target)?
-        }
-    };
-    // (tmux, without the DB guard.)
-    let running =
-        s.status != Status::Stopped && s.tmux_session.as_deref().is_some_and(tmux::has_session);
-    Ok(json!({
-        "id": s.id,
-        "name": s.name,
-        "overlord": overlord::is_overlord_role(&s.role),
-        "tmux_session": s.tmux_session,
-        "running": running,
-    }))
+/// `web.pane_open {target, surface, cols, rows}`: a local page's pane
+/// socket opens a pane (`surface`: `page:<id>`). `target` is `overlord`
+/// (the active one) or a session reference. Answered as a device's
+/// `pane.open` is (`control::open`): the session, its tmux session,
+/// whether it runs, whether this page holds it and the size to attach at.
+/// Starts nothing: a session that isn't running says so, and the page
+/// offers Resume.
+pub fn pane_open(d: &Daemon, params: &Value) -> Result<Value> {
+    let s = methods::p_str(params, "surface")?;
+    let surface = Surface::parse(s).ok_or_else(|| BadRequest(format!("unknown surface {s:?}")))?;
+    control::open(d, control::who(d, surface), params)
 }
 
 // ---- the surfaces besides the terminal: web pages and paired devices ----
@@ -1578,9 +1575,10 @@ mod tests {
                 "form.defaults",
                 "form.repos",
                 "form.setup",
-                "overlord.messages",
                 "device.list",
                 "session.messages",
+                "pane.open",
+                "pane.take",
             ]
         );
         for o in [
