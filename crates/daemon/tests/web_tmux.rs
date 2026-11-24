@@ -724,3 +724,293 @@ fn the_surface_used_last_gets_the_command() {
     term.close();
     tx(&["kill-server"]);
 }
+
+// ---- slice 5: which screen controls a pane (daemon/src/control.rs) ----
+
+/// The size of `session`'s window, as tmux has it.
+fn window_of(session: &str) -> (u16, u16) {
+    tmux::window_size(session).expect("a window")
+}
+
+/// A session option set on `session` itself (empty: not set there).
+fn local_opt(session: &str, opt: &str) -> String {
+    tx(&["show-options", "-qv", "-t", &format!("={session}:"), opt])
+}
+
+/// `call`'s result; panics on an error.
+fn ok_call(dir: &tempfile::TempDir, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let r = call(dir, method, params);
+    assert!(r["error"].is_null(), "{method}: {r}");
+    r["result"].clone()
+}
+
+/// A local page's op (the plugin stamps its id).
+fn page_op(
+    dir: &tempfile::TempDir,
+    page: &str,
+    op: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    ok_call(
+        dir,
+        "web.call",
+        serde_json::json!({"op": op, "args": args, "via": "local", "page": page}),
+    )
+}
+
+/// A page's pane socket opening `rlord_s1` at its size.
+fn pane_open(dir: &tempfile::TempDir, page: &str, cols: u16, rows: u16) -> serde_json::Value {
+    ok_call(
+        dir,
+        "web.pane_open",
+        serde_json::json!({"target": "s1", "surface": format!("page:{page}"),
+                           "cols": cols, "rows": rows}),
+    )
+}
+
+/// A page holding a pane pins its window to the page's size; view clients
+/// (attached `ignore-size`) never size it, whatever their size, and a
+/// terminal coming to it doesn't either. The session's keys are held.
+#[test]
+fn a_held_window_is_pinned_and_views_never_size_it() {
+    use serde_json::json;
+    let Some(_g) = setup() else { return };
+    tmux::new_session("rlord_s1", "/tmp", "cat").unwrap();
+    let (_d, dir) = daemon(Default::default());
+    let o = pane_open(&dir, "p1", 54, 20);
+    assert_eq!(o["running"], true, "{o}");
+    assert_eq!(o["control"], true, "a free pane is its opener's: {o}");
+    assert_eq!(o["window"], json!({"cols": 54, "rows": 20}), "{o}");
+    assert_eq!(window_of("rlord_s1"), (54, 20));
+    assert_eq!(local_opt("rlord_s1", "key-table"), tmux::HELD_TABLE);
+    assert_eq!(local_opt("rlord_s1", "assume-paste-time"), "0");
+    // The holder's view, then another page's at another size: a viewer,
+    // told the window's size; neither client sizes the window.
+    let v1 = PtyClient::run(
+        tmux::view_command("rlord_s1", "webview-1", false).unwrap(),
+        54,
+        20,
+    );
+    let o2 = pane_open(&dir, "p2", 120, 50);
+    assert_eq!(o2["control"], false, "{o2}");
+    assert_eq!(
+        (o2["cols"].clone(), o2["rows"].clone()),
+        (json!(54), json!(20))
+    );
+    let v2 = PtyClient::run(
+        tmux::view_command("rlord_s1", "webview-2", true).unwrap(),
+        120,
+        50,
+    );
+    wait_for("both views", || {
+        tx(&["list-clients", "-F", "#{session_name}"])
+            .lines()
+            .count()
+            == 2
+    });
+    // The view-only client is read-only.
+    assert!(tx(&["list-clients", "-F", "#{client_flags}"]).contains("read-only"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(window_of("rlord_s1"), (54, 20));
+    // A terminal comes: still the page's size (it views, padded).
+    let term = PtyClient::spawn(&["attach-session", "-t", "=rlord_s1"], 100, 30);
+    wait_for("the terminal", || tmux::list_clients().len() == 1);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(window_of("rlord_s1"), (54, 20));
+    // The holder's terminal changes size: the window follows; a viewer's
+    // doesn't move it.
+    let s = ok_call(
+        &dir,
+        "web.pane_size",
+        json!({"target": "s1", "surface": "page:p1", "cols": 60, "rows": 22}),
+    );
+    assert_eq!(s, json!({"control": true}));
+    assert_eq!(window_of("rlord_s1"), (60, 22));
+    let s = ok_call(
+        &dir,
+        "web.pane_size",
+        json!({"target": "s1", "surface": "page:p2", "cols": 30, "rows": 10}),
+    );
+    assert_eq!(s, json!({"control": false}));
+    assert_eq!(window_of("rlord_s1"), (60, 22));
+    // Everyone sees who holds it.
+    let c = ok_call(&dir, "control.get", json!({"target": "s1"}));
+    assert_eq!(c["control"]["holder"], "page:p1", "{c}");
+    assert_eq!(c["control"]["cols"], 60, "{c}");
+    for c in [v1, v2, term] {
+        c.close();
+    }
+    tx(&["kill-server"]);
+}
+
+/// The terminal holding a pane unpins its window (it follows the
+/// terminal's client again) and gets its keys back: the key table the
+/// session had (here a profile's) is restored.
+#[test]
+fn the_terminal_holding_unpins() {
+    use serde_json::json;
+    let Some(_g) = setup() else { return };
+    tmux::new_session("rlord_s1", "/tmp", "cat").unwrap();
+    // (As a session with the user's profile has.)
+    tx_ok(&["set-option", "-t", "=rlord_s1:", "key-table", "mytable"]).unwrap();
+    let term = PtyClient::spawn(&["attach-session", "-t", "=rlord_s1"], 100, 30);
+    wait_for("the terminal", || tmux::list_clients().len() == 1);
+    let own = window_of("rlord_s1");
+    assert_eq!(own.0, 100);
+    let (_d, dir) = daemon(Default::default());
+    // Opened beside the terminal: the terminal's, the page a viewer.
+    let o = pane_open(&dir, "p1", 54, 20);
+    assert_eq!(o["control"], false, "{o}");
+    assert_eq!(window_of("rlord_s1"), own);
+    assert_eq!(local_opt("rlord_s1", "key-table"), "mytable");
+    let c = ok_call(&dir, "control.get", json!({"target": "s1"}));
+    assert_eq!(c["control"]["holder"], "terminal", "{c}");
+    assert_eq!(c["control"]["by"], "terminal", "{c}");
+    // The page takes over: pinned to it, the terminal's keys held.
+    let t = page_op(
+        &dir,
+        "p1",
+        "pane.take",
+        json!({"target": "s1", "cols": 54, "rows": 20}),
+    );
+    assert_eq!(t, json!({"control": true, "cols": 54, "rows": 20}));
+    assert_eq!(window_of("rlord_s1"), (54, 20));
+    assert_eq!(local_opt("rlord_s1", "key-table"), tmux::HELD_TABLE);
+    // Twice is once.
+    page_op(
+        &dir,
+        "p1",
+        "pane.take",
+        json!({"target": "s1", "cols": 54, "rows": 20}),
+    );
+    // The terminal takes it back (`rlord control take`).
+    let t = ok_call(&dir, "control.take", json!({"target": "rlord_s1"}));
+    assert_eq!(t["control"], true, "{t}");
+    wait_for("the window to follow the terminal", || {
+        window_of("rlord_s1") == own
+    });
+    assert_eq!(local_opt("rlord_s1", "key-table"), "mytable");
+    assert_eq!(local_opt("rlord_s1", "assume-paste-time"), "");
+    assert!(tmux::held_sessions().is_empty());
+    term.close();
+    tx(&["kill-server"]);
+}
+
+/// While a page holds a session, what the terminal types reaches no pane
+/// (a fast burst and C-c included: `assume-paste-time 0`); a key press
+/// says who controls it. Once the terminal takes it back, its keys reach
+/// the pane again.
+#[test]
+fn a_held_sessions_keys_reach_no_pane() {
+    use serde_json::json;
+    let Some(_g) = setup() else { return };
+    let dir_log = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("web-tmux");
+    let log = dir_log.join("held.log");
+    let _ = std::fs::remove_file(&log);
+    tmux::new_session("rlord_s1", "/tmp", &probe_cmd(&log)).unwrap();
+    wait_for("the probe", || {
+        tmux::capture_pane("rlord_s1")
+            .unwrap()
+            .contains("PROBE-READY")
+    });
+    let mut term = PtyClient::spawn(&["attach-session", "-t", "=rlord_s1"], 100, 30);
+    wait_for("the terminal", || tmux::list_clients().len() == 1);
+    let (_d, dir) = daemon(Default::default());
+    pane_open(&dir, "p1", 54, 20);
+    page_op(
+        &dir,
+        "p1",
+        "pane.take",
+        json!({"target": "s1", "cols": 54, "rows": 20}),
+    );
+    term.send(b"typed while held\r");
+    term.send(b"\x03");
+    term.send(b"x");
+    wait_for("the held line", || {
+        term.drawn().contains("Controlled by a browser on")
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        read_log(&log),
+        "",
+        "a held terminal's keys reached the pane"
+    );
+    ok_call(&dir, "control.take", json!({"target": "s1"}));
+    term.send(b"after");
+    wait_for("the terminal's keys again", || {
+        read_log(&log).contains("after")
+    });
+    assert!(!read_log(&log).contains("typed while held"));
+    term.close();
+    tx(&["kill-server"]);
+}
+
+/// The take key, bound in a held session's table beside rlord's
+/// navigation keys, runs `rlord control take <its tmux session>`.
+#[test]
+fn the_take_key_takes() {
+    use serde_json::json;
+    let Some(_g) = setup() else { return };
+    let dir_out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("web-tmux");
+    let out = dir_out.join("take.out");
+    let _ = std::fs::remove_file(&out);
+    // A stand-in for `rlord` (the test binary isn't one): it writes what
+    // it was asked.
+    let bin = dir_out.join("rlord-standin.sh");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\necho \"$@\" > {}\n",
+            tmux::shell_quote(&out.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // Safety: this test process only; the other tests don't read it.
+    std::env::set_var("RLORD_TEST_HELD_BIN", &bin);
+    tmux::new_session("rlord_s1", "/tmp", "cat").unwrap();
+    let mut term = PtyClient::spawn(&["attach-session", "-t", "=rlord_s1"], 100, 30);
+    wait_for("the terminal", || tmux::list_clients().len() == 1);
+    let (_d, dir) = daemon(Default::default());
+    pane_open(&dir, "p1", 54, 20);
+    page_op(
+        &dir,
+        "p1",
+        "pane.take",
+        json!({"target": "s1", "cols": 54, "rows": 20}),
+    );
+    // rlord's keys in the held table: navigation, the take key, `Any`.
+    let keys = tmux::bindings(tmux::HELD_TABLE);
+    let bound = |k: &str| {
+        keys.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, c)| c.clone())
+    };
+    assert!(
+        bound("M-d").is_some_and(|c| c.contains("nav home")),
+        "{keys:?}"
+    );
+    assert!(
+        bound("M-o").is_some_and(|c| c.contains("nav overlord")),
+        "{keys:?}"
+    );
+    assert!(
+        bound("M-t").is_some_and(|c| c.contains("control take")),
+        "{keys:?}"
+    );
+    assert!(
+        bound("Any").is_some_and(|c| c.contains("display-message")),
+        "{keys:?}"
+    );
+    // Option-T in the terminal.
+    term.send(b"\x1bt");
+    wait_for("the take command", || {
+        std::fs::read_to_string(&out).is_ok_and(|s| s.trim() == "control take rlord_s1")
+    });
+    std::env::remove_var("RLORD_TEST_HELD_BIN");
+    term.close();
+    tx(&["kill-server"]);
+}

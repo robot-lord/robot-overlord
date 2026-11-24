@@ -748,7 +748,12 @@ fn apply(inner: &mut Inner) {
 /// The held key table, from config: the navigation keys and the take key.
 fn bind_held() -> Result<()> {
     let cfg = rlord_core::config::Config::load().unwrap_or_default();
-    let bin = methods::rlord_bin();
+    // (A debug build's tests point the keys at a stand-in: the test
+    // binary is no `rlord`.)
+    let bin = std::env::var("RLORD_TEST_HELD_BIN")
+        .ok()
+        .filter(|_| cfg!(debug_assertions))
+        .unwrap_or_else(methods::rlord_bin);
     let mut keys: Vec<(String, String)> = cfg
         .tmux
         .bindings()
