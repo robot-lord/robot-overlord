@@ -16,6 +16,7 @@ import {
   spaced,
 } from "../phone";
 import type { AppMessage } from "../proto";
+import robot from "../assets/robot.png";
 
 export type Send = (m: AppMessage) => void;
 
@@ -126,6 +127,7 @@ export function Pairing({ phone, send }: { phone: Phone; send: Send }) {
   }
   return (
     <section class="pair">
+      <img class="pair-robot" src={robot} alt="" width={128} height={128} />
       <h1>Pair this phone</h1>
       {body}
     </section>

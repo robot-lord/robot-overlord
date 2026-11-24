@@ -245,9 +245,34 @@
   max-width: 480px;
   margin: 0 auto;
 }
+/* The first screens sit centred under the robot; the status screen
+   (also .pair) keeps its left-aligned list. */
+section.pair:has(.pair-robot) {
+  min-height: 100dvh;
+  box-sizing: border-box;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  gap: 16px;
+}
+.pair-robot {
+  width: 128px;
+  height: 128px;
+  border-radius: 28px;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.35);
+}
 .pair h1 {
-  font-size: 20px;
+  font-size: 24px;
   margin: 0;
+}
+section.pair:has(.pair-robot) .big {
+  align-self: center;
+  min-width: 200px;
+  margin-top: 8px;
+}
+section.pair:has(.pair-robot) .pair-form {
+  align-self: stretch;
+  text-align: left;
 }
 .pair p {
   margin: 0;
