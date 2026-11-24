@@ -88,12 +88,13 @@ final class PairAndAskUITests: XCTestCase {
         assertAnswered("hello from the simulator")
     }
 
-    /// The ask left the outbox: the host answered it (a pending bubble
-    /// has a Cancel button; an answered one is gone).
+    /// The ask left the outbox (a pending bubble has a Cancel button) and
+    /// the stack's fake overlord's answer shows in the chat.
     func assertAnswered(_ text: String) {
         let cancel = page().buttons["Cancel"]
         let end = Date().addingTimeInterval(30)
         while cancel.exists, Date() < end { Thread.sleep(forTimeInterval: 0.2) }
         XCTAssertFalse(cancel.exists, "the ask is still pending")
+        waitFor(shows("Fake overlord here: you said \"\(text)\""), "the overlord's answer")
     }
 }
