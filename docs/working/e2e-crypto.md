@@ -1124,3 +1124,12 @@ on real pane output (lz4 and zstd, before and after padding)
 in the relay slice. If live streams turn out to need compression, only for
 content that can't hold secrets, or with a fresh compression context per
 frame, and only after the cryptographer's review.
+
+**Measured on panes (slice 5, 2026-11-24;** `web-ui-remote.md`, "Step 9").
+A real Claude Code pane drawn for a 54x30 view: about 180 B/s idle,
+500 to 600 B/s while an answer streams or a dialog draws, about 4 KiB for
+a whole redraw. zstd -3 with a fresh context per (15 ms) frame saves 60%,
+lz4 52%; a context across frames saves 84% (zstd), which is the
+arrangement the size side channel favours. A few hundred bytes a second
+per pane: panes stay uncompressed (slice 5, decision 1), with the flag
+bit kept free for a later choice.
