@@ -132,12 +132,22 @@ describe("the phone page over the bridge", () => {
       return p.kind === "scanned" && p;
     });
     expect(scanned.relay).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$|^http:\/\/127\.0\.0\.1:\d+$/);
-    t.send({ app: "pair_continue", name: "e2e phone" });
-    const waiting = await until("the code to compare", () => {
-      const p = pairing();
-      return p.kind === "waiting" && p;
+    // The stack confirms at once, so the code may be on screen for less
+    // than one poll: every screen the signal shows is watched.
+    let code: string | null = null;
+    const unwatch = phone.pairing.subscribe((p) => {
+      if (p.kind === "waiting") code = p.code;
     });
-    expect(waiting.code).toMatch(/^\d{6}$/);
+    t.send({ app: "pair_continue", name: "e2e phone" });
+    try {
+      await until("the code to compare", () => {
+        pairing(); // a pairing that ended without success fails at once
+        return code;
+      });
+    } finally {
+      unwatch();
+    }
+    expect(code).toMatch(/^\d{6}$/);
     await until("paired", () => pairing().kind === "done");
     await until("live", () => phone.conn.value?.state === "live");
     await until("the store connected", () => store.conn.value === "open" && store.snapshot.value);

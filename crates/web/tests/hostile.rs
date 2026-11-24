@@ -119,6 +119,9 @@ async fn a_link_invented_for_a_stranger_gets_nothing() {
     assert!(r.get("ok").is_some(), "{r}");
 }
 
+/// A frame held back: its link and payload.
+type Held = (u32, Vec<u8>);
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_devices_frames_swapped() {
     let _g = LOCK.lock().await;
@@ -135,7 +138,7 @@ async fn two_devices_frames_swapped() {
     // host could drop the second link (for the first frame) before the
     // relay forwarded the second, leaving one phone waiting on a live
     // session for an answer that never comes (no answer watchdog yet).
-    let held: Arc<Mutex<Vec<(u32, Vec<u8>)>>> = Arc::default();
+    let held: Arc<Mutex<Vec<Held>>> = Arc::default();
     let (l2, s2, h2) = (links.clone(), swap.clone(), held.clone());
     w.tamper.set_filter(Box::new(move |p, dir, m| {
         if p.role != Role::Host || dir != Dir::Down {

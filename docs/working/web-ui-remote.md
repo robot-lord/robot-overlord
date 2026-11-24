@@ -1402,10 +1402,10 @@ Decided 2026-11-17 (user):
       CI's `web` job installs tmux and runs it. Run on macOS about 25
       times and on Linux (Debian, Node 26, without xtask, whose build
       needs more than Docker's 2 GB here) twice.
-    - Owed: 2 of those macOS runs, both while other builds ran beside
-      them, timed out at the pairing step; the bridge's messages were
-      lost and it didn't happen again under CPU load. The step now fails
-      at once with the pairing's reason, so the next one says why.
+    - 2 of those macOS runs timed out at pairing. Found in the finishing
+      pass: the stack confirms at once, so the six-digit screen could
+      last less than the test's 50 ms poll; the test now watches every
+      screen the pairing signal shows.
   - Steps 2 and 3 done (the engine; agent branch `slice4-engine`, merged
     here): `crates/e2e-client` (`machine`, `driver`, `outbox`, `store`,
     `link`, `soft`, `Engine`), `rlord-device` on it
@@ -1493,10 +1493,8 @@ Decided 2026-11-17 (user):
     handshake's and first snapshot's time on cellular, with real
     snapshot sizes (owed to the compression question); the phone CSS in
     WKWebView (keyboard, viewport, scrolling).
-  - `app test-e2e`: 2 of about 25 runs in the agent's worktree timed out
-    at pairing while other builds ran beside it, cause not found; the
-    step now fails at once with the pairing's reason. Its first run
-    under xtask on Linux is CI's first `web` job on this branch.
+  - `app test-e2e`'s first run under xtask on Linux is CI's first `web`
+    job on this branch (it ran on Linux by hand, without xtask).
   - The page: no DOM tests (no jsdom dependency was added); the
     pairing, status and chat views are tested through their state and
     event sequences only.
