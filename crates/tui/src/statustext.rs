@@ -54,6 +54,10 @@ pub fn legend() -> Vec<(String, &'static str)> {
         "⇄".into(),
         "Remote Control: green on, dim connecting, red failing",
     ));
+    v.push((
+        "◧".into(),
+        "a browser or a phone controls its pane: open it to take over",
+    ));
     v.push(("⚙N".into(), "N sub-agents running"));
     v.push(("⋯".into(), "still loading its sub-agent counts"));
     v
@@ -146,6 +150,24 @@ pub fn remote_parts(r: &Value) -> Option<(Style, String)> {
         ),
         _ => return None,
     })
+}
+
+/// Who controls a session's pane, when it isn't this terminal (`control`
+/// on the row: a browser or a phone holds it). None: free, or the
+/// terminal's.
+pub fn held_elsewhere(c: &Value) -> Option<String> {
+    let holder = c["holder"].as_str()?;
+    if holder == "terminal" {
+        return None;
+    }
+    let name = c["name"]
+        .as_str()
+        .filter(|n| !n.is_empty())
+        .unwrap_or("another screen");
+    let away = if c["away"] == true { " (away)" } else { "" };
+    Some(format!(
+        "controlled by {name}{away}: open the session and take it over to type in it."
+    ))
 }
 
 /// Background shells (dev servers, watchers) still running, if any:
@@ -257,6 +279,14 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
         v.push(Item {
             label: "remote",
             mark: Span::styled("⇄", style),
+            text,
+            shown: true,
+        });
+    }
+    if let Some(text) = held_elsewhere(&s["control"]) {
+        v.push(Item {
+            label: "control",
+            mark: Span::styled("◧", Style::default().fg(theme::yellow())),
             text,
             shown: true,
         });
@@ -473,6 +503,30 @@ mod tests {
         let s = json!({"status": "idle", "shown_status": "limited",
             "limit": {"until": "3pm", "reset": true}});
         assert_eq!(texts(&s, 0), ["◷ reset — its usage limit just reset."]);
+    }
+
+    /// A session a browser or phone holds is marked in the list; one the
+    /// terminal holds, or nobody, isn't.
+    #[test]
+    fn a_session_held_elsewhere_is_marked() {
+        let held = json!({"status": "idle", "control": {"holder": "device:ab12", "by": "phone",
+            "name": "pocket", "away": true, "cols": 54, "rows": 40}});
+        assert_eq!(
+            texts(&held, 0)[1],
+            "◧ — controlled by pocket (away): open the session and take it over to type in it."
+        );
+        let col: Vec<String> = column_spans(&held, false, usize::MAX)
+            .iter()
+            .map(|sp| sp.content.to_string())
+            .collect();
+        assert_eq!(col.last().map(String::as_str), Some("◧"));
+        for c in [
+            json!(null),
+            json!({"holder": "terminal", "name": "mac's terminal"}),
+        ] {
+            let s = json!({"status": "idle", "control": c});
+            assert_eq!(texts(&s, 0).len(), 1, "{s}");
+        }
     }
 
     #[test]

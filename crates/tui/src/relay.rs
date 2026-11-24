@@ -1,7 +1,7 @@
 //! The Devices screen (`:relay`): remote access through a relay. The
 //! paired devices, a pairing offer's QR code, and the device waiting for
 //! the user's confirmation (its name and code), with keys to pair, confirm,
-//! turn away and unpair. Everything goes through the daemon's `relay.*`
+//! turn away, unpair, and make a device view-only (or let it type again). Everything goes through the daemon's `relay.*`
 //! commands (crates/daemon/src/relay.rs), which ask the web plugin; the
 //! screen holds no keys and only draws the offer's string
 //! (`rlord_core::qr`).
@@ -37,6 +37,8 @@ pub(crate) enum Act {
     Confirm,
     Reject,
     Revoke(String),
+    /// Let the device type into sessions (true) or only watch (false).
+    Input(String, bool),
 }
 
 impl Devices {
@@ -112,6 +114,13 @@ impl Devices {
             KeyCode::Char('x') if self.offer.is_some() => Some(Act::CancelPair),
             KeyCode::Char('y') if self.pending().is_some() => Some(Act::Confirm),
             KeyCode::Char('n') if self.pending().is_some() => Some(Act::Reject),
+            // A view-only device watches sessions and can't type or take
+            // one over; new devices may type.
+            KeyCode::Char('v') => {
+                let d = self.devices().get(self.sel)?;
+                let id = d["id"].as_str()?.to_string();
+                Some(Act::Input(id, d["input"] == false))
+            }
             KeyCode::Char('d') | KeyCode::Delete => {
                 let d = self.devices().get(self.sel)?;
                 let id = d["id"].as_str()?.to_string();
@@ -203,6 +212,12 @@ impl Devices {
                 ),
                 Span::styled(seen, theme::muted()),
             ]);
+            if d["input"] == false {
+                line.push_span(Span::styled(
+                    "  view-only",
+                    Style::default().fg(theme::yellow()),
+                ));
+            }
             if i == self.sel {
                 line = line.style(theme::selected());
             }
@@ -222,6 +237,17 @@ impl Devices {
             keys.push("x cancel the code");
         }
         if !self.devices().is_empty() {
+            keys.push(
+                if self
+                    .devices()
+                    .get(self.sel)
+                    .is_some_and(|d| d["input"] == false)
+                {
+                    "v let it type"
+                } else {
+                    "v view-only"
+                },
+            );
             keys.push("d unpair");
         }
         keys.push("esc close");
@@ -269,7 +295,9 @@ impl App {
             Some(Act::Confirm) => ("relay.confirm", json!({})),
             Some(Act::Reject) => ("relay.reject", json!({})),
             Some(Act::Revoke(id)) => ("relay.revoke", json!({"device": id})),
+            Some(Act::Input(id, on)) => ("relay.input", json!({"device": id, "input": on})),
         };
+        let typing = params["input"] == true;
         match relay_call(method, params) {
             Ok(v) => match method {
                 "relay.pair" => s.set_offer(&v),
@@ -282,6 +310,10 @@ impl App {
                     v["device"]["name"].as_str().unwrap_or("?")
                 )),
                 "relay.reject" => s.say("turned the device away"),
+                "relay.input" if typing => s.say("it may type into sessions again"),
+                "relay.input" => {
+                    s.say("view-only: it watches sessions, and can't type or take one over")
+                }
                 _ => s.say("unpaired"),
             },
             Err(e) => s.say(format!("{e:#}")),
@@ -426,6 +458,32 @@ mod tests {
             Some(Act::Revoke("ab99000011112222".into()))
         );
         assert_eq!(s.key(key(KeyCode::Esc)), Some(Act::Close));
+    }
+
+    /// `v` makes the selected device view-only, or lets it type again; the
+    /// list says which are view-only.
+    #[test]
+    fn a_device_can_be_made_view_only() {
+        let mut st = status(Value::Null, Value::Null);
+        st["devices"][1]["input"] = json!(false);
+        let mut s = Devices::new(st);
+        assert!(!text(&s)
+            .lines()
+            .any(|l| l.contains("phone") && l.contains("view-only")));
+        assert!(text(&s).contains("v view-only"), "{}", text(&s));
+        assert_eq!(
+            s.key(key(KeyCode::Char('v'))),
+            Some(Act::Input("ab12cd34ef560789".into(), false))
+        );
+        s.key(key(KeyCode::Down));
+        assert!(text(&s)
+            .lines()
+            .any(|l| l.contains("tablet") && l.contains("view-only")));
+        assert!(text(&s).contains("v let it type"), "{}", text(&s));
+        assert_eq!(
+            s.key(key(KeyCode::Char('v'))),
+            Some(Act::Input("ab99000011112222".into(), true))
+        );
     }
 
     #[test]

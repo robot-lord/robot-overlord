@@ -17,6 +17,12 @@
 //! overlay as the key does. tmux swallows clicks outside a popup, so the
 //! status bar's hints can't be clicked while it is up; this is the mouse
 //! way out.
+//!
+//! The overlay is the terminal's screen for the overlord. While a browser
+//! or a phone controls the overlord's pane (the daemon's `control`), the
+//! overlay is a viewer: it pins nothing, draws the frame it captures as it
+//! is, says who controls it, and sends no keys but its own (close, switch,
+//! and the take key, `[tmux] take`, which takes the pane over).
 
 use std::time::{Duration, Instant};
 
@@ -38,6 +44,62 @@ use rlord_daemon::overlord;
 
 /// Frame interval: how often the overlord's pane is re-captured.
 const FRAME_MS: u64 = 40;
+
+/// How often the overlay asks who controls the overlord's pane.
+const CONTROL_EVERY: Duration = Duration::from_millis(500);
+
+/// The overlord's `control` (null: free, or the terminal's).
+fn control_now() -> serde_json::Value {
+    client_call(
+        &paths::socket_path(),
+        "control.get",
+        json!({"target": "overlord"}),
+    )
+    .map(|v| v["control"].clone())
+    .unwrap_or_default()
+}
+
+/// The viewer's line when another screen controls the pane: "Controlled
+/// by <name> · <take key> to take over". None: this terminal may type.
+fn viewer_line(c: &serde_json::Value, take: &str) -> Option<String> {
+    let holder = c["holder"].as_str()?;
+    if holder == "terminal" {
+        return None;
+    }
+    let name = c["name"]
+        .as_str()
+        .filter(|n| !n.is_empty())
+        .unwrap_or("another screen");
+    let away = if c["away"] == true { " (away)" } else { "" };
+    let take = if take.is_empty() {
+        String::new()
+    } else {
+        format!(" · {take} to take over")
+    };
+    Some(format!("Controlled by {name}{away}{take}"))
+}
+
+/// What a key does in a viewer's overlay: only its own keys work.
+#[derive(Debug, PartialEq, Eq)]
+enum ViewerKey {
+    Close,
+    Take,
+    Switch,
+    /// Not sent: the pane is another screen's.
+    Ignore,
+}
+
+fn viewer_key(keys: &OverlayKeys, k: &KeyEvent) -> ViewerKey {
+    if keys.closes(k) {
+        ViewerKey::Close
+    } else if keys.takes(k) {
+        ViewerKey::Take
+    } else if keys.switches(k) {
+        ViewerKey::Switch
+    } else {
+        ViewerKey::Ignore
+    }
+}
 
 /// `token` identifies this overlay to the daemon (it was minted when the
 /// daemon opened the popup).
@@ -85,11 +147,15 @@ fn show(terminal: &mut ratatui::DefaultTerminal, keys: &OverlayKeys) -> Result<(
             .ok()
             .and_then(|p| parse_key(&p));
         let exit = run_loop(terminal, &view, &pane, keys, prefix);
-        // Never leave the overlord in copy mode: what's sent to it next
-        // would be taken by the mode's keys.
-        let _ = tmux::cancel_mode(&pane);
-        // The window follows clients again once nobody is embedding it.
-        let _ = tmux::auto_size_window(&view.tmux);
+        // A browser or phone controls it: its mode and its size are its
+        // own, not this overlay's to undo.
+        if viewer_line(&control_now(), "").is_none() {
+            // Never leave the overlord in copy mode: what's sent to it next
+            // would be taken by the mode's keys.
+            let _ = tmux::cancel_mode(&pane);
+            // The window follows clients again once nobody is embedding it.
+            let _ = tmux::auto_size_window(&view.tmux);
+        }
         match exit? {
             Exit::Close => return Ok(()),
             Exit::Switch(agent) => {
@@ -376,7 +442,24 @@ fn run_loop(
     let mut last = Instant::now() - Duration::from_secs(1);
     // When a passing hint on the switcher goes.
     let mut hint_until: Option<Instant> = None;
+    // Another screen controls the pane: its line (this overlay is a
+    // viewer). Asked again every `CONTROL_EVERY`.
+    let take = keys.take.as_ref().map(|k| k.label()).unwrap_or_default();
+    let mut held = viewer_line(&control_now(), &take);
+    let mut held_at = Instant::now();
     loop {
+        if held_at.elapsed() >= CONTROL_EVERY {
+            held_at = Instant::now();
+            let now = viewer_line(&control_now(), &take);
+            if now != held {
+                // Back to this terminal: laid out for the popup again.
+                if now.is_none() {
+                    size = (0, 0);
+                }
+                held = now;
+                last = Instant::now() - Duration::from_secs(1);
+            }
+        }
         if hint_until.is_some_and(|t| Instant::now() >= t) {
             hint_until = None;
             // (Without the notice it replaced: that is older still.)
@@ -400,8 +483,11 @@ fn run_loop(
                 history_at_entry = None;
             }
             let top = u16::from(has_top(size.1));
-            if let Err(e) = tmux::resize_window(target, size.0, size.1 - top) {
-                error = Some(format!("{e:#}"));
+            // (A viewer pins nothing: the window is the holder's size.)
+            if held.is_none() {
+                if let Err(e) = tmux::resize_window(target, size.0, size.1 - top) {
+                    error = Some(format!("{e:#}"));
+                }
             }
             last = Instant::now() - Duration::from_secs(1);
         }
@@ -484,6 +570,13 @@ fn run_loop(
                     // Copy mode looks like the live screen at the bottom of
                     // the history: say so, with its keys.
                     let bar = match &prompt {
+                        // Another screen's pane: who has it, and the key.
+                        _ if held.is_some() => Some(ratatui::text::Line::styled(
+                            format!(" {}", held.as_deref().unwrap_or_default()),
+                            ratatui::style::Style::default()
+                                .fg(crate::theme::yellow())
+                                .bold(),
+                        )),
                         Some(p) => Some(bar_line("COPY", p.label(), String::new())),
                         None if in_mode => Some(bar_line(
                             "COPY",
@@ -513,7 +606,10 @@ fn run_loop(
                             row,
                         );
                     }
-                    if let Some((x, y)) = cursor.filter(|(x, y)| *x < a.width && *y < a.height) {
+                    if let Some((x, y)) = cursor
+                        .filter(|(x, y)| *x < a.width && *y < a.height)
+                        .filter(|_| held.is_none())
+                    {
                         f.set_cursor_position((a.x + x, a.y + y));
                     }
                 }
@@ -529,6 +625,33 @@ fn run_loop(
             ));
         }
         match ev {
+            // A viewer sends the pane nothing: only its own keys work.
+            Event::Key(k) if k.kind != KeyEventKind::Release && held.is_some() => {
+                match viewer_key(keys, &k) {
+                    ViewerKey::Close => return Ok(Exit::Close),
+                    ViewerKey::Take => {
+                        match client_call(
+                            &paths::socket_path(),
+                            "control.take",
+                            json!({"target": "overlord"}),
+                        ) {
+                            Ok(_) => {
+                                held = None;
+                                size = (0, 0);
+                                error = None;
+                            }
+                            Err(e) => error = Some(format!("{e:#}")),
+                        }
+                    }
+                    ViewerKey::Switch => {
+                        if let Some(agent) = view.bar.as_ref().and_then(SwitchBar::next) {
+                            return Ok(Exit::Switch(agent));
+                        }
+                    }
+                    ViewerKey::Ignore => {}
+                }
+                last = Instant::now() - Duration::from_secs(1);
+            }
             Event::Key(k) if k.kind != KeyEventKind::Release => {
                 // A prompt open in copy mode takes the keys.
                 if let Some(p) = prompt.as_mut() {
@@ -658,6 +781,10 @@ fn run_loop(
             // (Motion and clicks are ignored: no redraw for them.)
             Event::Mouse(m) => {
                 let r = match m.kind {
+                    // (A viewer's wheel would scroll another screen's pane.)
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if held.is_some() => {
+                        continue
+                    }
                     MouseEventKind::ScrollUp => {
                         if !in_mode {
                             history_at_entry = tmux::history_size(pane);
@@ -699,6 +826,7 @@ fn run_loop(
                 }
                 last = Instant::now() - Duration::from_secs(1);
             }
+            Event::Paste(_) if held.is_some() => {}
             Event::Paste(t) => {
                 if let Err(e) = tmux::paste(pane, &t) {
                     error = Some(format!("{e:#}"));
@@ -1077,6 +1205,9 @@ struct OverlayKeys {
     close: Option<rlord_core::keys::Key>,
     /// The next agent's overlord (`[tmux] overlord_switch`; empty: off).
     switch: Option<rlord_core::keys::Key>,
+    /// Take the overlord's pane over from a browser or a phone (`[tmux]
+    /// take`; empty: off).
+    take: Option<rlord_core::keys::Key>,
 }
 
 /// Whether a key event is the tmux key `spec` (`M-a`, `a`, `[`, `C-Space`,
@@ -1148,7 +1279,14 @@ impl OverlayKeys {
             // Off is off (the overlord's key still closes it).
             close: Key::parse(&cfg.tmux.back),
             switch: Key::parse(cfg.tmux.switch_key()),
+            take: Key::parse(&cfg.tmux.take),
         }
+    }
+
+    /// Whether this key takes the pane over (a viewer's only).
+    fn takes(&self, k: &KeyEvent) -> bool {
+        let got = crate::keyscreen::key_of(k);
+        got.is_some() && self.take == got
     }
 
     /// Whether this key switches to the next agent's overlord. (Never a
@@ -1218,6 +1356,50 @@ fn tmux_key(k: &KeyEvent) -> Option<TmuxKey> {
 
 #[cfg(test)]
 mod tests {
+
+    /// While a browser or a phone controls the overlord's pane, the overlay
+    /// is a viewer: it says who controls it and the take key, and only its
+    /// own keys work (close, take, switch); none reach the pane. Free, or
+    /// the terminal's: no line, and it types as before.
+    #[test]
+    fn the_overlay_as_viewer() {
+        use super::{viewer_key, viewer_line, OverlayKeys, ViewerKey};
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use serde_json::json;
+        let c = json!({"holder": "device:ab12", "by": "phone", "name": "pocket",
+                       "away": false, "cols": 54, "rows": 40});
+        assert_eq!(
+            viewer_line(&c, "⌥t").as_deref(),
+            Some("Controlled by pocket · ⌥t to take over")
+        );
+        let mut away = c.clone();
+        away["away"] = json!(true);
+        assert_eq!(
+            viewer_line(&away, "").as_deref(),
+            Some("Controlled by pocket (away)")
+        );
+        assert_eq!(viewer_line(&json!(null), "⌥t"), None);
+        assert_eq!(
+            viewer_line(
+                &json!({"holder": "terminal", "name": "mac's terminal"}),
+                "⌥t"
+            ),
+            None
+        );
+        let keys = OverlayKeys::from_config(&rlord_core::config::Config::default());
+        let alt = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        assert_eq!(viewer_key(&keys, &alt('t')), ViewerKey::Take);
+        assert_eq!(viewer_key(&keys, &alt('o')), ViewerKey::Close);
+        assert_eq!(viewer_key(&keys, &alt('d')), ViewerKey::Close);
+        assert_eq!(viewer_key(&keys, &alt('s')), ViewerKey::Switch);
+        for k in [
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(viewer_key(&keys, &k), ViewerKey::Ignore, "{k:?}");
+        }
+    }
 
     /// The switcher: every agent on the row, clickable where it is drawn;
     /// the key goes round them.

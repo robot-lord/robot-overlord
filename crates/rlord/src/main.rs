@@ -453,6 +453,12 @@ enum Command {
         #[command(subcommand)]
         cmd: relay_cmd::RelayCmd,
     },
+    /// Which screen controls a session's pane (this terminal, a browser, a
+    /// phone)
+    Control {
+        #[command(subcommand)]
+        cmd: ControlCmd,
+    },
     /// A session's own read-only look-ups, for its agent: `rlord context
     /// help` lists them; `rlord context <tool> key=value…` calls one.
     Context {
@@ -579,6 +585,17 @@ enum NavCmd {
     /// session (the mastermind): the overlord is one session now
     #[command(hide = true)]
     Mastermind,
+}
+
+#[derive(Subcommand)]
+enum ControlCmd {
+    /// Take over a session a browser or a phone controls: its window
+    /// follows this terminal again, and your keys reach it (the take key,
+    /// `[tmux] take`, runs this in the session)
+    Take {
+        /// The session (id, name, or its tmux session; `overlord`)
+        session: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -745,6 +762,22 @@ fn main() -> Result<()> {
         Command::Overlay { token } => rlord_tui::run_overlay(token),
         Command::Web { cmd } => web_cmd(cmd),
         Command::Relay { cmd } => relay_cmd::run(cmd, call),
+        Command::Control {
+            cmd: ControlCmd::Take { session },
+        } => {
+            let r = call("control.take", json!({"target": session}));
+            // From the take key (tmux's run-shell, no terminal of its
+            // own): said on the status line, never printed into the pane.
+            if tmux::inside_rlord() && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                if let Err(e) = r {
+                    let _ = tmux::display_message(&format!("rlord: {e:#}"));
+                }
+                return Ok(());
+            }
+            r?;
+            println!("this terminal controls {session} now");
+            Ok(())
+        }
         Command::Overlord(OverlordCmd::Open) => {
             if tmux::inside_rlord() {
                 nav_overlord()

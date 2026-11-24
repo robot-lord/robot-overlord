@@ -1172,8 +1172,10 @@ mod tests {
 
     #[test]
     fn take_swaps_the_holder() {
-        let mut c = Control::default();
-        c.key = "⌥t".into();
+        let mut c = Control {
+            key: "⌥t".into(),
+            ..Default::default()
+        };
         c.open("s1", "t1", false, &page("p1"), 80, 24, false, 0);
         c.open("s1", "t1", false, &phone("a", true), 50, 30, false, 1);
         // At the size it opened at, or a new one.
