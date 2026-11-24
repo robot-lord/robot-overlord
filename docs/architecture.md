@@ -1153,8 +1153,9 @@ never parses it, and its `usage` picks the usage measure; `rev` is `<boot id>-<c
 `rev` gets `{"unchanged": true}`. `web.subscribe` pushes `changed` at
 most every 100 ms, with `"relay": true` when all it folds in is the
 plugin's own relay status (`changed_relay`): the plugin wakes no device
-for that. `web.pane_target` names a pane's tmux session and
-starts nothing. Adding an op: put it on `OPS` with its arguments, add it to
+for that. `web.pane_open`, `web.pane_size` and `web.pane_closed` open a
+pane for a surface (resolving its tmux session; starting nothing) and
+keep who controls it ("Control", below). Adding an op: put it on `OPS` with its arguments, add it to
 `OPS` in `crates/web/ui/src/proto.ts` (a test holds the two lists
 together), and test it in `crates/daemon/tests/web_api.rs`.
 
@@ -1186,9 +1187,33 @@ it elsewhere. The plugin sweeps leftover views at start
 `list_clients` drops view clients, `kill_session` kills a target's views
 first, and `send::user_active` and the overlord's idle check count a
 browser through tmux's own client activity. Opening a pane never starts
-anything (a stopped session shows Resume). The window takes the size of
-the latest active client (`window-size latest`); the page keeps a pane
-open only while its view is visible.
+anything (a stopped session shows Resume). View clients attach with
+`ignore-size`: no browser or phone sizes a window by itself. The page
+keeps a pane open only while its view is visible.
+
+**Control: one screen holds a pane** (`crates/daemon/src/control.rs`).
+Each running session's pane has at most one holder: `terminal` (rlord's
+TUI and its tmux client, the overlord overlay included), `page:<id>` (a
+local page) or `device:<id>` (a paired phone). Only the holder's keys
+reach the pane and the window is laid out for it; every other screen
+showing it is a viewer, with "Controlled by <name>" and Take over (one
+tap or key, `pane.take`, `rlord control take <session>`, the take key
+`[tmux] take`). The daemon keeps this in memory (a restart forgets it)
+and enforces it in tmux: a page or phone holder's size is pinned
+(`resize_window`); a terminal holder unpins (its client sizes the
+window); a free pane keeps its size. While another screen holds a
+session, its `key-table` is `rlord-held` (rlord's navigation keys, the
+take key, `Any` showing the line) with `assume-paste-time 0`, so a
+terminal's typed keys reach no pane; a bracketed paste from that
+terminal still does (tmux forwards pastes past key tables). Pages and
+phones are held back by the plugin, which passes input on only for the
+holder (the `{"notify":"control"}` line on `web.subscribe`) and draws
+viewers at the holder's size. A free pane goes to the screen that opens
+it (not a view-only device); a holder that leaves keeps control 30 s
+(away), then it passes to the terminal if it shows the pane, else the
+screen used last (`ui::target`'s order), else the pane is free. Every
+session in the snapshot carries `control` (`null` or `{holder, by,
+name, away, cols, rows}`). The overlord sees none of it.
 
 **The page** (`crates/web/ui/`): TypeScript, Preact with signals and
 xterm.js 6, built by Vite into `dist/`, which `crates/web/build.rs` embeds
@@ -1309,8 +1334,8 @@ keying `Noise_KKpsk2`, all `25519_ChaChaPoly_SHA256` with an ML-KEM-768
 step mixed in through the PSK slot (post-quantum forward secrecy). The
 device always initiates; the host treats a handshake as a session only
 once the device's first frame decrypts, and any decrypt failure ends the
-session. A live session carries streams (0 is control; panes later),
-fragmented up to 1 MiB. The mailbox (for `overlord.ask` and
+session. A live session carries streams (0 is control, fragmented up to
+1 MiB; 1 to 250 are panes, a frame each). The mailbox (for
 `overlord.new_session` while the host is away) is its own saveable
 cipher state over the kind-3 handshake's raw keys, rekeyed after every
 message; its receiver skips up to 64 lost messages (counters only move
@@ -1340,6 +1365,29 @@ the remote ones for the plugin. Don't switch to explicit nonces to make
 sessions survive a lost frame: the reconnect is cheap and the rule keeps
 both ends simple.
 
+**Panes on a device** (`crates/web/src/remote/panes.rs`;
+`docs/working/e2e-protocol.md`, "Panes"). `pane.open` (an op, so the
+daemon's allow-list decides it and applies control) attaches a view
+client and runs a task per stream; bytes go both ways as pane frames,
+`resize`, `ack` and `close` are events, and the host says `closed`. The
+host sends on a stream only under the device's credit (64 KiB and 48
+frames unacknowledged; the page acknowledges what xterm.js has parsed),
+only while the link's queue is under 32 KiB (`outq::LOW_MARK`: frames
+are encrypted when queued, so this is what keeps an answer from waiting
+behind a busy pane), and no faster than 64 KiB/s per pane. **A view
+client is never left unread**: tmux stops discarding for a client whose
+last redraw isn't written yet, so an unread one makes the tmux server
+buffer a flood whole. The task keeps reading into a hold of at most 256
+KiB while it may not send; past that it drops the hold, ends the client,
+and when it may send again attaches a fresh one behind `CAN ESC c`
+(only unsent bytes go; the device gets one whole redraw). Reads after 15
+ms of quiet go at once, else they gather for 15 ms. A pane lives in one
+session: a reconnect reopens it (tmux draws the whole screen for the new
+client). 2 panes per device, 8 remote in all. A view-only device (`rlord
+relay input <device> off`, the Devices screens; never an MCP tool or a
+remote op) gets read-only clients and never holds a pane. The audit log
+names opens, takes, the first input and closes, never bytes.
+
 **Pairing is user-only and confirmed.** `rlord relay pair` (or the TUI's
 Devices screen, or the local page's) shows a QR: the pin, a one-use
 rendezvous id, the host's static key and a pairing secret, valid 300 s
@@ -1359,10 +1407,10 @@ make an op remote, set `remote: true` on its `Op` and test it from a
 device in `web_api.rs`; an op is local-only unless a device needs it.
 Mark it `.idempotent()` only if running it twice is the same as once (a
 look-up); anything else is deduplicated by request id.
-`overlord.messages` and `session.messages {ref}` (both) give the active
-overlord's or a session's recent conversation as text, read from its
-transcript (at most 50 messages of 4 KiB), for a chat view and a
-session's view without a pane. A device's `hello` carries `api`, the
+`session.messages {ref}` gives a session's recent conversation (the
+overlord's too, by its id) as text, read from its transcript (at most 50
+messages of 4 KiB), for the phone's Transcript tab. `overlord.ask` is
+the local page's only: a phone types into the overlord's pane. A device's `hello` carries `api`, the
 remote API level (`web::API`, from `web.hello`'s answer): the ops, the
 snapshot and the `ui` commands as a device sees them. Within a level
 they only grow; `web_api.rs` pins the remote ops and snapshot keys
@@ -1441,7 +1489,13 @@ is still to come and needs nothing new from the engine or the page.
   build --app`, `dist-app/`): the same store and views behind
   `RemoteTransport`, which posts to the shell
   (`webkit.messageHandlers.rlord`) and is answered through
-  `window.__rlord_recv`. The WebView loads it from the bundle through a
+  `window.__rlord_recv`. Its terminal is xterm.js with the WebGL
+  renderer only (a lost context gets a new addon; the CSP stays
+  `style-src 'self'`, which refuses only xterm.js's `<style>` elements,
+  unused by WebGL): every session and the overlord are reached through
+  their pane (`remotePane.ts`'s `RemotePaneLink`, `term.ts`), with a key
+  row, a compose line sent as one paste, Take over, and a Transcript tab
+  (`session.messages`). The WebView loads it from the bundle through a
   scheme handler (`rlord-app://page/`) under `connect-src 'none'` and
   Trusted Types, with a content rule list that blocks every other URL:
   the page can't reach the network at all. The engine's relay link is
@@ -1452,9 +1506,15 @@ is still to come and needs nothing new from the engine or the page.
 a local page, and `app` messages (`ready`, which replays `conn`,
 `pairing`, `outbox` and the last `hello` so a reload restores
 everything; `pair_continue`, `pair_cancel`, `unpair`, `cancel`,
-`status`). The shell answers `scan` and `settings` itself. Engine to
+`status`), and `pane` messages (`input` with base64 bytes, `resize`,
+`ack`, `close`). The shell answers `scan`, `settings`, `paste` (the
+pasteboard's text, read only then) and `copy` itself; its web view's
+content view has no accessory bar and no smart punctuation. Engine to
 page: answers by id and events (`conn` with its state, `pairing`,
-`outbox`, `hello`, `changed`, `ui`, `status`). A page feature that a
+`outbox`, `hello`, `changed`, `ui`, `status`, `pane` with `data` or
+`closed`; `closed` `link` for every open stream when a session ends).
+The engine pings at once when input got no answer for 5 s and redials
+5 s later. A page feature that a
 phone should have is an op with `remote: true` (Remote access, above)
 and, when the page draws it, a `caps` check in `transport.ts`; nothing in
 the engine or the shell changes for it. The page reads `api` from the
@@ -1465,7 +1525,7 @@ level it doesn't speak.
 app's own folder, out of backups, sealed by the vault (an enclave key,
 `AfterFirstUnlockThisDeviceOnly`): the device's X25519 key, the host's
 public key, the pin, the mailbox state, the outbox (at most 16 entries;
-an ask waits up to 24 hours) and the last `rev`. The relay key never
+a described new session waits up to 24 hours) and the last `rev`. The relay key never
 leaves the enclave. Nothing of the host's but its public key and the
 pin. A debug build on a Mac without an enclave falls back to software
 keys; a release build refuses to start.
@@ -1496,7 +1556,11 @@ agents' names on its PATH are the example too, so no real agent runs).
 `cargo xtask app test-e2e` runs the page's own store and
 `RemoteTransport` in Node over it (CI's `web` job); `cargo xtask app
 test-ios` drives the simulator against it (pair, list, background and
-back, relay restart, an ask answered) through its control folder.
+back, relay restart, typing into the overlord's pane) through its
+control folder. `cargo xtask app test-term` runs the real Claude Code
+(pinned, on the fake model) in a demo rlord behind the real relay and
+the engine, and reads it through `RemotePaneLink` into a headless
+xterm.js (CI's `web` job too).
 
 ## rlord's private tmux server (2026-11-10)
 

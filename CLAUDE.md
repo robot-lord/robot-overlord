@@ -278,6 +278,11 @@ get handled without the user looking. For each one:
   `remote` flag: may a paired device call it?) and in
   `crates/web/ui/src/proto.ts`, with a test. Read "Web UI" in
   docs/architecture.md before changing either side.
+- The phone page has a terminal: sessions and the overlord are reached
+  through their pane (`pane.open`, a stream of the device's session),
+  and only the screen that holds a pane types into it (control, in
+  `crates/daemon/src/control.rs`). Read "Control" and "Panes on a
+  device" in docs/architecture.md before changing either.
 - The phone app (`apps/ios`, on the dark feature branch) has one network
   path: the device engine's relay link (`crates/e2e-client`). Its page
   has `connect-src 'none'`, and `cargo xtask check-deps` fails if `apps/`

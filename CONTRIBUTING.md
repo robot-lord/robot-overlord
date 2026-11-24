@@ -77,6 +77,7 @@ cargo xtask app test-ios            # XCTest, then the XCUITest against a loopba
 cargo xtask app test-ios --unit     # XCTest only
 cargo xtask app dev                 # the phone page in a desktop browser, over rlord-device bridge
 cargo xtask app test-e2e            # the page's store and RemoteTransport over the bridge (no simulator; CI)
+cargo xtask app test-term           # the real Claude Code's terminal through the pane link, headless (CI)
 cargo xtask app bindings            # regenerate the Swift bindings (the build tasks do this)
 ```
 
@@ -171,7 +172,12 @@ DIR` (which the demo runs) sets it up:
   straight at its prompt; a new dialog needs another flag.
 
 Drive it like any rlord session (`tmux -L <socket> send-keys`, the list,
-the web page) and `tail -f DIR/fake-model.log` to watch the requests.
+the web page, `rlord-device pane <session> --state DIR` through a paired
+relay) and `tail -f DIR/fake-model.log` to watch the requests.
+`RLORD_FAKE_MODEL_DELAY_MS` slows its stream (`app test-term` uses it to
+interrupt an answer). `cargo xtask app test-term` starts such a demo by
+itself (its own tmux socket and web port, under `/tmp/rlord-term-<pid>`),
+with the relay and the engine, and fails on a `BLOCKED` line.
 
 The website's phone screenshots (`public/img/phone-*.webp` in
 robot-lord/website) come from the same demo:

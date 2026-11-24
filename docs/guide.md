@@ -838,8 +838,8 @@ device_expiry_days = 90  # 0: devices never expire
 ## The phone app
 
 An iPhone app that pairs with this machine through your relay and shows
-the session list, the overlord's chat and each session's recent
-conversation. **It isn't released yet:** it lives on a development branch
+the session list, and every session's (and the overlord's) live
+terminal. **It isn't released yet:** it lives on a development branch
 and you build and install it yourself (below). Android comes later.
 
 What it does:
@@ -848,13 +848,29 @@ What it does:
   in the app, name the phone, then check that both show the same six
   digits and confirm on the Mac (`rlord relay confirm`). The app
   remembers one computer.
-- **Use:** the list, the overlord chat (a message typed while the
-  computer is unreachable waits, visibly, and is sent when it's back; the
-  app gives up after 24 hours), a session's notes and its recent
-  messages (read only: answer a session through the overlord; the live
-  terminal isn't available remotely yet), and the forms the overlord
-  opens. The overlord can open a form on the phone when it's the screen
+- **Use:** the list, and for the overlord (its button in the header, or
+  the list's first row) and each session three tabs: *Terminal* (the
+  live pane: type with the keyboard; the key row has Esc, Tab, ⇧Tab,
+  sticky Ctrl and Alt, the arrows, Enter, ^C, Paste, Copy screen, text
+  size and the compose line, an ordinary text field with autocorrect and
+  dictation sent as one paste; drag to scroll back when `[tmux] mouse`
+  is on), *Transcript* (the recent conversation, to read and copy) and
+  *Details*. A new session described while the computer is unreachable
+  waits, visibly, and is sent when it's back (the app gives up after 24
+  hours); the forms the overlord opens show up too. The overlord can open a form on the phone when it's the screen
   you used last; the code-folder form and the key screen never go there.
+- **Controlled by:** one screen holds a pane at a time: this
+  computer's terminal, a browser, or a phone. The others show
+  "Controlled by <name>" and **Take over**, which lays the agent out for
+  the screen that took it (a tap on the phone or in a browser; ⌥t, the
+  `[tmux] take` key, in the terminal, or `rlord control take
+  <session>`). A screen that leaves keeps control 30 s, then it passes
+  to this computer's terminal if it shows the pane. While another screen
+  holds a session, this computer's terminal shows the line and its keys
+  don't reach the pane (a paste still does).
+- **View only:** `rlord relay input <device> off` (or `v` on the TUI's
+  Devices screen, or the local page's Devices) makes a phone a viewer
+  only: no keyboard, no Take over. Back with `on`.
 - **Recover:** it reconnects by itself after a lost network, a change
   from wifi to cellular, the relay or the computer restarting, or coming
   back to the front. The status screen (`⋯`) says what it's waiting for.

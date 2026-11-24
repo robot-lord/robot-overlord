@@ -49,7 +49,13 @@ and the relay's pin. Its page has no network access (`connect-src
 engine's to the pinned relay, with public certificates only. No third
 party is involved: no push service, no analytics. Someone holding the
 unlocked phone, inside the app lock's 5 minutes, can do what the phone
-can; revoke a lost phone on the host (`rlord relay revoke`). Reports in
+can: a paired phone types into any running session's terminal (and the
+overlord's), which is running code on your computer as you. Make a
+device view only on the host (`rlord relay input <device> off`), and
+revoke a lost phone there (`rlord relay revoke`), which ends its live
+terminals at once. The host's audit log (`remote.log`) names each
+terminal opened, taken over, first typed into and closed, never what was
+typed or shown. Reports in
 scope: the page reaching the network, another app or site driving the
 app, the app trusting a relay other than its pin, or key material leaving
 the enclave.
