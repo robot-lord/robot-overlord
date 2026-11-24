@@ -4636,3 +4636,31 @@ and 8. Steps 12 and 13 can move to a later PR.
 5–16. The recommended defaults.
 
 `xcode-select` now points at Xcode (the user ran `sudo xcode-select -s`).
+
+## Slice 5: live terminals on the phone (decided, not planned yet)
+
+User, 2026-11-24, after the first real-iPhone run (paired through the
+Tailscale Serve dev relay, CONTRIBUTING.md): the phone's core job is
+good communication with the terminals, the overlord's included.
+
+- The phone talks to every session through its tmux pane, as the
+  terminal app and the desktop page do: live panes over the relay (today
+  streams 1 and up close the link), a terminal view with the keyboard and
+  a row of special keys.
+- The overlord stays special on the phone and the desktop (its own
+  place, its prominence), but on the phone it is reached through its pane
+  too. The phone's separate message path to it (the chat view over
+  `overlord.ask` / `overlord.messages`) is removed; a removal from the
+  remote API bumps `web::API`. The desktop page's overlord is unchanged.
+- The read-only transcript view (`session.messages`) is what the phone
+  shows today instead of a pane; whether it stays (as an offline or
+  slow-link fallback) is a planning question.
+- Slice 4 merges first, as built; slice 5 is its own PR.
+
+Found on the real phone, fixed on `feat/web-ui-4`: the first device
+install needs `-allowProvisioningDeviceRegistration`; the pairing screen
+restyled (robot, centred); the web view's own scroll view rubber-banded
+the whole app past a list's end. The demo gotcha: a `rlord-demo` tmux
+server left by an older demo keeps that demo's environment, so a new
+demo's stand-ins write transcripts into the old folder (stop old demos
+with `scripts/demo/demo.sh --stop DIR` first).
