@@ -120,8 +120,11 @@ final class PageAssetsTests: XCTestCase {
 
 @MainActor
 final class BridgeTests: XCTestCase {
-    func testTheShellServesOnlyScanAndSettings() {
+    func testTheShellServesOnlyScanSettingsAndTheClipboard() {
         XCTAssertEqual(Shell.shellMessage(#"{"app":"scan"}"#), .scan)
+        XCTAssertEqual(Shell.shellMessage(#"{"app":"paste"}"#), .paste)
+        XCTAssertEqual(Shell.shellMessage(#"{"app":"copy","text":"a b"}"#), .copy("a b"))
+        XCTAssertNil(Shell.shellMessage(#"{"app":"copy"}"#))
         XCTAssertEqual(
             Shell.shellMessage(#"{"app":"settings","app_lock":false}"#),
             .settings(appLock: false, notifications: nil))
@@ -131,6 +134,22 @@ final class BridgeTests: XCTestCase {
         XCTAssertNil(Shell.shellMessage(#"{"app":"unpair"}"#))
         XCTAssertNil(Shell.shellMessage(#"{"id":1,"op":"snapshot","args":{}}"#))
         XCTAssertNil(Shell.shellMessage("not json"))
+    }
+
+    /// The terminal's text input: no accessory bar, no smart punctuation.
+    func testTheTerminalsInputHasNoAccessoryBarOrSmartPunctuation() throws {
+        let web = WebController()
+        let content = try XCTUnwrap(TerminalInput.contentView(of: web.webView))
+        XCTAssertTrue(NSStringFromClass(type(of: content)).hasSuffix(TerminalInput.suffix))
+        XCTAssertNil(content.inputAccessoryView)
+        let traits = try XCTUnwrap(content as? UITextInputTraits)
+        XCTAssertEqual(traits.smartQuotesType, UITextSmartQuotesType.no)
+        XCTAssertEqual(traits.smartDashesType, UITextSmartDashesType.no)
+        // A second web view reuses the class.
+        let other = WebController()
+        XCTAssertEqual(
+            NSStringFromClass(type(of: try XCTUnwrap(TerminalInput.contentView(of: other.webView)))),
+            NSStringFromClass(type(of: content)))
     }
 
     func testNavigationFirstLoadAndSameDocumentOnly() {

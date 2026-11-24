@@ -149,6 +149,12 @@ final class Shell: ObservableObject {
         case .settings(let appLock, let notifications):
             if let appLock { UserDefaults.standard.set(appLock, forKey: Setting.appLock) }
             if let notifications { setNotifications(notifications) } else { sendSettings() }
+        case .paste:
+            // Read only when the page asks (its Paste key); iOS shows its
+            // own paste notice.
+            sendEvent(["event": "paste", "text": UIPasteboard.general.string ?? ""])
+        case .copy(let text):
+            UIPasteboard.general.string = text
         case nil:
             engine?.pageMessage(json: text)
         }
@@ -157,6 +163,10 @@ final class Shell: ObservableObject {
     enum ShellMessage: Equatable {
         case scan
         case settings(appLock: Bool?, notifications: Bool?)
+        /// The terminal's Paste key: the pasteboard's text, to the page.
+        case paste
+        /// "Copy screen": the page's text, to the pasteboard.
+        case copy(String)
     }
 
     /// The page messages the shell serves itself; nil for the engine's.
@@ -169,7 +179,15 @@ final class Shell: ObservableObject {
         case "scan": return .scan
         case "settings":
             return .settings(appLock: obj["app_lock"] as? Bool, notifications: obj["notifications"] as? Bool)
+        case "paste": return .paste
+        case "copy": return (obj["text"] as? String).map { .copy($0) }
         default: return nil
+        }
+    }
+
+    private func sendEvent(_ obj: [String: Any]) {
+        if let data = try? JSONSerialization.data(withJSONObject: obj), let s = String(data: data, encoding: .utf8) {
+            web.send(s)
         }
     }
 

@@ -6,6 +6,7 @@
 // detectors or media). The page has no network path: the engine's relay
 // link is the app's only one.
 
+import ObjectiveC
 import SwiftUI
 import WebKit
 
@@ -156,6 +157,7 @@ final class WebController: NSObject, WKNavigationDelegate, WKScriptMessageHandle
         #if DEBUG
         webView.isInspectable = true
         #endif
+        TerminalInput.apply(to: webView)
     }
 
     /// Compile the content rules, then load the page.
@@ -244,6 +246,47 @@ final class WebController: NSObject, WKNavigationDelegate, WKScriptMessageHandle
         _ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
         for action: WKNavigationAction, windowFeatures: WKWindowFeatures
     ) -> WKWebView? { nil }
+}
+
+/// The terminal types into xterm.js's hidden text area: the web view's
+/// accessory bar (previous, next, Done) is removed, and smart quotes,
+/// dashes and insert-delete are off, so what the keyboard sends is what
+/// the pane gets. Done by giving the web view's content view (WebKit's
+/// private `WKContentView`, the first responder for text input) a subclass
+/// of rlord's with those few getters; nothing else changes.
+enum TerminalInput {
+    static let suffix = "_rlordTerminal"
+
+    static func contentView(of webView: WKWebView) -> UIView? {
+        webView.scrollView.subviews.first { NSStringFromClass(type(of: $0)).hasPrefix("WKContent") }
+    }
+
+    static func apply(to webView: WKWebView) {
+        guard let content = contentView(of: webView) else { return }
+        let base: AnyClass = type(of: content)
+        let baseName = NSStringFromClass(base)
+        if baseName.hasSuffix(suffix) { return }
+        let name = baseName + suffix
+        let cls: AnyClass
+        if let existing = NSClassFromString(name) {
+            cls = existing
+        } else {
+            guard let made = objc_allocateClassPair(base, name, 0) else { return }
+            let noView: @convention(block) (AnyObject) -> AnyObject? = { _ in nil }
+            class_addMethod(
+                made, NSSelectorFromString("inputAccessoryView"),
+                imp_implementationWithBlock(noView), "@@:")
+            // UITextSmartQuotesType.no, UITextSmartDashesType.no and
+            // UITextSmartInsertDeleteType.no are all 1.
+            let no: @convention(block) (AnyObject) -> Int = { _ in 1 }
+            for getter in ["smartQuotesType", "smartDashesType", "smartInsertDeleteType"] {
+                class_addMethod(made, NSSelectorFromString(getter), imp_implementationWithBlock(no), "q@:")
+            }
+            objc_registerClassPair(made)
+            cls = made
+        }
+        object_setClass(content, cls)
+    }
 }
 
 /// The WebView in SwiftUI.
