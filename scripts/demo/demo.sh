@@ -6,13 +6,17 @@
 # (scripts/demo/bin) that draw a screen and report state as the real ones
 # would (rlord's hooks; OpenCode: its session database), with no model.
 #
-#   scripts/demo/demo.sh [--web] [DIR]  # set up (DIR default: a new temp dir)
+#   scripts/demo/demo.sh [--web] [--real-claude] [DIR]  # set up (DIR default: a new temp dir)
 #   source DIR/env.sh && rlord          # look around
 #   source DIR/env.sh && rlord web      # with --web: the web UI
 #   scripts/demo/demo.sh --stop DIR
 #
 # --web also builds the web page and the rlord-web plugin and puts the
 # plugin beside the demo's rlord (unverified, as a checkout's build runs it).
+# --real-claude runs the real Claude Code CLI (a pinned version) in place
+# of the stand-in claude, on a fake model server on 127.0.0.1 (`cargo xtask
+# demo-claude`: no model calls, nothing leaves the machine); its log is
+# DIR/fake-model.log. Codex and OpenCode stay stand-ins.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -24,14 +28,24 @@ if [[ ${1:-} == --stop ]]; then
   rlord tmux unbind >/dev/null 2>&1 || true
   tmux -L "$RLORD_TMUX_SOCKET" kill-server 2>/dev/null || true
   pkill -f "$d/bin/rlord daemon" 2>/dev/null || true
+  # --real-claude's fake model (started by `cargo xtask demo-claude`).
+  if [[ -f $d/fake-model.pid ]]; then
+    pid=$(cat "$d/fake-model.pid")
+    if ps -p "$pid" -o command= 2>/dev/null | grep -q fake-model; then kill "$pid"; fi
+    rm -f "$d/fake-model.pid"
+  fi
   exit 0
 fi
 
-web=
-if [[ ${1:-} == --web ]]; then
-  web=1
+web='' real_claude=''
+while [[ ${1:-} == --* ]]; do
+  case $1 in
+    --web) web=1 ;;
+    --real-claude) real_claude=1 ;;
+    *) echo "unknown option $1" >&2; exit 2 ;;
+  esac
   shift
-fi
+done
 
 d=${1:-$(mktemp -d "${TMPDIR:-/tmp}/rlord-demo.XXXXXX")}
 mkdir -p "$d"/{data,config/robot-overlord,run,state,claude,codex,bin,src,screens,states,summaries,usage}
@@ -53,7 +67,13 @@ fi
 # tmux by itself (not its whole folder, which may hold a real agent): the
 # stand-in login shell below runs rlord's own panes, the list included.
 ln -sf "$(command -v tmux)" "$d/bin/tmux"
-cp "$here/bin/claude" "$here/bin/codex" "$here/bin/opencode" "$d/bin/"
+cp "$here/bin/codex" "$here/bin/opencode" "$d/bin/"
+if [[ -z $real_claude ]]; then
+  cp "$here/bin/claude" "$d/bin/"
+else
+  # The real Claude Code, on the fake model (writes $d/bin/claude).
+  (cd "$root" && cargo xtask demo-claude "$d")
+fi
 # A stand-in login shell that sees only the demo's programs: rlord asks the
 # login shell where an agent is when its PATH doesn't have it, and the
 # demo must never find (and launch) a real agent that way.
@@ -85,6 +105,8 @@ list_width_pct = 62
 model = "opus"
 effort = "medium"
 EOF
+# The real Claude Code reports its state through rlord's hooks.
+if [[ -n $real_claude ]]; then rlord claude install-hooks >/dev/null; fi
 
 B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' Y=$'\e[33m' M=$'\e[35m'
 # DEMO_COLS: how wide the stand-in agents draw their input box (`cargo
@@ -293,6 +315,8 @@ oid=$(sql "select id from sessions where role='overlord'")
 cur=$(sql "select agent_session from sessions where role='overlord'")
 if [[ -n ${src:-} && -n $oid && -n $cur ]]; then
   tdir=$(dirname "$src")
+  # (The real Claude Code makes it only once its conversation starts.)
+  mkdir -p "$tdir"
   past() { # minutes_ago turns first_prompt reply
     local id
     id=$(python3 -c 'import uuid; print(uuid.uuid4())')
@@ -318,5 +342,6 @@ fi
 echo "demo ready in $d"
 echo "  source $d/env.sh && rlord"
 if [[ -n $web ]]; then echo "  source $d/env.sh && rlord web    # or: rlord web url"; fi
+if [[ -n $real_claude ]]; then echo "  tail -f $d/fake-model.log    # every request Claude Code makes"; fi
 echo "  scripts/demo/screenshots.sh $d    # images into docs/images"
 echo "  scripts/demo/demo.sh --stop $d"

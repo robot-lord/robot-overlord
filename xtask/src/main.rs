@@ -13,9 +13,11 @@ mod build;
 mod bump;
 mod check_deps;
 mod cmd;
+mod demo_claude;
 mod demo_wrap;
 mod dev_daemon;
 mod e2e;
+mod fake_model;
 mod fresh_install;
 mod preflight;
 mod publish;
@@ -71,6 +73,10 @@ usage: cargo xtask <task>
       phone-sized screenshots of the demo into the website's public/img
   demo-wrap COLS
       wrap the demo's stand-in screens (stdin) to COLS columns
+  fake-model [--port N] [--delay-ms MS] [--dump DIR]
+      a stand-in Anthropic Messages API on 127.0.0.1 (no model), for the demo
+  demo-claude DIR
+      the real Claude Code (pinned) on the fake model, in demo DIR (demo.sh --real-claude)
   dev-daemon
       rebuild, then restart the daemon on the new binary";
 
@@ -122,6 +128,8 @@ fn main() -> ExitCode {
         "screenshots" => screenshots::main(rest, &invoked_from),
         "fresh-install" => fresh_install::main(rest, &invoked_from),
         "demo-wrap" => demo_wrap::main(rest),
+        "fake-model" => fake_model::main(rest),
+        "demo-claude" => demo_claude::main(rest, &invoked_from),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
