@@ -66,7 +66,7 @@ jobs:
       - run: cargo xtask e2e test-wasm
       - run: cargo xtask web build
       # The phone app's page, and its checks: every file local, no
-      # network, its CSP, no xterm.js and no LocalTransport.
+      # network, its CSP, xterm.js (its terminal) and no LocalTransport.
       - run: cargo xtask web build --app
       # The phone page end to end without a phone: its store and
       # RemoteTransport in Node, over `rlord-device bridge` (the app's
@@ -74,6 +74,15 @@ jobs:
       # overlord in a scratch tmux server. No simulator, no Xcode.
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: cargo xtask app test-e2e
+      # The real Claude Code's terminal through the phone's pane link: a
+      # demo on rlord's fake model (no model is called), the relay, the
+      # engine, a headless xterm.js. The pinned CLI comes from npm once
+      # per version (cached).
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/demo-claude
+          key: demo-claude-${{ hashFiles('xtask/src/demo_claude.rs') }}
+      - run: cargo xtask app test-term
       - run: cargo test -p robot-overlord-web
         env:
           RLORD_WEB_REQUIRE_ASSETS: "1"
