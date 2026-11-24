@@ -193,10 +193,15 @@ final class Shell: ObservableObject {
 
     func sendSettings() {
         let d = UserDefaults.standard
-        let obj: [String: Any] = [
+        var obj: [String: Any] = [
             "event": "settings", "app_lock": d.bool(forKey: Setting.appLock),
             "notifications": d.bool(forKey: Setting.notifications), "platform": "ios",
         ]
+        #if DEBUG
+        // The page mirrors a terminal's text into a hidden element, for
+        // the UI tests.
+        obj["debug"] = true
+        #endif
         if let data = try? JSONSerialization.data(withJSONObject: obj), let s = String(data: data, encoding: .utf8) {
             web.send(s)
         }

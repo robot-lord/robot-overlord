@@ -76,25 +76,37 @@ final class PairAndAskUITests: XCTestCase {
         try stack("restart-relay")
         connected()
 
-        // Ask the overlord.
+        // The overlord's terminal: type into its pane with the keyboard.
         let overlord = page().links.matching(NSPredicate(format: "label CONTAINS 'overlord'")).firstMatch
         waitFor(overlord, "the overlord row")
         overlord.tap()
-        let box = page().textViews["tell the overlord"]
-        waitFor(box, "the overlord's composer")
-        box.tap()
-        box.typeText("hello from the simulator")
-        page().buttons["Send"].tap()
-        assertAnswered("hello from the simulator")
+        waitFor(shows("fake overlord"), "the fake overlord's pane drawn", timeout: 45)
+        typeIntoTerminal("hi rlord")
+        let answer = "Fake overlord here: you said \"hi rlord\""
+        waitFor(shows(answer), "the overlord's answer in its pane")
+
+        // The key row: Enter from the row, after typing on the keyboard.
+        typeIntoTerminal("again", enter: false)
+        page().buttons["Enter"].tap()
+        waitFor(shows("Fake overlord here: you said \"again\""), "the key row's Enter")
+
+        // Away and back: the pane is opened again and drawn whole.
+        XCUIDevice.shared.press(.home)
+        Thread.sleep(forTimeInterval: 2)
+        app.activate()
+        connected()
+        waitFor(shows(answer), "the pane redrawn after coming back", timeout: 45)
     }
 
-    /// The ask left the outbox (a pending bubble has a Cancel button) and
-    /// the stack's fake overlord's answer shows in the chat.
-    func assertAnswered(_ text: String) {
-        let cancel = page().buttons["Cancel"]
-        let end = Date().addingTimeInterval(30)
-        while cancel.exists, Date() < end { Thread.sleep(forTimeInterval: 0.2) }
-        XCTAssertFalse(cancel.exists, "the ask is still pending")
-        waitFor(shows("Fake overlord here: you said \"\(text)\""), "the overlord's answer")
+    /// Tap the terminal (its keyboard comes up) and type `text`.
+    func typeIntoTerminal(_ text: String, enter: Bool = true) {
+        let term = page().descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS 'Terminal input'")).firstMatch
+        if term.exists { term.tap() } else {
+            page().coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4)).tap()
+        }
+        let kb = app.keyboards.firstMatch
+        XCTAssertTrue(kb.waitForExistence(timeout: 10), "no keyboard for the terminal")
+        app.typeText(enter ? text + "\n" : text)
     }
 }
