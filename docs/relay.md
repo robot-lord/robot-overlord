@@ -110,7 +110,9 @@ attestation verify`), then:
   prints the address it will announce.
 - **The certificate** must be valid for that name from a public CA (hosts
   and devices check it like a browser does). A relay on premises can use
-  a private CA if each host sets `[remote] ca_file`.
+  a private CA if each host sets `[remote] ca_file`, but the phone app
+  (not released yet) trusts public CAs only, so it can't reach such a
+  relay.
 - **Files mode** (`[tls] mode = "files"`): the relay terminates TLS
   (TLS 1.3 and 1.2). It re-reads `cert` and `key` on SIGHUP (`systemctl
   reload rlord-relay`; in proxy mode SIGHUP does nothing) and every 12 hours, so a renewal needs no restart.
