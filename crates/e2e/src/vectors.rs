@@ -79,6 +79,11 @@ pub struct Outputs {
     /// `stream id | flags | chunk length` of each fragment of a message of
     /// `2 * CHUNK + 5` bytes.
     pub fragments: Vec<String>,
+    /// Pane frame plaintexts (hex): `ls` and Enter on stream 1, an empty
+    /// frame on stream 250, then the messages (`stream body-hex`) read
+    /// from a control message's two fragments with a pane frame between
+    /// them.
+    pub pane_frames: Vec<String>,
     /// Failure cases: name to the error each side reports.
     pub failures: BTreeMap<String, String>,
 }
@@ -341,6 +346,20 @@ pub fn run(i: &Inputs) -> Result<Outputs, String> {
 
     let failures = failures(&p, &qr, &qr2, &rogue, &frames, &pd, &ph)?;
 
+    // Pane frames, and one between a control message's fragments.
+    let mut pane_frames = vec![
+        x(&stream::pane_frame(1, b"ls\r").map_err(e)?),
+        x(&stream::pane_frame(stream::PANE_LAST, b"").map_err(e)?),
+    ];
+    let two = stream::fragment(CONTROL, &vec![0x7b; CHUNK + 3]).map_err(e)?;
+    let pane = stream::pane_frame(5, b"\x1b[Z").map_err(e)?;
+    let mut r = Reassembler::new();
+    for f in [&two[0], &pane, &two[1]] {
+        if let Some(m) = r.push(f).map_err(e)? {
+            pane_frames.push(format!("{} {}", m.stream, x(&sha256(&[&m.body]))));
+        }
+    }
+
     Ok(Outputs {
         host_public: x(host.public()),
         device_public: x(device.public()),
@@ -367,6 +386,7 @@ pub fn run(i: &Inputs) -> Result<Outputs, String> {
         mb_export_device: export,
         mb_gaps,
         fragments,
+        pane_frames,
         failures,
     })
 }
@@ -557,6 +577,8 @@ fn failures(
         let mut r = Reassembler::new();
         failures.insert("stream_bad_flags".into(), err(r.push(&[0, 2, 1])));
         failures.insert("stream_too_short".into(), err(r.push(&[0])));
+        failures.insert("stream_pane_more".into(), err(r.push(&[1, 1, 0x61])));
+        failures.insert("stream_reserved_id".into(), err(r.push(&[251, 0, 0x61])));
     }
     Ok(failures)
 }

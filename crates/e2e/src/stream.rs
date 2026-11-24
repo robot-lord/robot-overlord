@@ -1,11 +1,15 @@
 //! Streams inside a live session, and fragmenting.
 //!
 //! The first plaintext byte of a frame is a stream id: [`CONTROL`] (0) is
-//! the control stream (the local control socket's JSON messages); `1..` are
-//! reserved for panes and unused in v1. The second byte is a flags byte:
-//! bit 0 ([`MORE`]) means "more of this message follows", so a control
-//! message larger than one frame (a snapshot) is sent as fragments and
-//! reassembled, up to [`MAX_MESSAGE`]. Other flag bits must be zero.
+//! the control stream (the local control socket's JSON messages);
+//! [`PANE_FIRST`]..=[`PANE_LAST`] (1 to 250) are pane streams (a terminal's
+//! bytes, opened by the `pane.open` op on the control stream); 251 to 255
+//! are reserved and refused. The second byte is a flags byte: bit 0
+//! ([`MORE`]) means "more of this message follows", so a control message
+//! larger than one frame (a snapshot) is sent as fragments and reassembled,
+//! up to [`MAX_MESSAGE`]. A pane frame stands alone: "more" on a pane
+//! stream is refused, and its bytes are a message by themselves (at most
+//! [`CHUNK`]). Other flag bits must be zero.
 //!
 //! The relay cannot tell streams apart: the header is inside the
 //! ciphertext.
@@ -16,6 +20,10 @@ use crate::{Error, Result, MAX_PLAINTEXT};
 
 /// The control stream.
 pub const CONTROL: u8 = 0;
+/// The first pane stream.
+pub const PANE_FIRST: u8 = 1;
+/// The last pane stream (251 to 255 are reserved).
+pub const PANE_LAST: u8 = 250;
 /// Flags bit 0: more of this message follows.
 pub const MORE: u8 = 1;
 /// Stream id and flags.
@@ -55,6 +63,27 @@ pub fn fragment(stream: u8, msg: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(out)
 }
 
+/// Whether `stream` is a pane stream.
+pub fn is_pane(stream: u8) -> bool {
+    (PANE_FIRST..=PANE_LAST).contains(&stream)
+}
+
+/// One pane frame's plaintext: `stream | 0 | bytes`, at most [`CHUNK`]
+/// bytes (a pane frame stands alone; split longer input yourself).
+pub fn pane_frame(stream: u8, bytes: &[u8]) -> Result<Vec<u8>> {
+    if !is_pane(stream) {
+        return Err(Error::Format("not a pane stream"));
+    }
+    if bytes.len() > CHUNK {
+        return Err(Error::Format("pane frame too long"));
+    }
+    let mut f = Vec::with_capacity(HEADER_LEN + bytes.len());
+    f.push(stream);
+    f.push(0);
+    f.extend_from_slice(bytes);
+    Ok(f)
+}
+
 /// Reads one frame plaintext that must hold a whole message (the mailbox:
 /// one message per frame).
 pub fn single(frame: &[u8]) -> Result<Message> {
@@ -81,6 +110,18 @@ impl Reassembler {
         };
         if flags & !MORE != 0 {
             return Err(Error::Format("stream flags"));
+        }
+        if *stream > PANE_LAST {
+            return Err(Error::Format("reserved stream"));
+        }
+        if is_pane(*stream) {
+            if flags & MORE != 0 {
+                return Err(Error::Format("more on a pane stream"));
+            }
+            return Ok(Some(Message {
+                stream: *stream,
+                body: chunk.to_vec(),
+            }));
         }
         let buf = self.partial.entry(*stream).or_default();
         if buf.len() + chunk.len() > MAX_MESSAGE {
@@ -160,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn streams_interleave() {
+    fn control_fragments_and_pane_frames_interleave() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&[0, MORE, 1]).unwrap(), None);
         assert_eq!(
@@ -177,5 +218,45 @@ mod tests {
                 body: vec![1, 2]
             })
         );
+    }
+
+    #[test]
+    fn pane_frames_stand_alone() {
+        let mut r = Reassembler::new();
+        for s in [PANE_FIRST, 7, PANE_LAST] {
+            let bytes = vec![s; CHUNK];
+            let f = pane_frame(s, &bytes).unwrap();
+            assert_eq!(f.len(), crate::MAX_PLAINTEXT);
+            assert_eq!(&f[..2], &[s, 0]);
+            assert_eq!(
+                r.push(&f).unwrap(),
+                Some(Message {
+                    stream: s,
+                    body: bytes
+                })
+            );
+        }
+        // An empty pane frame is a message too (nothing to write).
+        assert_eq!(r.push(&[3, 0]).unwrap().unwrap().body, Vec::<u8>::new());
+        assert!(pane_frame(1, &vec![0; CHUNK + 1]).is_err());
+        assert!(pane_frame(CONTROL, b"x").is_err());
+        assert!(pane_frame(PANE_LAST + 1, b"x").is_err());
+        assert!(is_pane(1) && is_pane(250) && !is_pane(0) && !is_pane(251));
+    }
+
+    #[test]
+    fn pane_more_is_refused() {
+        let mut r = Reassembler::new();
+        assert!(r.push(&[1, MORE, 1]).is_err());
+        assert!(r.push(&[PANE_LAST, MORE]).is_err());
+    }
+
+    #[test]
+    fn reserved_streams_refused() {
+        let mut r = Reassembler::new();
+        for s in 251..=255u8 {
+            assert!(r.push(&[s, 0, 1]).is_err(), "{s}");
+            assert!(r.push(&[s, MORE, 1]).is_err(), "{s}");
+        }
     }
 }

@@ -228,9 +228,15 @@ Live: `u16 length | ciphertext`, the plaintext `u16 length | content |
 zero fill` padded to a multiple of 32; rekey every 2^20 frames each way.
 Any decrypt failure (a malformed frame included) ends the session: the
 owner closes the link. Content: `stream id | flags | bytes`. Stream 0 is
-control; 1 and up are reserved for panes (the host closes a link that uses
-one). Flag bit 0 is "more follows"; a control message up to 1 MiB is
-fragmented and reassembled; other bits must be zero.
+control; 1 to 250 are pane streams ("Panes" below); 251 to 255 are
+reserved, and a frame on one is a protocol error (the link is closed).
+Flag bit 0 is "more follows"; a control message up to 1 MiB is
+fragmented and reassembled; other bits must be zero. A pane frame stands
+alone: at most 16 382 bytes, "more" on a pane stream is a protocol
+error, and a pane frame may come between two fragments of a control
+message. A pane frame for a stream that isn't open (input still in
+flight when the pane ended, output after the device closed it) is
+decrypted and discarded, never an error.
 
 Mailbox: the same frame shape padded to a Padmé bucket, its own cipher
 state (ChaCha20-Poly1305 with a counter nonce, Noise's `REKEY` after every
