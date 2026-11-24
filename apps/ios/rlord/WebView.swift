@@ -146,6 +146,11 @@ final class WebController: NSObject, WKNavigationDelegate, WKScriptMessageHandle
         webView.allowsLinkPreview = false
         webView.allowsBackForwardNavigationGestures = true
         webView.scrollView.contentInsetAdjustmentBehavior = .never
+        // The page is laid out fixed and scrolls only inside (its lists,
+        // the chat): the web view's own scroll view would rubber-band the
+        // whole app past a list's end.
+        webView.scrollView.isScrollEnabled = false
+        webView.scrollView.bounces = false
         webView.isOpaque = false
         webView.backgroundColor = .systemBackground
         #if DEBUG

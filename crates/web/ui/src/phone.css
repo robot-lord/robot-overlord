@@ -27,6 +27,10 @@
   text-size-adjust: 100%;
   overscroll-behavior: none;
 }
+/* A list scrolled past its end bounces by itself, not its parents. */
+.phone * {
+  overscroll-behavior: contain;
+}
 /* Laid over the visual viewport (app.tsx sets --vvh and --vvtop), so the
    composer sits above the keyboard. */
 .phone .app {
