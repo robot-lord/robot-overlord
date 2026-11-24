@@ -1519,12 +1519,15 @@ Decided 2026-11-17 (user):
   streams inside the device's Noise session (opened by a new remote op
   `pane.open`, credit flow control, tmux coalescing for a slow phone,
   reopen and redraw on reconnect), xterm.js with WebGL in the phone
-  page, a phone-sized view with "typed on last sizes the window", a key
+  page, a phone-sized view under explicit control, a key
   row and a compose line, a per-device view-only switch, `web::API` 2
   (`overlord.ask` and `overlord.messages` leave the remote API; the
   transcript stays), and a real-Claude-Code test through the relay
-  (`cargo xtask app test-term`). Nothing built. Nine open questions wait
-  for the user.
+  (`cargo xtask app test-term`). Nothing built. The user answered the
+  nine questions the same day ("Slice 5 answers"): the size rule became
+  an explicit control handoff (one screen controls a pane; the others
+  show "Controlled by <location>" and Take over), which raises five
+  new questions.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
@@ -4778,15 +4781,16 @@ websocket, no second handshake, no relay change.
   `{"id","op":"pane.open","args":{"stream","target","cols","rows"}}`
   (`target`: `overlord` or a session reference; sizes 2 to 1000, the
   local socket's bounds). Answer `{"id","ok":{"stream","id","name",
-  "overlord","input","window"}}` or an error: `not_running`,
+  "overlord","input","control","cols","rows","window"}}` (`control`: this
+  device holds the pane; `cols`, `rows`: the size its view is attached
+  at, the window's when it only views; decision 3) or an error: `not_running`,
   `not_found`, `too_many`, `bad_request` (a stream already open, a bad
   size). Opening never starts anything, as locally.
 - **The rest are events on the control stream** (they need no answer and
   must not spend the 20 ops per second):
   - device to host: `{"event":"pane","stream","type":"resize","cols",
     "rows"}`, `{…"type":"ack","bytes","frames"}` (cumulative totals the
-    page has consumed), `{…"type":"fit"}` (claim the window's size,
-    decision 3), `{…"type":"close"}`.
+    page has consumed), `{…"type":"close"}`.
   - host to device: `{"event":"pane","stream","type":"closed","reason",
     "message"}` with reason `ended` (the client exited: the session
     stopped, the overlord restarted), `closed` (the device asked),
@@ -4883,8 +4887,9 @@ recorded for that decision.
   making a new addon, not by the DOM renderer. The CSP is unchanged.
 - If gate 1c shows WebGL can't be relied on in WKWebView, the fallback is
   the DOM renderer with `style-src 'self' 'unsafe-inline'` (the local
-  page's policy). That loosens the phone's CSP, so it is the user's call
-  (open question 6); the page still has no network and no HTML sink.
+  page's policy). The user agreed to that, for the phone page and only if
+  WebGL proves unreliable (answer 4); the page still has no network and
+  no HTML sink.
 - Not loaded: the clipboard addon (a session must not write the phone's
   clipboard through OSC 52), link handling (the web view cancels every
   navigation anyway).
@@ -4900,46 +4905,111 @@ recorded for that decision.
   missing in WKWebView (gate 1c), a monospace font is bundled
   (`font-src 'self'` already allows it).
 
-#### 3. Size: the phone's own, and the screen typed on last wins
+#### 3. Control: one screen holds a pane, and the handoff is explicit
 
-| | Phone-sized view (chosen) | The window's desktop size, panned and zoomed |
-| --- | --- | --- |
-| Reading | lines wrap at the phone's width, text at a readable size | 120 or more columns on a phone: a keyhole, or unreadably small |
-| Typing | the prompt is where the keyboard is | pan to find the cursor |
-| The desktop's view of the same session | follows the phone while the phone is the one typing; the agent redraws at each change of hands | undisturbed |
+Revised after the user's answer 1 ("a 'take over from <location>' and a
+corresponding 'currently controlled by <location>' view that basically
+makes the bind explicit on both sides"). tmux's silent `window-size
+latest` is replaced, for every surface, by a holder rlord keeps and
+shows.
 
-- A phone pane is its own tmux client on a view session, as a local web
-  view is, sized by the page. The rule stays tmux's `window-size latest`:
-  the window takes the size of the client used last. Opening a pane on
-  the phone takes the size (attaching does); typing on the desktop takes
-  it back; typing on the phone takes it again. The other screen sees the
-  window padded or cropped meanwhile, as two web views do today.
+**The model.** Each running session's pane (the overlord's included) has
+at most one **controller**: the screen it is laid out for and the only
+one whose keys reach it. Every other screen showing it is a **viewer**:
+it sees the pane as the controller sees it, with "Controlled by
+<location>" and a **Take over** action. Taking over is one tap or key,
+no confirmation; the pane is resized to the taker, and the previous
+holder's screen turns into the viewer's, naming the taker.
+
+| Surface | Its name on other screens | As controller | As viewer | Take over |
+| --- | --- | --- | --- | --- |
+| The terminal (rlord's TUI and its tmux client on the computer; the overlord overlay) | "<host name>'s terminal" | the window follows the terminal's size, as today | tmux shows the window padded or cropped; rlord's status row says "Controlled by <name> · <key> to take over"; keys don't reach the pane | a key (rlord's status row, and the overlay's own line) |
+| A local page | "a browser on <host name>" | the window is pinned to the page's terminal size | the terminal is drawn at the window's size, scaled to fit; a bar above it | a button in the bar |
+| A paired phone | the name given at pairing | pinned to the phone's size | as a page: the whole screen, scaled down, with the bar | a button in the bar |
+
+**Where it lives: the daemon** (`crates/daemon/src/control.rs`, new). In
+memory, per session id: the holder (`terminal`, `page:<id>` or
+`device:<id>`), the holder's size, since when, and whether the holder is
+away. A daemon restart forgets it (every pane is free again). Plain
+code: no agent decides anything.
+
+- Device names come from the plugin (the daemon holds no device list):
+  the mirror the plugin already sends (`web.remote_state`) gains each
+  paired device's id and name. Names only; no keys.
+- **How each surface learns it.** Every session in the snapshot (and the
+  overlord) gains `control`: `null`, or `{holder, by, name, away, cols,
+  rows}` (`by`: `terminal`, `web` or `phone`). A change moves `rev`, so
+  pages and phones hear `changed` as for anything else and compare
+  `holder` with their own id from `hello`. The TUI reads the same field
+  from the daemon as it reads the rest of a session: the list marks a
+  session held elsewhere, the overlay and the status row show the line.
+  The plugin is told on its `web.subscribe` stream (`{"control":{…}}`),
+  because it enforces typing and sizes the viewers' clients.
+- **Ops**: `pane.take {target, cols, rows}` (local and remote; running it
+  twice is the same as once). The terminal's key runs `rlord control
+  take <session>` (a daemon method over the socket, `control.take`).
+  A view-only device (decision 6) is refused (`not_allowed`).
+- Plugin-only daemon methods, replacing `web.pane_target`:
+  `web.pane_open {target, surface, cols, rows}` (resolves the target,
+  says whether this surface controls, and the size to attach at; **a
+  free pane is taken by the surface that opens it**, since there is
+  nobody to take it from), `web.pane_size {target, surface, cols, rows}`
+  (the controller's terminal changed size: pin again) and
+  `web.pane_closed {target, surface}`.
+
+**How it is enforced in tmux.**
+
+- **Every view client attaches with `ignore-size`** (local pages' too),
+  so no browser or phone ever sizes a window by itself. Size comes only
+  from the daemon: holder a page or a phone, the window is pinned to its
+  size (`tmux::resize_window`, as the overlay does today); holder the
+  terminal or nobody, it is unpinned (`auto_size_window`) and follows
+  the terminal's own client, the only kind left that tmux counts.
+- **Typing.** The plugin passes a pane's input on only for the
+  controller's stream or socket; a viewer's input is discarded and its
+  page doesn't send any (a key press there points at Take over). The
+  terminal isn't in rlord's path (the user's tmux client types straight
+  into the pane), and tmux can't make a client read-only and back. So
+  while another surface holds a session, the daemon sets that session's
+  `key-table` option to a table of rlord's (`rlord-held`): rlord's
+  navigation keys, the take-over key, and `Any` bound to a message. View
+  sessions have their own table, so only real terminals are affected.
+  Gate 1b; the fallback is under "Risks".
+- **The overlay** is the terminal surface. Holding the overlord, it pins
+  the window to its popup as today. Not holding it, it pins nothing,
+  draws the frame it captured as it is, shows the line, and sends no
+  keys but its own (close, take over). `web.pane_claim`, the `fit` event
+  and the bound no-op key of the first plan are gone.
 - **The keyboard never resizes the terminal.** Rows are computed for the
   full view with the keyboard down. When the keyboard comes up the
   terminal slides up, its bottom rows above the key row (Claude Code's
-  prompt is at the bottom); a drag shows the top. So showing and hiding
-  the keyboard sends no `resize` and costs no redraw. A resize is sent
-  only for a rotation or a font-size change, 200 ms after the size
-  settles.
-- **Fit to this screen** (the pane's menu): the `fit` event. The host
-  writes one key into the view client that the `rlord-web` table binds to
-  a harmless command (a user key bound to `refresh-client`), so tmux
-  counts the client as used last and gives it the size; the agent never
-  sees the key. Checked in gate 1b; the fallback is closing and opening
-  the stream (an attach takes the size too).
-- **The overlord under the TUI's overlay.** The overlay pins the window's
-  size, which no client can then change, and the overlord is the pane the
-  phone uses most. So the same rule is applied by rlord there:
-  - a new plugin-only daemon method `web.pane_claim {target}` (beside
-    `web.pane_target`, never an op): if the target's window is pinned, it
-    unpins it; answer `{pinned}`. The plugin calls it when a device opens
-    the pane, on `fit`, and on input at most once every 2 s.
-  - the overlay (`crates/tui/src/overlay.rs`), when the frame it captured
-    isn't its popup's size, draws it as it is with one dim line ("sized
-    for another screen: type to take it back") and pins again on the
-    user's next key, before sending it.
-- A view-only device (decision 6) attaches with tmux's `ignore-size`
-  client flag: looking never resizes anything.
+  prompt is at the bottom); a drag shows the top. A new size is sent
+  (`resize`, which pins again) only for a rotation or a font-size
+  change, 200 ms after it settles.
+
+**Opening, leaving, coming back.**
+
+- Opening a pane another live surface holds opens it as a viewer. It
+  never takes by itself.
+- **When the holder leaves** (its stream or socket closes, the link
+  drops, the phone goes to the background, the terminal moves to another
+  session or closes the overlay) it is marked **away** and keeps control
+  for 30 s: a network blip, or a look at the list and back, changes
+  nothing and redraws nothing. Viewers see "Controlled by <name>
+  (away)". After that it is released: if other surfaces are showing the
+  pane, control passes to the terminal if it is one of them, else to the
+  one used last (`ui::target`'s order); if none is, the pane is free and
+  keeps its size until someone opens it. Explicit where two screens
+  compete; automatic where nobody is left to ask. Open question 2.
+- What rlord types by itself (the overlord's tools sending to a session,
+  the desktop page's "tell the overlord" box) isn't a surface and is
+  never held back.
+
+**The overlord and the input rule.** The overlord sees and does nothing
+here: no MCP tool, nothing in `get_ui_state`, so `overlord.md` is
+unchanged (if a later change shows control to it, that change updates
+it). "Describe, then confirm" doesn't apply: this is a one-tap action on
+a pane, not config-style input.
 
 #### 4. Input
 
@@ -4959,8 +5029,7 @@ recorded for that decision.
   (`term.paste`, bracketed when the pane asked for it) followed by Enter;
   a second button pastes without Enter. Direct keys suit `y`, arrows and
   `Esc`; a paragraph for an agent is typed far better in a real text
-  field. Default: direct keys, the compose line one tap away (open
-  question 3).
+  field. Default: direct keys, the compose line one tap away.
 - **Paste and copy.** The Paste key asks the shell (`{"app":"paste"}`,
   answered `{"event":"paste","text"}` from `UIPasteboard`, which shows
   iOS's own paste notice); the page then pastes it. "Copy screen" sends
@@ -5019,12 +5088,12 @@ run code). A pane makes it direct, so:
   false`), set by the user on the computer: `rlord relay input <device>
   on|off`, the TUI's Devices screen, and the local page's Devices modal
   (a local-only op `device.input`). Never an MCP tool, never a remote op.
-  For such a device the host attaches the view client read-only and
-  `ignore-size`, discards any input frame, answers `"input": false` in
-  `pane.open`, and the page shows no keyboard. Whether new devices start
-  as view-only is open question 2.
+  Such a device is only ever a viewer: it can't take a pane (decision
+  3), the host attaches its view client read-only, discards any input
+  frame, answers `"input": false` in `pane.open`, and the page shows no
+  keyboard and no Take over. New devices may type (answer 2).
 - **`remote` flags**: `pane.open` is remote (and refused from a local
-  page, which has its socket). `overlord.ask` becomes local-only;
+  page, which has its socket); `pane.take` is remote and local. `overlord.ask` becomes local-only;
   `overlord.messages` is removed. The local-only list is otherwise
   unchanged.
 - **A device can reach only what the daemon resolves.** The target is
@@ -5033,7 +5102,7 @@ run code). A pane makes it direct, so:
   has no keyboard bindings, so tmux's prefix, other windows and the
   user's profile are out of reach, as for a local page.
 - **Audit** (`remote.log`): `pane open <session id> <cols>x<rows>
-  rw|ro`, `pane input <session id>` (the first input of a stream), `pane
+  rw|ro`, `pane take <session id>`, `pane input <session id>` (the first input of a stream), `pane
   close <session id> in=<bytes> out=<bytes>`. Never the bytes, as today's
   rule says.
 - **Revoking a device ends its panes at once** (the link is dropped; its
@@ -5046,7 +5115,8 @@ run code). A pane makes it direct, so:
 #### 7. Remote API and protocol changes
 
 - **`web::API` becomes 2** (a removal): `overlord.ask` and
-  `overlord.messages` leave the remote API; `pane.open` joins it.
+  `overlord.messages` leave the remote API; `pane.open` and `pane.take` join it, and the
+  snapshot's sessions gain `control`.
   `tests/fixtures/remote_api.json` is regenerated on purpose. The engine
   supports 2 only (`API_MIN` = `API_MAX` = 2): an older host gets
   `update_host`, an older app `update_app`. The app and the host are the
@@ -5056,14 +5126,15 @@ run code). A pane makes it direct, so:
 - **Mailbox**: `MAILBOX_OPS` and `outbox::may_wait` shrink to
   `overlord.new_session`. The outbox's 24-hour ask rule goes with the
   asks.
-- `plugin::WEB_PROTOCOL` becomes 5 (`web.pane_claim`, `pane.open`
-  through `web.call`).
+- `plugin::WEB_PROTOCOL` becomes 5 (`web.pane_open`, `web.pane_size`
+  and `web.pane_closed` in place of `web.pane_target`, the `control`
+  line on `web.subscribe`, device names in `web.remote_state`).
 - **`e2e-protocol.md`**: §3 "Frames" (streams 1 to 250, no "more" on a
   pane stream, frames for a closed stream discarded) and a new "Panes"
-  part (the op, the events, credit, the limits, order, reopen on
-  reconnect); §3 "Requests by mailbox" (one op); §4 (the host reads a PTY
+  part (the ops, the events, credit, the limits, order, reopen on
+  reconnect, controller and viewer); §3 "Requests by mailbox" (one op); §4 (the host reads a PTY
   only under credit, queue mark and rate; the input-stall rule on the
-  device; panes end with their session); §5 (`web.pane_claim`).
+  device; panes end with their session); §5 (the pane methods and control).
 - **Vectors** (`cargo xtask e2e vectors`): pane frame headers; a pane
   frame between two fragments of a control message; "more" on a pane
   stream refused; a reserved stream id refused. The crypto is untouched.
@@ -5077,7 +5148,7 @@ run code). A pane makes it direct, so:
   when it isn't running (`overlord.ensure`), and its terminal. The pane
   follows a switch to another agent's overlord, as the desktop's does.
 - **A session** (`#/s/<id>`): three tabs. *Terminal* (first when it is
-  running), *Transcript*, *Details* (description, notes, tags, the
+  running; with the control bar when another screen holds it), *Transcript*, *Details* (description, notes, tags, the
   action buttons). Not running: Resume, and the transcript.
 - **The transcript stays: `session.messages`, read-only.** Recommended,
   for what a terminal on a phone does badly rather than as an offline
@@ -5093,8 +5164,9 @@ run code). A pane makes it direct, so:
   to `transcript.ts` (`MessageLog`). A described new session still waits
   in the outbox when the computer is away: shown as one line on the list
   with Cancel, not as a chat bubble.
-- **The desktop page is unchanged**: its overlord view is the pane and
-  the "tell the overlord" box (`overlord.ask`, local).
+- **The desktop page's overlord is unchanged**: the pane and the "tell
+  the overlord" box (`overlord.ask`, local). Its panes do gain the
+  control bar of decision 3, as every surface does.
 - **`overlord.md`**: the overlord sees nothing new (no tool, no state);
   what the phone types arrives as typing. Its lines about the phone as a
   surface stay true. Checked in step 4; the tests on its tool list cover
@@ -5109,7 +5181,7 @@ Never `tmux -L rlord` or the default server; every relay is the real
 | --- | --- | --- |
 | Core, engine, page units | nothing | yes |
 | Host, daemon, relay, engine with a stand-in terminal | tmux | yes (`RLORD_TMUX_TESTS=1`, as `web/tests/pane.rs`) |
-| The real Claude Code through the relay | tmux, Node, the pinned CLI from npm (2.1.331, cached) | yes if the user agrees (open question 5), else by the same task locally |
+| The real Claude Code through the relay | tmux, Node, the pinned CLI from npm (2.1.331, cached) | yes (answer 3) |
 | iOS simulator | Xcode | no (local, as slice 4) |
 | A real iPhone | the phone, the Tailscale Serve dev relay | by hand |
 
@@ -5132,18 +5204,30 @@ Never `tmux -L rlord` or the default server; every relay is the real
   the link lives, the pane catches up with one redraw),
   `a_flood_never_delays_control` (a snapshot is answered promptly while a
   pane floods), `a_flooding_pane_never_stalls_another_device`,
-  `a_view_only_device_cannot_type`, `revoking_ends_its_panes`,
+  `a_view_only_device_cannot_type`, `a_view_only_device_cannot_take`,
+  `a_second_surface_opens_as_a_viewer`,
+  `take_over_resizes_and_swaps_typing`, `a_viewers_input_goes_nowhere`,
+  `a_blip_keeps_control`, `control_passes_on_after_the_holder_leaves`,
+  `revoking_ends_its_panes`,
   `two_devices_one_pane`, `too_many_panes`, `a_relay_restart_reopens`,
   `the_audit_log_names_no_bytes`.
 - **`crates/web/tests/hostile.rs`**: a relay that replays, drops or
   reorders a pane frame ends the session (no bytes reach the PTY out of
   order); a relay that withholds a device's acks only slows that pane.
 - **Daemon** (`web_api.rs`): `pane_open_from_a_device`,
-  `pane_open_is_refused_locally`, `overlord_ask_is_local_only`,
-  `overlord_messages_is_gone`, `device_input_is_local_only`, the fixture
-  at `api` 2; `web_tmux.rs`: `pane_claim_unpins_a_pinned_window`.
-  **TUI**: the overlay's re-pin on a key after a claim (its existing
-  test style).
+  `pane_open_is_refused_locally`, `pane_take_from_a_device_and_a_page`,
+  `overlord_ask_is_local_only`, `overlord_messages_is_gone`,
+  `device_input_is_local_only`, the snapshot's `control` keys and the
+  fixture at `api` 2. `control.rs` units (a fake clock, no tmux):
+  `a_free_pane_goes_to_its_opener`, `an_opener_never_takes`,
+  `take_swaps_the_holder`, `away_keeps_control_for_the_grace`,
+  `release_prefers_the_terminal_then_the_last_used`,
+  `nobody_left_means_free`, `a_restart_forgets`. `web_tmux.rs`:
+  `a_held_window_is_pinned_and_views_never_size_it`,
+  `the_terminal_holding_unpins`, `a_held_sessions_keys_reach_no_pane`,
+  `the_take_key_takes`. `crates/web/tests/pane.rs`: a local page as
+  viewer and as taker. **TUI**: the overlay as viewer (no pin, the line,
+  the take key), the list's mark.
 - **Engine** (`machine/tests.rs`): `pane_frames_go_to_the_page`,
   `page_input_becomes_stream_frames`, `long_input_is_split`,
   `pane_open_is_never_kept`, `a_stalled_link_under_input_redials`,
@@ -5154,7 +5238,8 @@ Never `tmux -L rlord` or the default server; every relay is the real
   reopen on `hello`, a stream id reused only after its `closed`);
   `pane.test.ts` unchanged; the transcript's tests in place of the
   chat's; the bundle test turned round (xterm.js present, still no
-  websocket and no `LocalTransport`).
+  websocket and no `LocalTransport`); the control bar's states (holder,
+  viewer, away) from snapshots.
 - **The real terminal, automated** (`cargo xtask app test-term`, new,
   beside `test-e2e`): a demo with `demo-claude`, the loopback relay, a
   dev daemon with the plugin, `rlord-device bridge`, and a Vitest project
@@ -5170,7 +5255,10 @@ Never `tmux -L rlord` or the default server; every relay is the real
   - a resize, then a second fresh open, show the same screen;
   - the link cut mid-answer (`testing::Flaky`), then reopened, shows the
     same screen as a fresh open once the answer ended;
-  - the compose line's paste arrives as one bracketed paste.
+  - the compose line's paste arrives as one bracketed paste;
+  - opened while the terminal holds the session, it is a viewer at the
+    window's size; after `pane.take` Claude Code is laid out at 54
+    columns and typing works.
   The fake model logs every request; the test fails on a `BLOCKED` line.
 - **iOS** (`app test-ios`): `LivePageTests` gains the terminal mounting
   under the page's CSP with WebGL (and that the only policy violations
@@ -5183,7 +5271,8 @@ Never `tmux -L rlord` or the default server; every relay is the real
   the keyboard (autocorrect, smart punctuation, dictation, a hardware
   keyboard); every key of the row; the compose line; paste and copy;
   scroll-back; rotation; font sizes; the desktop TUI and page on the same
-  session (the change of hands, the overlay case); wifi to mobile and
+  session (controlled-by and take over, each way, the overlay included;
+  the phone leaving and coming back inside and after the 30 s); wifi to mobile and
   back, a tunnel, a long lock, background and foreground mid-answer; a
   flood (`cat` of a large file) on a slow network; view-only; revoke
   while a pane is open; key-to-echo times and bytes per second, recorded
@@ -5200,10 +5289,12 @@ in "Progress".
    - (a) tmux and an unread client: a view client whose PTY isn't read
      while the pane floods; tmux's memory stays bounded and the client
      gets one redraw when read again. On this Mac's tmux and CI's.
-   - (b) the size: a key bound in `rlord-web` makes the view client the
-     latest and resizes the window without reaching the agent;
-     `new-session -f read-only,ignore-size` for a view-only client on
-     tmux 3.2.
+   - (b) control in tmux 3.2: view clients attached with `ignore-size`
+     never size the window; `resize-window` pins it with views attached
+     and unpinning hands it to the terminal's client; a session's
+     `key-table` set to a table with `Any` bound keeps a real client's
+     keys from the pane, keeps rlord's navigation, and the take key
+     works; `read-only` for a view-only device's client.
    - (c) xterm.js 6 with WebGL in WKWebView under the phone's CSP, in the
      simulator and on the phone: draws, survives a lost context, Claude
      Code's glyphs.
@@ -5217,7 +5308,8 @@ in "Progress".
 2. **Core**: `stream.rs` (pane frames, the reserved ids), the vectors,
    the WASM vector runner, `e2e-protocol.md` §3. Proves the framing.
 3. **Host**: `crates/web/src/bridge.rs` (`Bridge` and `Pty` moved out of
-   `pane.rs`, the read-only attach); `remote/panes.rs` (a task per
+   `pane.rs`, `ignore-size` on every view, the read-only attach, input
+   only for the controller; `pane.rs` on it); `remote/panes.rs` (a task per
    stream, credit, the queue mark, the rate, coalescing, input);
    `outq.rs` (`link_bytes`, the low mark); `session.rs` (data frames,
    the `pane` events, `pane.open` passed to the daemon and answered);
@@ -5225,32 +5317,40 @@ in "Progress".
    by-hand client: raw mode in a terminal). `remote_pane.rs` passes with
    the low-level device. Proves panes over the relay, flow control and
    priority, with no phone.
-4. **Daemon and TUI**: `web::OPS` (`pane.open`, `overlord.ask` local,
-   `overlord.messages` gone, `device.input`), `API` 2 and the fixture,
-   `web.pane_claim`, `relay.rs` and the CLI's `rlord relay input`, the
-   Devices screens, `MAILBOX_OPS`, `WEB_PROTOCOL` 5, the overlay's
-   re-pin, `proto.ts` `OPS`. `overlord.md` checked. Proves the allow-list
-   and the size rule.
+4. **Daemon and TUI**: `control.rs` and its tmux side (`rlord-held`,
+   pin and unpin), `web.pane_open` / `pane_size` / `pane_closed`, the
+   `control` line to the plugin and the snapshot field, `rlord control
+   take`, the status row's line and key, the overlay as holder and as
+   viewer, the list's mark; `web::OPS` (`pane.open`, `pane.take`,
+   `overlord.ask` local, `overlord.messages` gone, `device.input`),
+   `API` 2 and the fixture, `relay.rs` and the CLI's `rlord relay
+   input`, the Devices screens, `MAILBOX_OPS`, `WEB_PROTOCOL` 5,
+   `proto.ts` `OPS`. `overlord.md` checked (expected: no change). Proves
+   the allow-list and the handoff with no phone. Steps 3 and 4 meet at
+   the plugin's calls, so 3 starts against `web.pane_open` answering
+   "you control".
 5. **Engine**: the machine's pane passthrough, the input-stall rule, API
    2, `may_wait`; `rlord-device bridge` carries the new messages.
    `crates/e2e-ffi` and the Swift bindings don't change. Proves the
    device's side natively.
 6. **Page**: `term.ts`, `remotePane.ts`, `term/keys.ts`, the key row and
-   the compose line, the overlord and session terminal views, the tabs,
+   the compose line, the overlord and session terminal views, the control bar and viewer
+   scaling (the local page's panes too), the tabs,
    `Transcript.tsx`, the chat's removal, the outbox line on the list,
    `REMOTE_CAPS.panes`, the bundle test. `app test-e2e` updated (its ask
    step becomes typing in the fake overlord's pane).
 7. **The real terminal test**: `cargo xtask app test-term`, the headless
-   xterm.js project, CI (per open question 5).
+   xterm.js project, and CI's `web` job with the pinned CLI cached
+   (answer 3).
 8. **iOS shell**: the input traits and accessory bar, `paste` and `copy`
    if gate 1d needs them, `app test-ios` additions. Install on the phone.
 9. **By hand and measured**: the list under "Tests"; key-to-echo times,
    bytes per second, the compression figures; the `pane.open`-behind-
    `hello` shortcut if the reopen time wants it.
-10. **Docs**: `docs/architecture.md` ("Remote access": panes, flow
-    control, the size rule; "The phone app": the terminal, what went),
-    `docs/guide.md` (the phone's terminal, the key row, view-only
-    devices), `SECURITY.md` (a paired phone types into any session;
+10. **Docs**: `docs/architecture.md` ("Web UI" and "Remote access": panes, flow
+    control, control and take over; "The phone app": the terminal, what went),
+    `docs/guide.md` (the phone's terminal, the key row, "controlled by"
+    and Take over on each screen, view-only devices), `SECURITY.md` (a paired phone types into any session;
     view-only; the audit lines), `CLAUDE.md` (the phone page has a
     terminal; `pane.open`), `CONTRIBUTING.md` (`app test-term`),
     `e2e-protocol.md` §4 and §5 as built, `e2e-crypto.md`'s compression
@@ -5271,24 +5371,35 @@ iOS-only but step 8.
   discards and asks tmux for a redraw (`refresh-client`) when the device
   catches up: lossless on the wire still, since only unsent bytes go.
 - **WebGL in WKWebView** (lost contexts, memory on old phones). Gate 1c;
-  the fallback loosens the CSP and needs the user's word.
+  the fallback loosens the phone page's CSP, as the user allowed.
 - **The iOS keyboard on a hidden textarea**: smart punctuation,
   dictation and composition can send what the terminal doesn't expect.
   Gate 1d, the shell's input traits, and the compose line as the place
   for prose.
 - **Claude Code at phone width.** It works narrow but wraps hard; its
   dialogs assume more columns. Gate 1e; font steps and landscape.
-- **Changes of hands redraw.** Each time the other screen types, the
-  agent lays itself out again. Correct, sometimes noisy; one screen at a
-  time is the normal case. The overlay rule adds a daemon method and a
-  TUI change for one case; if it proves fragile, the fallback is a note
-  on the phone ("the overlord is open in the terminal app on your
-  computer") and no claim.
+- **Control touches every surface.** The TUI, its overlay, rlord's
+  status row, the local page and the phone all change, and local web
+  views stop sizing windows by themselves (a visible change to slice 1's
+  behaviour: a page opened beside a terminal is a viewer until it takes
+  over). The state machine is plain code with unit tests; the tmux side
+  is gate 1b.
+- **Holding back a terminal's keys** rests on a session `key-table` with
+  `Any`. If tmux 3.2 can't do that cleanly (mouse events, the prefix,
+  rlord's own bindings), the fallback is honest rather than strict: the
+  terminal always can type, the status row still says who controls, and
+  the take key still takes. Pages and phones are held back by the plugin
+  either way.
+- **A terminal can't be scaled.** A viewer in a terminal sees a
+  phone-sized pane padded, or a larger one cropped; only pages and
+  phones get the whole screen scaled.
+- **A take-over redraws** the agent at the taker's size. Once per
+  handoff, on purpose.
 - **Latency on mobile networks** is two relay round trips; no prediction
   softens it. Measured in step 9; local echo is a later slice if needed.
 - **A raw terminal is a bigger grant than a chat box.** It was a shell
   already; now it is plainly one. View-only devices, the audit lines and
-  revocation; open question 2.
+  revocation.
 - **The relay's 128-frame buffer** is a cliff for a device: the frame
   credit keeps panes away from it, but a 1 MiB snapshot is 64 frames by
   itself. Unchanged from today; noted in case panes make it visible.
@@ -5304,45 +5415,49 @@ iOS-only but step 8.
 
 ### Open questions for the user
 
-1. **The size rule.** Planned: the phone's pane is phone-sized and the
-   screen typed on last sizes the window (your desktop's view of that
-   session follows the phone while you type there, and takes the size
-   back when you type at the desk), with the TUI's overlord overlay made
-   to follow the same rule. Alternative: the phone never changes a
-   window's size and pans across the desktop's. Recommended: as planned.
-2. **May every paired phone type?** Planned: yes by default, with a
-   per-device "view only" switch set on the computer. Alternative: new
-   devices start view-only until you allow typing on the computer.
-   Recommended: typing by default (pairing is already confirmed on the
-   computer, and a phone that can't type misses the point), the switch
-   for a device you only want to watch from.
-3. **The compose line.** Planned: direct keys by default, and a text
-   field one tap away that sends a whole line with autocorrect and
-   dictation. Alternative: direct keys only. Recommended: both.
-4. **The transcript.** Planned: keep `session.messages` as a read-only
-   Transcript tab (stopped sessions, long history, copying text), for
-   the overlord too; remove `overlord.ask` and `overlord.messages`.
-   Alternative: drop the transcript and rely on the terminal alone.
-   Recommended: keep it.
-5. **The real Claude Code in CI.** Planned: `cargo xtask app test-term`
-   runs in CI's `web` job, installing the pinned CLI from npm (cached),
-   always against the fake model. Alternative: local only, like the
-   simulator tests. Recommended: in CI; it is the test that sees what a
-   Claude Code release does to the terminal.
-6. **If WebGL can't be relied on in the app's web view** (gate 1c): allow
-   inline styles in the phone page's CSP so xterm.js's DOM renderer
-   works (the local page's policy), or stop and look for another
-   renderer? Recommended: allow them; the page still has no network path
-   and no HTML sink.
-7. **Messages for the overlord while the computer is unreachable** go
-   away with the chat (a described new session still waits). Planned:
-   accept that. Alternative: keep a small "leave a note" box on the
-   overlord's screen (`overlord.ask` stays remote, API still bumps for
-   `overlord.messages`). Recommended: accept; it contradicts "one way to
-   reach the overlord" for a rare case.
-8. **Scroll-back by touch** needs `[tmux] mouse` on (the default). With
-   it off the phone's terminal has no scroll-back, only the transcript.
-   Planned: accept. Recommended: accept.
-9. **Local echo** (showing a key before the computer answers) is not
-   planned. If step 9's numbers on your mobile network feel slow, it
-   becomes its own slice. Agreed?
+The first nine are answered below. New, from the explicit control model:
+
+1. **Viewers can't type.** Planned: only the controller's keys reach a
+   pane; on any other screen a key press points at Take over (one tap or
+   key, no confirmation). Alternative: every screen may always type and
+   control only decides the size. Recommended: as planned; it is what
+   makes the bind explicit on both sides, and typing into a layout made
+   for another screen is the confusion this removes.
+2. **When the controller leaves.** Planned: it keeps control for 30 s
+   (a blip or a look at the list changes nothing), then control passes
+   to the terminal if it shows the pane, else to the screen used last,
+   else the pane is free. Alternative: control stays with the phone
+   until someone takes it, however long it has been gone. Recommended:
+   as planned; otherwise every return to the desk starts with a take
+   over from a phone in a pocket.
+3. **A free pane goes to whoever opens it**, with no tap (there is
+   nobody to take it from); a pane held by a screen that is present is
+   never taken without one. Agreed?
+4. **The desktop page follows the same rule**: opened beside a terminal
+   that holds the session, its pane is a viewer until Take over (today
+   two views silently take turns). Planned: yes, one rule everywhere.
+5. **Names**: "<host name>'s terminal", "a browser on <host name>", and
+   the phone's pairing name. Two browser tabs are both "a browser".
+   Good enough?
+
+### Slice 5 answers (user, 2026-11-24)
+
+To the first plan's nine questions:
+
+1. Size: "last typed wins" in spirit, but explicit. The user's words: "A
+   'take over from <location>' and a corresponding 'currently controlled
+   by <location>' view that basically makes the bind explicit on both
+   sides would be the best user experience." Decision 3 is rewritten as
+   an explicit control handoff on every surface (the TUI, the desktop
+   page, a named phone).
+2. Typing: every paired device may type by default, with a host-only
+   per-device view-only switch, as planned.
+3. CI: yes, install the pinned Claude Code in CI (cached) for `app
+   test-term`. (Was question 5.)
+4. CSP: yes, allow `style-src 'unsafe-inline'` on the phone page, only
+   if WebGL proves unreliable. (Was question 6.)
+5. to 9. No objection, so the recommendations stand: the compose line
+   beside direct keys; the Transcript tab stays (`session.messages`);
+   losing notes for the overlord while the computer is unreachable is
+   accepted; scroll-back by touch needs `[tmux] mouse`; no local echo
+   for now.
