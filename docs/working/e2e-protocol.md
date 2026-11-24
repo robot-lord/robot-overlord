@@ -328,8 +328,8 @@ The device id is `device_id(static)`: 16 hex characters of a labelled hash.
 
 ### Requests by mailbox
 
-Only `overlord.ask` and `overlord.new_session` travel by the mailbox, one
-frame each, when the device finds its host offline or has no live
+Only `overlord.new_session` travels by the mailbox (`overlord.ask` left
+the remote API at `api` 2), one frame each, when the device finds its host offline or has no live
 session. The host, for each lane-2 frame: acknowledges and ignores a
 frame whose relay `boot` and `seq` it has handled already (delivered
 again after a crash); drops (and acknowledges) a frame whose id is not
@@ -357,6 +357,56 @@ sent again, the same bytes, when the device next links and every 30 s
 store). One whose fate a lost connection hides is encrypted afresh: the
 device skips the gap, or drops a second answer to the same id.
 
+### Panes
+
+A pane is a session's (or the overlord's) tmux pane, live, as a stream
+of the device's session (slice 5; the plan is in
+`docs/working/web-ui-remote.md`, "Slice 5 plan" and "Slice 5 build").
+
+- **Open**: the op `{"id","op":"pane.open","args":{"stream","target",
+  "cols","rows"}}` (stream 1 to 250 and not open on this session; sizes
+  2 to 1000). The host refuses a bad one (`bad_request`) and one past its
+  limits (2 per device, 8 remote panes in all: `too_many`), asks the
+  daemon (`web.call`, which resolves the target, refuses `not_found`, says
+  `running` and applies control, below), attaches a view client and
+  answers `{"stream","id","name","overlord","input","control","cols",
+  "rows","window":{"cols","rows"}}` (`not_running` when it isn't).
+  Opening never starts anything. It counts as an op against the rate
+  limit; it is never kept in the request store or the outbox.
+- **Order**: the answer goes before the stream's first byte and
+  `{"event":"pane","stream","type":"closed","reason","message"}` after
+  its last, in the session's one sequence. Reasons: `ended` (the client
+  exited: the session stopped, the overlord restarted), `closed` (the
+  device asked, or its typing was switched), `overflow` (more than 64
+  input frames waiting for the PTY), `failed` (an `ack` past what was
+  sent). A device reuses a stream id only after its `closed`. A
+  revoked device's link is dropped, and its panes with it.
+- **Data**: pane frames, host to device the view client's output, device
+  to host input (written to the PTY only when the device holds the pane
+  and may type; otherwise dropped).
+- **Events, device to host**: `{"event":"pane","stream","type":"resize",
+  "cols","rows"}`, `{…"type":"ack","bytes","frames"}` (cumulative totals
+  the page has parsed), `{…"type":"close"}`. Events, not ops: no rate
+  limit, no answer.
+- **Credit**: the host sends on a stream while the device has under 64 KiB
+  and 48 frames unacknowledged (`hello`'s `"panes":{"max":2,"window":
+  65536,"frames":48}`), so a stalled phone never nears the relay's
+  128-frame cliff because of a pane.
+- **Reconnect**: a stream lives in one session. When the link goes the
+  host ends that link's view clients; the device opens the pane again on
+  its next session and tmux draws the whole screen for the new client
+  first. Nothing is resumed.
+- **Control**: each pane has at most one holder (`terminal`, `page:<id>`
+  or `device:<id>`), kept by the daemon. A free pane goes to the surface
+  that opens it (not to a view-only device); a held one opens as a
+  viewer, at the window's size. `pane.take {target, cols, rows}` takes
+  it (refused `not_allowed` for a view-only device). Every session in
+  the snapshot carries `control` (`null` or `{"holder","by","name",
+  "away","cols","rows"}`); a change moves `rev`.
+- **View only**: a device the user set to view only (`rlord relay input
+  <device> off`) gets `"input": false` in its `hello` and `pane.open`
+  answers; its view clients are read-only.
+
 ## 4. Delivery and recovery
 
 The rule: **one websocket link is one Noise session per device link,
@@ -373,6 +423,22 @@ never outlives a lost frame, so nothing may be lost quietly.
   it goes). A control message that can't be queued closes the connection
   (it is dialled again; every device does a fresh handshake). A link's
   `drop` waits behind that link's frames.
+- **Host, panes** (`crates/web/src/remote/panes.rs`). A pane frame is
+  encrypted only while the stream has credit (above), its link's queue
+  holds under 32 KiB (`outq::LOW_MARK`; the writer wakes the actor when
+  a watched link's queue falls below it), and the pane's own rate allows
+  (64 KiB/s, 256 KiB burst). Frames are encrypted when queued, so that
+  mark is what bounds how long an answer waits behind a busy pane (32
+  KiB); between links the writer's turn-taking and pacing are unchanged.
+  The pane's task reads its view client always (an unread tmux client
+  makes the tmux server buffer a flood whole): what it may not send yet
+  waits in a hold of at most 256 KiB; past that the hold is dropped and
+  the client ended, and when the stream may send again a fresh client is
+  attached at the same size, its first frame starting with `CAN ESC c`
+  ahead of tmux's full redraw. Only bytes never sent are dropped. Reads
+  after 15 ms of quiet go at once; otherwise they gather for up to 15 ms
+  or a full frame. Panes end with their link (dropped, unlinked, the
+  connection lost, the device revoked).
 - **Host, receiving.** A binary frame it can't parse closes the
   connection (skipping it could skip one of a session's frames). An
   unknown text message is skipped (a newer relay's). A relay silent for
@@ -461,7 +527,7 @@ The daemon holds no keys and does no crypto.
   for it come on the `web.subscribe` stream as `{"notify":"ui","device",
   "n","cmd"}`; the plugin sends them on its live session and says
   `web.ui_delivered {device, n}`, or signals it. `device.leave` removes
-  the calling device. `plugin::WEB_PROTOCOL` is 4. `web::Op.idempotent`
+  the calling device. `plugin::WEB_PROTOCOL` is 5. `web::Op.idempotent`
   marks the look-ups (and `page.report`); `web.hello`'s answer lists the
   remote ones (`"idempotent": [op]`) and gives `"api"`, and the plugin
   runs any op not listed at most once per request id (§4).
@@ -493,6 +559,18 @@ The daemon holds no keys and does no crypto.
   `relay.devices` from it, calls `changed_relay()` (moves `rev`; the
   `web.subscribe` line says `"relay": true` when nothing else changed),
   and sends a notice to every surface when a new `pending` appears.
+- **Panes and control** (slice 5). `pane.open` from a device reaches the
+  daemon as `web.call` and is answered with `tmux_session` too (the
+  plugin keeps it); a local page's pane socket uses `web.pane_open
+  {target, surface, cols, rows}` (same answer). `web.pane_size {target,
+  surface, cols, rows}` (the surface's terminal changed size: pinned
+  again if it holds the pane) and `web.pane_closed {target, surface}`
+  (it stopped showing it). The daemon pushes `{"notify":"control",
+  "sessions":{"<session id>":{"holder","by","name","away","cols","rows",
+  "tmux_session"}}}` (every held pane, on every change): the plugin
+  passes input on only for the holder and draws viewers at the holder's
+  size. `web.remote_state`'s devices carry `input` (view only when
+  false); `{cmd:"input", device, input}` sets it, as `revoke` does.
 - **Local page ops** (`remote: false`): `device.list`, `device.pair`,
   `device.pair_cancel`, `device.confirm`, `device.reject`,
   `device.revoke`, answered by the same path.
